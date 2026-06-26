@@ -172,6 +172,7 @@ flowchart LR
 
 - 每个 change 结束时 AI 自动提交（归档步骤内），不中途提交
 - commit message 使用中文，格式：`<type>: <中文描述>`（例：`feat: 添加邮件发送功能`）
+- 禁止在 commit message 中添加 `Co-Authored-By` 或其他署名
 
 **无孤儿变更规则：**
 
