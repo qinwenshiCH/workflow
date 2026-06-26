@@ -1,4 +1,4 @@
-# 需求讨论：项目级操作审计日志
+# 需求讨论：项目内对象操作审计日志
 
 **用途**: 集中管理所有 open questions、trade-offs、待决策事项
 **状态**: 讨论中，无定论
@@ -10,11 +10,11 @@
 
 ### D-01：detail 结构方案
 
-changes[] 和 extra 共存于一个 JSONB：
+结构化 `changes[]` 与补充性的 `extra` / `snapshot` 共存于同一份稳定审计载荷中：
 
 ```json
 {
-  "name": "资产名（快照）",
+  "name": "对象名（快照）",
   "changes": [
     {"field": "name", "action": "changed", "before": "旧", "after": "新"}
   ],
@@ -73,7 +73,7 @@ changes[] 和 extra 共存于一个 JSONB：
 
 ```sql
 idx_pal_project_created  ON (project_id, created_at DESC)
-idx_pal_asset            ON (project_id, asset_type, asset_id, created_at DESC)
+idx_pal_object           ON (project_id, object_type, object_id, created_at DESC)
 idx_pal_operator         ON (project_id, operator_id, created_at DESC)
 idx_pal_action           ON (project_id, action_type, created_at DESC)
 ```
@@ -82,15 +82,15 @@ idx_pal_action           ON (project_id, action_type, created_at DESC)
 
 **理由**:
 1. 表在 meta schema 下（`meta_{project_id}.project_audit_log`），每个 schema 只属于一个项目。表里的所有数据都已经是该项目的，`project_id` 列仅作为数据冗余，不需要进索引
-2. 核心查询维度是**按资产**：`(asset_type, asset_id, created_at DESC)` — 这是主索引
+2. 核心查询维度是**按对象**：`(object_type, object_id, created_at DESC)` — 这是主索引
 3. 从少开始，逐步加。PostHog 也是上线后根据实际查询补的索引
 
 **新索引方案**:
 ```sql
--- 主索引：按资产查询
-idx_pal_asset ON (asset_type, asset_id, created_at DESC)
+-- 主索引：按对象查询
+idx_pal_object ON (object_type, object_id, created_at DESC)
 
--- 辅助索引：按操作人和时间查询（可选，根据实际频率决定是否保留）
+-- 辅助索引：按操作人和时间查询（当前 V1 不要求，可后续按真实查询补）
 -- idx_pal_operator ON (operator_id, created_at DESC)
 -- idx_pal_action ON (action_type, created_at DESC)
 ```
@@ -121,7 +121,7 @@ idx_pal_asset ON (asset_type, asset_id, created_at DESC)
 
 **理由**:
 - 表在 meta schema 下，已经按 project_id 物理隔离了
-- 配合 `(asset_type, asset_id, created_at DESC)` 索引，单项目千万级查询够用
+- 配合 `(object_type, object_id, created_at DESC)` 索引，单项目千万级查询够用
 - 分区表在 PG 中有维护成本（分区裁剪、约束排除），V1 先去这个复杂度
 - 设计上保持扩展点：`created_at` 是 TIMESTAMPTZ，后续加按月分区不需要改业务代码
 
@@ -140,10 +140,10 @@ idx_pal_asset ON (asset_type, asset_id, created_at DESC)
 ```
 
 **待补充**:
-- 各资产类型的按类型排除字段（需各模块确认）
+- 各对象类型的按类型排除字段（需各模块确认）
 - 变更级排除（仅当这些字段变更时跳过记录）
 
-**操作**: 需要在 implement 阶段各资产类型配合提供排除字段清单
+**操作**: 需要在 implement 阶段各对象类型配合提供排除字段清单
 
 ---
 
@@ -188,22 +188,19 @@ detail JSON → serialize → < 64KB? → 直接写入
 
 ## 四、AB 模块兼容
 
-### D-10：AB 迁移策略
+### D-10：AB / Metric 历史迁移策略
 
 **要求**（已确定）:
 
 1. 旧 `details.operation_records` 保留不删
-2. 新操作全部写入新 `project_audit_log` 表
-3. 前端查询时合并展示新旧数据
+2. `metric_define_history` 作为历史债务的一部分，也需要映射进新的统一审计规范
+3. 所有历史 Wave 项目内对象操作记录复制到新审计表
+4. 升级后新操作只写新审计表，不要求双写
 
-**待讨论**:
-- 是否做一次数据回填：把旧的 `details.operation_records` 复制到新表？还是前端查询时做 UNION？
-- 如果回填，预计数据量？是一次性迁移还是在线迁移？
-
-**讨论**:
-- 回填的好处：查询逻辑统一，后续可以废弃旧字段
-- 不回填的好处：零风险，但查询层永远要处理两条路径
-- 折中：写一次性迁移脚本，但不作为上线 blocker，什么时候有空什么时候跑
+**结论**:
+- 不采用过渡期双写
+- 历史数据复制是需求的一部分，不是可选优化
+- 旧字段仅为兼容保留，不作为升级后新记录写入目标
 
 ---
 
@@ -241,11 +238,58 @@ detail JSON → serialize → < 64KB? → 直接写入
 
 ---
 
+### D-14：detail 物理存储形态
+
+**问题**: 审计 detail 是否使用 JSONB？是否可以直接存当前业务结构体？
+
+**决策**: **B — 不使用 JSONB，也不直接持久化现有业务结构体**。
+
+**理由**:
+- 用户明确优先考虑历史兼容和扩展性
+- 审计详情应是审计域自有的稳定 envelope，而不是跟随业务模型演化的镜像
+- 查询需求当前只要求按对象维度查看历史，不依赖数据库对 detail 做 JSON 结构查询
+
+**补充约束**:
+- 结构化 diff 优先
+- `extra` / `snapshot` 仅作必要补充，不要求完整快照
+- 物理列类型可在技术方案中在 `TEXT` / `BYTEA` 等非 JSONB 方案间定夺
+
+---
+
+### D-15：审计一致性等级（强审计 vs best-effort）
+
+**问题**: 审计写入失败时，主业务流程是否允许继续成功？
+
+**状态**: ⏳ 待评审，当前不做最终结论。
+
+**说明**:
+- 这会直接影响 `AuditService` 契约、事务边界、延迟目标和失败处理方式
+- 现有 `LogWithFallback` 只能作为候选方案之一，不能再被视为已定事实
+
+---
+
+### D-16：项目对象 vs 资产概念
+
+**要求**（已确定）:
+
+1. 审计规范不再沿用“资产”作为顶层概念
+2. 指标、事件、属性属于元数据对象，不算资产
+3. 项目内审计规范适用于资产对象和元数据对象
+4. 组织 / 项目级管理操作也要审计，但允许独立于 `project_audit_log`
+5. 账号最近登录 / 登出 / 活跃时间记录在 `account` 表，不进入项目对象审计表
+
+**结论**:
+- `project_audit_log` 是项目内对象的标准落盘表，不要求所有审计场景共用同一张表
+- `ObjectType` 应为审计域自有类型体系，而不是直接复用 `def.AssetType`
+- AB 与 Metric 是明确必须纳入统一规范的历史源
+
+---
+
 ## 五、待决策清单
 
 | ID | 议题 | 优先级 | 状态 |
 |----|------|--------|------|
 | D-07 | 排除字段清单 | P1 | ⏳ 需各模块确认 |
 | D-08 | 敏感字段掩盖粒度 | P1 | ⏳ 待定 |
-| D-10 | AB 迁移策略（回填？） | P1 | ⏳ 待定 |
+| D-15 | 审计一致性等级（强审计 vs best-effort） | P0 | ⏳ 待评审 |
 | D-13 | 是否记录 IP 地址 | P2 | ⏳ 待定 |

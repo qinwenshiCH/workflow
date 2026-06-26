@@ -1,7 +1,14 @@
-# 调研文档：Wave 项目操作记录历史债务与资产操作类型全景
+# 调研文档：Wave 项目操作记录历史债务与项目对象全景
 
 **日期**: 2026-06-26
 **范围**: `/Users/wenshiqin/wave-worktrees/add_audit_record`
+
+> 2026-06-26 最新共识补充：
+> - 目标审计规范不再沿用“资产”作为顶层概念，而是使用“项目内对象”
+> - 指标、事件、属性归类为元数据对象，不算资产，但适用同一审计规范
+> - AB 和 Metric 明确需要纳入统一规范
+> - 组织 / 项目级管理操作也需要审计，但允许独立于项目内标准表单独设计
+> - 账号最近登录 / 登出 / 活跃时间走 `account` 表字段，不进入项目对象审计表
 
 ---
 
@@ -44,7 +51,7 @@ graph TD
 | **状态** | `success`, `failed`, `verify_failed` |
 | **服务层** | `AuditService`（单例，`sync.Once`） |
 
-**问题**: 虽然是成熟的审计基础设施，但作用域在 global schema，面向运维后台，**完全不覆盖项目内的资产操作**。
+**问题**: 虽然是成熟的审计基础设施，但作用域在 global schema，面向运维后台，**完全不覆盖项目内对象的统一规范**。
 
 ---
 
@@ -154,9 +161,11 @@ graph LR
         AB_REC[AB JSONB records]
         BEH_ADD[AssetBehavior 未使用方法]
     end
-    subgraph "要保留的（不动）"
-        OP_AUDIT[OP 审计<br/>作用域不同]
-        MH_METRIC[Metric History<br/>迁移到新系统可考虑]
+    subgraph "也是历史债务，需纳入统一规范"
+        MH_METRIC[Metric History<br/>当前已明确纳入]
+    end
+    subgraph "独立系统，作用域不同"
+        OP_AUDIT[OP 审计<br/>global 运维域]
     end
     subgraph "新审计系统"
         NEW_AUDIT[project_audit_log]
@@ -166,11 +175,24 @@ graph LR
     BEH_ADD -->|替代| NEW_AUDIT
 ```
 
+这里需要把两个问题分开：
+
+1. `metric_define_history` **是历史债务的一部分**。它和 AB 内嵌记录、AssetBehavior 一样，都是 Wave 内部自发演化出来的独立“历史记录机制”。
+2. 虽然 `metric` 不在当前代码的 Asset 基础设施里，但根据最新共识，它**仍然属于项目内对象审计规范的范围**，应与 AB 一起收口到统一标准。
+
+因此更准确的说法是：
+
+- `metric_define_history` 属于**待统一的历史债务**
+- 当前目标不再是“只按资产收口”，而是建立**项目内对象统一审计规范**
+- 因此 `metric_define_history` 需要被吸收到该统一规范中，即使 `metric` 不属于现有 Asset 基础设施
+
 ---
 
 ## 二、各资产类型操作全景
 
 ### 2.1 资产类型总览
+
+> 本节仍按当前 Wave 代码里的 **资产基础设施现状** 展示：`AssetType` 常量、`asset_base_view / asset_view`、`asset_permission`、`favorites`、`asset_reference`、`asset_behavior` 都共用同一组 `asset_type + asset_id` 建模，因此 **这里的“资产”只是一种现状代码分类，不等于目标审计规范的最终范围**。
 
 | 资产类型 | 常量 | AssetOperator | 行为追踪 | 自有操作记录 | 审计覆盖 |
 |---------|------|:------------:|:--------:|:-----------:|:-------:|
@@ -180,6 +202,44 @@ graph LR
 | Experiment | `AssetExperiment` | ❌ 未注册 | ❌ | ✅ JSONB 内嵌 | ❌ |
 | Feature Gate | `AssetFeatureFlag` | ❌ 未注册 | ❌ | ✅ JSONB 内嵌 | ❌ |
 | Feature Config | `AssetFeatureConfig` | ❌ 未注册 | ❌ | ✅ JSONB 内嵌 | ❌ |
+
+### 2.1.1 Asset vs Metadata / Catalog 的代码边界
+
+Wave 当前代码里至少有两套并存的对象分类：
+
+1. **Asset 域**：
+   - 有明确 `AssetType` 常量
+   - 进入 `asset_base_view / asset_view`
+   - 参与 `asset_permission` / `favorites` / `asset_reference` / `asset_behavior`
+   - 当前是 6 类：Chart / Dashboard / Cohort / Experiment / Feature Gate / Feature Config
+
+2. **Metadata / Catalog 域**：
+   - 通过 `CatalogChangeType` 建模
+   - 进入 QE catalog 刷新链路和首页 metadata 搜索
+   - 包含 `tracked_event` / `virtual_event` / `event_property` / `user_property` / `virtual_property` / `cohort` / `metric`
+
+这两个集合 **有交集但不完全相同**：
+
+- `Cohort` 同时属于 Asset 域和 Catalog 域
+- `Metric` 当前只在 Catalog 域，不在 Asset 域
+- `Event / EventProperty / UserProperty / VirtualProperty / VirtualEvent` 当前只在 Catalog 域，不在 Asset 域
+
+因此，按当前最新共识，目标应从“资产审计”提升为“项目对象审计”：
+
+- 现有 Asset 域只是其中一部分
+- Metric、事件、属性等元数据对象也属于统一规范的适用范围
+- 是否复用同一张表可以按场景分层，但项目内标准模型需要统一
+
+同时还要注意：**当前 Asset 基础设施本身也没有完全长成**，不能机械地把“已经接了 asset infra 的对象”当成唯一范围依据。至少有几个明显信号：
+
+- `AssetOperator` 只注册了 Chart / Dashboard，其他 4 类仍在 TODO
+- `AssetOperator` 接口只有 CRUD，不覆盖 copy / status change / relate 等关键操作
+- 不同入口对 asset 集合的覆盖并不完全一致，例如首页搜索的 `assetTypes` 列表少了 `FEATURE_CONFIG`
+
+所以更稳妥的理解是：
+
+- 当前代码能帮助我们识别 **现有资产基础设施的边界**
+- 但产品规格仍应显式定义“首批要审计哪些项目对象”，不能反过来完全被未完善的 asset infra 绑死
 
 ---
 
@@ -370,23 +430,26 @@ func initAssetOperator() {
 
 ### 3.3 AB 内嵌记录的历史兼容策略
 
-AB 模块现有 `operation_records` 内嵌在 JSONB 中，数据不删。
-新系统上线后的双写策略：
+AB 模块现有 `operation_records` 内嵌在 JSONB 中，历史数据保留在原字段中，但需要在升级时一次性复制到新的 `project_audit_log`。
+新系统上线后的兼容策略：
 
 ```mermaid
 sequenceDiagram
-    participant SVC as 业务服务
-    participant NEW as 新 AuditService
+    participant MIG as 升级迁移
     participant OLD as 旧 JSONB 记录
     participant DB as project_audit_log
 
-    SVC->>OLD: 保留现有写入逻辑（兼容期）
-    SVC->>NEW: 新增 AuditService.Log() 调用
-    NEW->>DB: 写入 project_audit_log
-    Note over SVC,DB: 过渡期双写，后续逐步废弃 JSONB 记录
+    MIG->>OLD: 读取历史 operation_records
+    MIG->>DB: 复制为 imported legacy audit records
+    Note over MIG,DB: 一次性历史迁移
 ```
 
-查询端合并展示新旧数据，用户感知一致。
+迁移完成后：
+
+- 查询端只读 `project_audit_log`
+- 新产生的记录只写 `project_audit_log`
+- 不要求业务路径继续双写旧 `operation_records`
+- 旧字段保留，仅作为历史兼容兜底，不再作为主查询来源
 
 ### 3.4 AssetBehavior 的定位问题
 
