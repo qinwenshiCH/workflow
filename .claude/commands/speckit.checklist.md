@@ -1,4 +1,5 @@
 ---
+name: speckit.checklist
 description: Generate a custom checklist for validating requirements quality in the current feature.
 ---
 

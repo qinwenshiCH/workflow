@@ -238,6 +238,17 @@ specs/
 
 ---
 
+## Codex CLI
+
+在 Codex CLI 中运行时，适配差异如下：
+
+- `@speckit.specify <描述>` 替代 `/speckit.specify <描述>`，其余子命令同理
+- `simplify` 步骤改为手动代码审查（检查重复、死代码、复杂度）
+- `gstack.review` / `gstack.cso` 改为 `$gstack`
+- 审查步骤（Agent/background）改为依次执行
+
+---
+
 ## 语言
 
 所有文档、commit message、artifacts 使用中文。代码中的标识符保持英文。

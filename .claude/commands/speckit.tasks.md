@@ -1,4 +1,5 @@
 ---
+name: speckit.tasks
 description: Generate an actionable, dependency-ordered tasks.md from spec and plan artifacts.
 handoffs:
   - label: Analyze For Consistency

@@ -1,4 +1,5 @@
 ---
+name: speckit.analyze
 description: Non-destructive cross-artifact consistency and quality analysis across spec.md, plan.md, and tasks.md.
 ---
 

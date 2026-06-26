@@ -1,4 +1,5 @@
 ---
+name: speckit.implement
 description: Execute the implementation plan by processing all tasks in tasks.md phase by phase.
 ---
 

@@ -1,4 +1,5 @@
 ---
+name: speckit.constitution
 description: Review and update the project constitution (CLAUDE.md) to reflect current principles and governance.
 handoffs:
   - label: Build Specification

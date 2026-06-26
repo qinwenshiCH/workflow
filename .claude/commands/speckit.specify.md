@@ -1,4 +1,5 @@
 ---
+name: speckit.specify
 description: Create or update a feature specification from a natural language feature description.
 handoffs:
   - label: Build Technical Plan

@@ -1,4 +1,5 @@
 ---
+name: speckit.plan
 description: Generate implementation plan artifacts (plan.md, data-model.md) from the feature spec.
 handoffs:
   - label: Create Tasks
