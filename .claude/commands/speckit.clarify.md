@@ -31,7 +31,8 @@ Detect and reduce ambiguity or missing decision points in the active feature spe
 
 3. **Generate up to 5 clarification questions** prioritizing highest-impact categories. Each must be answerable as multiple-choice or short answer (≤5 words). Present ONE at a time with a recommended option.
 
-4. **After each answer**, update the spec in-memory. Create a `## Clarifications` section if needed with `### Session YYYY-MM-DD`. Append the Q&A and apply the clarification to the relevant section. Save after each integration.
+4. **After each answer**, update the spec in-memory. Create a `## Clarifications` section if needed with `### Session YYYY-MM-DD`. Append the Q&A and apply the clarification to the relevant section.
+   **Also record the decision**: Append a dated entry to `decisions.md` in the same spec directory, under the appropriate category from `specs/_template/decisions.md`. Save both files after each Q&A round.
 
 5. **Validation**: Ensure no contradictory statements remain, markdown is valid, and each clarification is applied.
 

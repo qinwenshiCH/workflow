@@ -10,6 +10,7 @@
 
 - 确认(2026-06-26): simplify、review 等审查工作使用独立子上下文（sub-agent / background task）执行，当前会话不直接运行；待子任务完成后获取结果，在当前会话汇总呈现给用户
 - 确认(2026-06-26): 本项目（workflow）的改动自动 commit；其他项目的改动等一批流程结束、人确认后再提交
+- 确认(2026-06-26): Spec 阶段决策即时写入 decisions.md（详见 CLAUDE.md「决策记录纪律」）
 
 ## Spec & 设计
 

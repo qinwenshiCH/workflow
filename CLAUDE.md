@@ -69,7 +69,7 @@ flowchart LR
 每次新会话启动时，AI 自动执行：
 
 1. 读取 `HABITS.md` — 加载你的工作偏好
-2. 如有活跃 spec（`specs/` 下未归档目录），加载其 `decisions.md`
+2. 如有活跃 spec（`specs/` 下未归档目录），加载其 `decisions.md` 和 `spec.md`
 3. 检查 `STATUS.md` — 了解项目当前状态
 
 ### Spec 阶段（你控制）
@@ -96,6 +96,8 @@ flowchart LR
 6. 你审核技术方案，可要求修改
 7. 你说"开始开发" → 进入 Dev 阶段
 ```
+
+**决策即时记录**：以上步骤 2/4/6 中每次与你达成共识的决策，AI 即时追加到 `specs/<目录>/decisions.md`（见「决策记录纪律」）。
 
 **启动方式**：`/speckit.specify <你的需求描述>`
 
@@ -135,10 +137,9 @@ flowchart LR
 
 ```
 1. 回顾本次开发中的用户偏好       → 更新 HABITS.md
-2. 记录 spec 设计决策             → 写入 specs/<目录>/decisions.md
-3. 更新 STATUS.md                 → 当前 change 移入已归档
-4. git add + git commit           → AI 自动提交
-5. 告知交付                       → "已完成，请体验"
+2. 更新 STATUS.md                 → 当前 change 移入已归档
+3. git add + git commit           → AI 自动提交
+4. 告知交付                       → "已完成，请体验"
 ```
 
 归档即触发提交。提交后工作区干净，可进入下一 change。
@@ -167,6 +168,13 @@ flowchart LR
 ---
 
 ## 全局纪律
+
+**决策记录纪律：**
+
+- Spec 阶段每次与你达成共识的决策（范围、优先级、技术选型、边界处理等），AI **即时（immediately）** 追加到 `specs/<目录>/decisions.md`
+- 不得等待归档时再补写——决策在讨论中产生，立即落盘
+- 每次新会话加载活跃 spec 时，自动读入 `decisions.md`，避免重复讨论已定事项
+- decisions.md 分类记录（范围/架构/边界/数据模型/其他），按日期排序
 
 **Commit 纪律：**
 
