@@ -181,13 +181,15 @@
 
 **优先级理由**: 用户已经明确要求组织、项目的操作也必须有记录；否则系统只覆盖项目内对象，整体责任链路仍然是不完整的。
 
-**独立测试**: 修改组织配置、调整项目配额或模板，验证系统产生对应的审计记录，且记录链路不依赖 `project_audit_log` 单表假设。
+**独立测试**: 修改组织配置、调整项目配额或模板，验证系统产生对应的审计记录，且记录链路不依赖 `object_audit_log` 单表假设。
 
 **验收场景**:
 
-1. **Given** 管理员修改组织配置，**When** 保存成功，**Then** 系统产生一条组织级审计记录
-2. **Given** 管理员调整项目配额或项目模板，**When** 保存成功，**Then** 系统产生一条项目级管理审计记录
-3. **Given** 技术方案决定组织 / 项目级管理操作不复用 `project_audit_log`，**When** 实施方案落地，**Then** 规格仍明确其记录责任、查询责任和存储位置
+1. **Given** 管理员添加成员到组织，**When** 添加成功，**Then** `global.op_operation_log` 出现 `add_org_member` 记录，含 `account_id` 和角色信息
+2. **Given** 管理员变更成员角色（如 Analyst → Admin），**When** 保存成功，**Then** 出现 `update_org_member_level` 记录，含 `old_level` / `new_level`
+3. **Given** 管理员移除组织成员，**When** 操作成功，**Then** 出现 `remove_org_member` 记录
+4. **Given** 用户创建/删除组织或项目，**When** 操作成功，**Then** 出现对应 `create_org` / `archive_org` / `create_project` / `delete_project` 记录
+5. **Given** OP 管理员修改组织配置/项目配额（已有），**When** 保存成功，**Then** 继续沿用现有 `update_org_config` / `update_project_quota` 记录，不做变更
 
 ---
 
@@ -242,15 +244,20 @@
 
 ### 功能需求
 
-- **FR-001**: 系统 MUST 为项目内对象定义统一审计规范，并在 meta schema 下提供 `project_audit_log` 作为项目内对象的标准落盘表
+- **FR-001**: 系统 MUST 为项目内对象定义统一审计规范，并在 meta schema 下提供 `object_audit_log` 作为项目内对象的标准落盘表
 - **FR-002**: 系统 MUST 提供 `AuditService` 作为公共写入入口，支持 `Log(ctx, input)` 和 `BatchLog(ctx, inputs)` 方法
 - **FR-003**: 审计规范 MUST 使用审计域自有的 `ObjectType` 体系，不直接沿用 `def.AssetType` 作为顶层概念；该体系至少能表达资产对象与元数据对象
 - **FR-004**: 对已接入现有基础设施的对象类型（如 CHART / DASHBOARD），系统 MUST 在对象操作实现中自动调用审计记录
 - **FR-005**: 对非 AssetOperator、元数据对象或需要手动控制写入的场景，系统 MUST 支持模块直接调用 `AuditService.Log()` 记录
-- **FR-006**: 系统 MUST 提供按对象视角的审计日志分页查询接口，V1 至少支持 `project_id`、`object_type`、`object_id` 过滤，按 `created_at DESC` 排序；该接口优先供 OP / 内部链路调用
+- **FR-006**: 系统 MUST 提供按对象视角的审计日志分页查询接口，V1 至少支持 `object_type`、`object_id` 过滤，按 `created_at DESC` 排序；表在 project schema 内天然隔离，不出 project scope；该接口优先供 OP / 内部链路调用
 - **FR-007**: AB / Metric / Wave 项目内历史操作记录 MUST 复制到新审计规范中，旧字段或旧表保留不删；升级后新操作只写新审计表
-- **FR-008**: 组织 / 项目级管理操作 MUST 具备审计记录能力，但允许采用独立于 `project_audit_log` 的存储结构或表
-- **FR-009**: 账号最近登录时间、最近登出时间、最近活跃时间 MUST 记录在 `account` 表或等价账号主表，不要求写入 `project_audit_log`
+- **FR-008**: 以下组织 / 项目级管理操作 MUST 记录在 global schema，不写入 `object_audit_log`。OP 端配置操作继续走 `global.op_operation_log`；Member + 生命周期操作进入新表 `global.management_audit_log`（OP 未来可能独立拆分，member 数据不应随 OP 迁移）：
+  - **组织成员**：添加成员（`add_org_member`）、变更成员角色/级别（`update_org_member_level`）、替换主管（`replace_org_supervisor`）、移除成员（`remove_org_member`）
+  - **组织生命周期**：创建组织（`create_org`）、归档组织（`archive_org`）
+  - **项目生命周期**：创建项目（`create_project`）、删除项目（`delete_project`）
+  - 以下明确 V1 不做：项目成员变更（被 org member 覆盖）、邀请操作（成员加入已有 add）、重命名（排障价值低）、预设角色变更（极低频）
+- **FR-009**: 账号最近登录时间（`last_login_at`）、最近登出时间（`last_logout_at`）、最近活跃时间（`last_active_at`）MUST 作为 3 个 `TIMESTAMPTZ NULL` 列记录在 `global.account` 表。写入点：登录成功（密码 + OAuth）写 `last_login_at`；登出成功写 `last_logout_at`；`last_active_at` 通过 Redis SetNX 做 15 分钟节流刷新，每个认证请求触发但同一账号 15 分钟内最多写一次 DB。不要求写入 `object_audit_log`
+- **FR-009-bis**: 会话活跃刷新 MUST 在 Redis 不可用时降级为每次写 DB（不阻塞请求），并记录 warning 日志。
 - **FR-010**: 系统 MUST 在技术方案中明确审计写入的一致性等级与失败策略（强审计或 best-effort）；当前评审前不预设 `LogWithFallback` 为最终结论
 - **FR-011**: 系统 MUST 保留支撑内部排障所需的最小归因信息集合：`object_type`、`object_id`、`action_type`、`operator_id`、`operator_name`、`source`、`created_at` 以及必要的结构化变更详情
 - **FR-012**: V1 的查询接口与索引策略 MUST 优先优化“单对象最近变更链路”的排查路径，而不是优先满足按操作人、按组织范围的广义分析型查询
@@ -269,13 +276,12 @@
 
 ## 关键实体
 
-### project_audit_log（meta schema 表）
+### object_audit_log（meta schema 表）
 
 | 字段 | 类型 | 约束 | 说明 |
 |---|---|---|---|
 | `id` | BIGSERIAL | PK | 自增主键 |
-| `project_id` | INTEGER | NOT NULL | 所属项目 ID（数据冗余，meta schema 已隔离） |
-| `object_type` | VARCHAR(64) | NOT NULL | 审计对象类型：如 CHART / DASHBOARD / COHORT / EXPERIMENT / FEATURE_GATE / FEATURE_CONFIG / METRIC / TRACKED_EVENT / EVENT_PROPERTY / USER_PROPERTY / VIRTUAL_PROPERTY / VIRTUAL_EVENT |
+| `object_type` | VARCHAR(64) | NOT NULL | 审计对象类型：如 CHART / DASHBOARD / COHORT 等，详见 plan.md 枚举规范 |
 | `object_id` | INTEGER | NOT NULL | 对象 ID |
 | `object_name` | VARCHAR(255) | NOT NULL DEFAULT '' | 记录时的对象名称展示快照，便于列表展示和删除后追溯，不随对象后续改名回写 |
 | `action_type` | VARCHAR(32) | NOT NULL | 操作类型：create / update / delete / copy |
@@ -298,14 +304,14 @@
 
 审计域使用自有的 `ObjectType` 字符串体系，不直接复用 `def.AssetType`。当前至少需要表达：
 
-- **资产对象**：`CHART` / `DASHBOARD` / `COHORT` / `EXPERIMENT` / `FEATURE_GATE` / `FEATURE_CONFIG`
+- **资产对象**：`CHART` / `DASHBOARD` / `COHORT` / `EXPERIMENT` / `FEATURE_GATE` / `FEATURE_CONFIG` / `PIPELINE`
 - **元数据对象**：`METRIC` / `TRACKED_EVENT` / `VIRTUAL_EVENT` / `EVENT_PROPERTY` / `USER_PROPERTY` / `VIRTUAL_PROPERTY`
 - **扩展原则**：后续新增对象类型时，通过增加新的 `ObjectType` 常量接入，无需改变整体审计模型
 
 ### 其他审计落点
 
-- **组织 / 项目级管理审计**：允许使用独立于 `project_audit_log` 的存储结构，可以基于现有 `global.op_operation_log` 演进，也可以设计新的 global 级记录表
-- **账号活跃字段**：`last_login_at` / `last_logout_at` / `last_active_at` 记录在 `account` 表或等价账号主表，不进入项目对象审计表
+- **组织 / 项目级管理审计**：继续沿用现有 `global.op_operation_log`，不新建表。当前通过 `apps/web/op/service/audit.go` 写入，已覆盖 `update_org_config` / `update_project_quota` / `update_project_init_quota` / 客户管理（create_invite / bind_customer / expire_customer / update_profile / save_contracts）。V1 需做的是：补全组织/项目管理操作 inventory，确保无遗漏，并补齐查询接口。不做 global 审计模型重构
+- **账号活跃字段**：3 个 `TIMESTAMPTZ NULL` 列直接加在 `global.account` 表上。`last_login_at` 在 `LoginAccount` / `OauthCallback` controller 写，`last_logout_at` 在 `LogoutAccount` controller 写，`last_active_at` 在 `SessionMiddleware` 通过 Redis SetNX 15min 节流刷新。详情见 plan.md 2.3
 
 ### AuditService（公共审计服务）
 
@@ -318,8 +324,7 @@
 **AuditWriteInput**:
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| ProjectID | int64 | 是 | |
-| ObjectType | string | 是 | 审计域自有类型，不要求必须来自 `def.AssetType` |
+| ObjectType | string | 是 | 审计域自有类型 |
 | ObjectID | int64 | 是 | |
 | ObjectName | string | 否 | 写入时快照 |
 | ActionType | string | 是 | |
@@ -343,10 +348,11 @@
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `name` | string | 否 | 资源的展示名称（记录时的快照） |
 | `changes` | Change[] | 否 | 字段级变更列表 |
 | `extra` | object | 否 | 领域特定扩展信息（如 copy 的 source） |
-| `snapshot` | object | 否 | 必要时补充的稳定快照片段，不要求完整业务结构体 |
+| `snapshot` | object | 否 | 必要时补充的稳定快照片段（如 delete 场景下的规则摘要），不要求完整业务结构体 |
+
+注：对象名称快照由表字段 `object_name` 承载，`detail` 内不重复。`operator_name` 同理。若 name 在本次操作中被变更，通过 `changes` 中 `field: "name"` 的 before/after 体现。
 
 **Change 结构**:
 
@@ -360,7 +366,6 @@
 **create 场景**（初始状态的字段列表）:
 ```json
 {
-    "name": "新图表",
     "changes": [
         {"field": "name", "action": "created", "after": "新图表"},
         {"field": "type", "action": "created", "after": "line"},
@@ -372,7 +377,6 @@
 **update 场景**（仅包含有变更的字段）:
 ```json
 {
-    "name": "新名称",
     "changes": [
         {"field": "name", "action": "changed", "before": "旧名称", "after": "新名称"},
         {"field": "description", "action": "changed", "before": "旧描述", "after": "新描述"}
@@ -383,7 +387,6 @@
 **delete 场景**（变更可以为空，至少保留 name 快照，必要时补充 snapshot）:
 ```json
 {
-    "name": "已删除图表",
     "snapshot": {
         "version": 7,
         "dashboard_id": 42
@@ -394,7 +397,6 @@
 **AB 状态变更 / 上线场景**（通过 changes[] 中的字段级变更表达状态变化）:
 ```json
 {
-    "name": "experiment-v2",
     "changes": [
         {"field": "status", "action": "changed", "before": "DRAFT", "after": "RUNNING"},
         {"field": "rollout_percentage", "action": "changed", "before": 0, "after": 100}
@@ -405,7 +407,6 @@
 **copy 场景**:
 ```json
 {
-    "name": "副本名称",
     "extra": {
         "source_object_id": 123,
         "source_object_name": "原始名称"
@@ -425,10 +426,17 @@
 
 ### 敏感字段掩盖
 
-涉及敏感信息的字段，在 `before` / `after` 中统一替换为字符串 `"masked"`：
-- Integration 的 `config`, `sensitive_config`
-- User 的 `email`, `password`
-- 各对象类型自行声明敏感字段列表
+审计模块不实现独立的屏蔽逻辑，由各调用方/registry 在写入前完成脱敏。现有 Wave 基础设施：
+
+| 字段 | 现有掩码方式 | 审计适配 |
+|------|------------|---------|
+| 邮箱 | `ulog.MaskEmail()` — 保留首字符 + `***` | 直接复用 |
+| 密码/密钥/token | 不读 DB 明文，业务层不持有可审计值 | `before`/`after` 统一写 `"masked"` |
+| Integration 的 config/sensitive_config | 各 integration 自行脱敏 | 关注点不在审计模块，由 integration 调用方在写入前处理 |
+| Webhook/API endpoint 含凭据 | pipeline/AB target 的后端配置 | 调用方负责剔除敏感字段后再传入 |
+| OAuth client credentials | OAuth 域管理 | 不进入审计字段投影 |
+
+审计模块提供 `MaskedValue = "masked"` 常量，各对象 registry 在声明敏感字段时标注，diff 引擎直接输出 `"masked"` 而不尝试读取实际值。粗粒度字段值的掩码（如邮箱脱敏）由调用方使用 `ulog.MaskEmail()` 处理。
 
 ### 变更检测（diff 引擎）
 
