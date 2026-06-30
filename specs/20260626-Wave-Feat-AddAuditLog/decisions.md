@@ -22,8 +22,8 @@
 
 ## 架构 & 技术选型
 
-- 2026-06-26: `project_audit_log`（meta schema）是**项目内对象**的标准落盘表，但审计体系不要求所有场景都共用这一张表
-- 2026-06-26: 组织 / 项目级管理操作可以基于现有 `global.op_operation_log` 演进，或设计新的 global 级记录表；不强行并入 `project_audit_log`
+- 2026-06-26: `project_activity_log`（meta schema）是**项目内对象**的标准落盘表，但审计体系不要求所有场景都共用这一张表
+- 2026-06-26: 组织 / 项目级管理操作可以基于现有 `global.op_operation_log` 演进，或设计新的 global 级记录表；不强行并入 `project_activity_log`
 - 2026-06-26: 审计一致性等级（强审计 vs best-effort）重新打开，需在方案评审中显式定夺；`LogWithFallback` 仅作为候选方案，不视为最终结论
 - 2026-06-26: detail 采用**审计域自有的版本化载荷**，结构化 `changes: [{field, action, before, after}]` 优先，必要时允许 `extra` / `snapshot` 补充；不使用 JSONB，不直接持久化现有业务结构体（来源：PostHog 研究 D-01 + 本轮会话确认）
 - 2026-06-26: V1 的查询路径和索引策略优先服务**单对象变更链路排查**，不优先按操作人或全局分析视角优化
@@ -34,14 +34,14 @@
 - 2026-06-30: **BatchLog 原子性**：同一业务事务内的多条审计记录通过 `BatchLog` 一次性写入。任一记录的核心字段写入失败 → 整体失败 → 业务事务回滚。
 - 2026-06-30: **审计保留策略**：V1 不实现自动清理，预留 `created_at` 作为未来分区键；按月份分区为推荐扩展路径。
 - 2026-06-30: `detail_payload` 使用 BYTEA + LZ4 压缩——LZ4 压缩后是二进制数据，BYTEA 是自然选择。不使用 JSONB，因为 V1 查询只按 (object_type, object_id) 过滤，不在 detail 上做搜索。未来如需全文检索 detail，需评估从 TEXT / JSONB + GIN 索引迁移的成本。
-- 2026-06-30: `meta.audit_log` 部署在 project schema（meta），`project_id` 列冗余，不设。索引为 `(object_type, object_id, created_at DESC)`。
+- 2026-06-30: `meta.activity_log` 部署在 project schema（meta），`project_id` 列冗余，不设。索引为 `(object_type, object_id, created_at DESC)`。
 - 2026-06-30: **枚举规范最终定义**：
   - `ObjectType` 使用 UPPER_SNAKE_CASE 字符串，共 13 个值（含 PIPELINE）
   - `action_type` 使用全小写描述性字符串，所有常量**统一定义在 `auditlog/types.go`**（守口到审计模块）。新增 action_type 需在此文件加 const 并 PR review 确认语义无重叠。
   - 内部操作（冲突解决）的 action_type 与正常操作保持一致，用 `source="internal"` 区分。
   - `source` 使用全小写字符串，共 4 个值：`web` / `openapi` / `internal` / `backfill`
-- 2026-06-30: **表名定稿为 `meta.audit_log`**（在 project schema 内，`project_` 前缀冗余）。
-- 2026-06-30: **两期交付策略**：第一期（Phase 0+1）交付项目对象审计底座（meta.audit_log + auditlog 模块 + 对象 live-write + 历史迁移 + OP 查询），独立可验证。第二期（Phase 2+3）交付 metadata 长尾 + account/org/project 管理审计。两期分别 commit，但都在本 spec 内完成。
+- 2026-06-30: **表名定稿为 `meta.activity_log`**（在 project schema 内，`project_` 前缀冗余）。
+- 2026-06-30: **两期交付策略**：第一期（Phase 0+1）交付项目对象审计底座（meta.activity_log + auditlog 模块 + 对象 live-write + 历史迁移 + OP 查询），独立可验证。第二期（Phase 2+3）交付 metadata 长尾 + account/org/project 管理审计。两期分别 commit，但都在本 spec 内完成。
 
 ## 边界 & 异常处理
 
@@ -65,7 +65,7 @@
 - 2026-06-29: `operator_name`、`object_name` 都按展示快照处理，不要求随主表数据变更回写历史
 - 2026-06-26: 新增 `source` 字段，区分操作来源：web / openapi / internal / backfill（D-13）
 - 2026-06-26: 不需要 `operation_group_id`，同一条记录天然是一组操作（D-12）
-- 2026-06-26: 账号最近登录/登出/活跃时间不进入 `project_audit_log`，而是作为账号活跃字段落在 `account` 表或等价账号主表
+- 2026-06-26: 账号最近登录/登出/活跃时间不进入 `project_activity_log`，而是作为账号活跃字段落在 `account` 表或等价账号主表
 - 2026-06-29: `detail_version` 表示 `detail_payload` 的 schema version，不是业务对象版本号；V1 固定为 `1`，仅在 detail 解码语义发生不兼容变化时升级
 - 2026-06-29: `created_at` 直接定义为操作时间 / 审计事件时间，而不是数据库插入时间；历史迁移时回填旧事件时间
 - 2026-06-30: V1 不记录 IP 地址。排障场景 operator_id 已够用，不增加字段复杂度。
@@ -80,7 +80,7 @@
 ## 其他
 
 - 2026-06-29: 审计日志默认对官方产品用户不可见；V1 以 OP / 内部接口消费为主，页面不是前置要求
-- 2026-06-30: **Member/生命周期审计不往 `op_operation_log` 塞**。新建 `global.global.audit_log`（增加 `org_id`/`project_id`，无 `customer_id`/`result_status`/`error_message`）。理由：`op_operation_log` 为 OP 设计，OP 未来可能独立拆分，member 数据不应随 OP 迁移。OP 端 9 项配置操作继续走 `op_operation_log` 不动。
+- 2026-06-30: **Member/生命周期审计不往 `op_operation_log` 塞**。新建 `global.global.activity_log`（增加 `org_id`/`project_id`，无 `customer_id`/`result_status`/`error_message`）。理由：`op_operation_log` 为 OP 设计，OP 未来可能独立拆分，member 数据不应随 OP 迁移。OP 端 9 项配置操作继续走 `op_operation_log` 不动。
 - 2026-06-30: **ObjectType 常量也统一定义在 `auditlog/types.go`**，与 action_type 同文件。
 - 2026-06-30: **plan.md 拆分为 3 个**：`plan-object.md`（项目对象审计）、`plan-org.md`（组织/项目管理审计）、`plan-account.md`（账号活跃字段），三条链路独立演进、独立 commit。
 - 2026-06-30: 同一事务中跨对象操作（如 CopyDashboard 同时复制 dashboard 和 charts）产生多条审计记录，通过 `BatchLog` 写入，共享事务。
@@ -88,18 +88,18 @@
 
 ## autoplan 审查（2026-06-30）
 
-- 2026-06-30: **global.audit_log 的 action_type** 使用自有枚举（create/update/delete），不共享 meta.audit_log 的枚举。域操作语义由 object_type + detail_payload 承载，不设 object_action 字段。模块可注册新 object_type 来扩展，无需改 action_type。
+- 2026-06-30: **global.activity_log 的 action_type** 使用自有枚举（create/update/delete），不共享 meta.activity_log 的枚举。域操作语义由 object_type + detail_payload 承载，不设 object_action 字段。模块可注册新 object_type 来扩展，无需改 action_type。
 - 2026-06-30: **新增操作人索引 idx_audit_operator**。支撑"按操作人反查组织操作"的排障路径。新增 DAO 方法 ListByOperator。
 - 2026-06-30: **BatchInsert 上限 500 行**。超过时调用方自行分批，DAO 层不接受超过 500 行的参数。
 - 2026-06-30: **增加 write-only feature flag**。部署方案增加 feature flag 保护，异常时可快速关闭审计写入而不影响业务逻辑。
-- 2026-06-30: **detail 格式与 meta.audit_log 对齐**。global.audit_log 增加 detail_version + detail_payload（替代原 detail TEXT），V1 固定 detail_version=1。
-- 2026-06-30: **一致性模型由调用方决定**。审计服务层提供 `Log`（强审计）和 `LogWithFallback`（best-effort）两种方法，管理审计推荐 `LogWithFallback`，但不硬编码。detail_payload 大小约束对齐 meta.audit_log（64KB + LZ4）。
+- 2026-06-30: **detail 格式与 meta.activity_log 对齐**。global.activity_log 增加 detail_version + detail_payload（替代原 detail TEXT），V1 固定 detail_version=1。
+- 2026-06-30: **一致性模型由调用方决定**。审计服务层提供 `Log`（强审计）和 `LogWithFallback`（best-effort）两种方法，管理审计推荐 `LogWithFallback`，但不硬编码。detail_payload 大小约束对齐 meta.activity_log（64KB + LZ4）。
 
 ## autoplan scope 确认（2026-06-30）
 
 - 2026-06-30: **PROJECT_MEMBER 确认纳入 V1**。与 org/member 独立，是独立的权限授予操作。
-- 2026-06-30: **不承诺统一查询层**。op_operation_log / global.audit_log / meta.audit_log 三套独立存储，按需分别查询。
-- 2026-06-30: **UpdateAccountProjectAuths 是一条 global.audit_log 记录**。记录 action_type=update, object_type=ORG_MEMBER，detail 含变更摘要。
-- 2026-06-30: **邀请流程**：邀请建在自有表上，接受邀请后触发 global.audit_log 记录。邀请本身（创建/发送/撤回）不落审计。
-- 2026-06-30: **OP 操作 vs 客户操作分界**：OP 人员在 OP 后台的操作走 op_operation_log；客户在业务系统中的操作走 global.audit_log。OP 未来在内部接口同时展示两类日志。
+- 2026-06-30: **不承诺统一查询层**。op_operation_log / global.activity_log / meta.activity_log 三套独立存储，按需分别查询。
+- 2026-06-30: **UpdateAccountProjectAuths 是一条 global.activity_log 记录**。记录 action_type=update, object_type=ORG_MEMBER，detail 含变更摘要。
+- 2026-06-30: **邀请流程**：邀请建在自有表上，接受邀请后触发 global.activity_log 记录。邀请本身（创建/发送/撤回）不落审计。
+- 2026-06-30: **OP 操作 vs 客户操作分界**：OP 人员在 OP 后台的操作走 op_operation_log；客户在业务系统中的操作走 global.activity_log。OP 未来在内部接口同时展示两类日志。
 - 2026-06-30: **第一期受众为内部排障**。查询端点通过 OP 内部接口暴露，不对外。

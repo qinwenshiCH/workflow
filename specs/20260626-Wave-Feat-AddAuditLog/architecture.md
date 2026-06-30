@@ -5,7 +5,7 @@
 ## 设计原则
 
 - **共享引擎**：ObjectType 枚举、detail 序列化（LZ4 + BYTEA）、diff 引擎三件套与两个表共用
-- **独立存储**：`meta.audit_log` 在 project schema（meta）内，`global.audit_log` 在 global schema 内。不试图统一
+- **独立存储**：`meta.activity_log` 在 project schema（meta）内，`global.activity_log` 在 global schema 内。不试图统一
 - **显式路由**：`WriteObjectLog` / `WriteMgmtLog`，调用方选哪个就写哪个表，不搞自省
 - **展示快照**：`object_name` 和 `operator_name` 写入时快照，不随主表变更回写
 
@@ -26,8 +26,8 @@ apps/web/service/auditlog/      # 服务层
   auditlog.go                   # AuditService 单例（WriteObjectLog / WriteMgmtLog）
 
 script/migration/scripts/
-  meta_v20260701_audit_log.sql    # meta.audit_log DDL
-  global_v20260701_audit_log.sql    # global.audit_log DDL
+  meta_v20260701_activity_log.sql    # meta.activity_log DDL
+  global_v20260701_activity_log.sql    # global.activity_log DDL
 ```
 
 ## 架构图
@@ -54,7 +54,7 @@ flowchart TD
 
 ## 存储
 
-### meta.audit_log（project schema）
+### meta.activity_log（project schema）
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -72,9 +72,9 @@ flowchart TD
 
 索引：`(object_type, object_id, created_at DESC)`
 
-### global.audit_log（global schema）
+### global.activity_log（global schema）
 
-同 meta.audit_log + org_id（BIGINT NOT NULL）+ project_id（BIGINT DEFAULT NULL）。
+同 meta.activity_log + org_id（BIGINT NOT NULL）+ project_id（BIGINT DEFAULT NULL）。
 
 索引：
 - `(org_id, object_type, created_at DESC)`
@@ -86,8 +86,8 @@ flowchart TD
 
 | 链路 | 存储 | 覆盖范围 |
 |---|---|---|
-| **项目对象审计** | `meta.audit_log` | Chart / Dashboard / Cohort / AB / Metric / Pipeline / Event / Property |
-| **客户管理审计** | `global.audit_log` | 组织/项目生命周期、成员管理、权限同步 |
+| **项目对象审计** | `meta.activity_log` | Chart / Dashboard / Cohort / AB / Metric / Pipeline / Event / Property |
+| **客户管理审计** | `global.activity_log` | 组织/项目生命周期、成员管理、权限同步 |
 | **OP 操作审计** | `global.op_operation_log`（不变） | OP 人员的组织/项目配置操作 |
 | **账号活跃字段** | `global.account` 表 3 列 | last_login_at / last_logout_at / last_active_at |
 

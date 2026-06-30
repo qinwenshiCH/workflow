@@ -1,6 +1,6 @@
 <!-- /autoplan restore point: /Users/wenshiqin/.gstack/projects/qinwenshiCH-workflow/main-autoplan-restore-20260629-155919.md -->
 
-# 技术方案：项目对象审计（meta.audit_log）
+# 技术方案：项目对象审计（meta.activity_log）
 
 > 本方案聚焦项目内对象审计。组织/项目管理审计见 [plan-org.md](./plan-org.md)，账号活跃字段见 [plan-account.md](./plan-account.md)。
 
@@ -20,7 +20,7 @@
 
 ### 2.1 项目内对象标准审计
 
-这一层是本次主线，统一落到 `meta.audit_log`。
+这一层是本次主线，统一落到 `meta.activity_log`。
 
 首批对象范围：
 
@@ -41,17 +41,17 @@
 
 | 模块 | 职责 | 建议落点 | 参考现状 |
 |---|---|---|---|
-| 审计域类型 | `ObjectType`、`ActionType`、`AuditDetail`、`Change`、query DTO | `apps/web/service/auditlog/types.go` | `spec.md` 的 `audit_log` / detail 约定 |
+| 审计域类型 | `ObjectType`、`ActionType`、`AuditDetail`、`Change`、query DTO | `apps/web/service/auditlog/types.go` | `spec.md` 的 `activity_log` / detail 约定 |
 | 公共服务 | `Log` / `BatchLog` / `ListByQuery` | `apps/web/service/auditlog/service.go` | OP 审计的 `apps/web/op/service/audit.go` |
 | diff 引擎 | 结构化变更生成、排除字段、敏感字段掩盖 | `apps/web/service/auditlog/diff.go` | `research.md` 对 PostHog 结构化 diff 的总结 |
 | 对象注册表 | 各对象的字段投影、排除规则、mask 规则、对象名提取 | `apps/web/service/auditlog/registry.go` | 现有 `AssetOperator` 只覆盖 Chart / Dashboard，不能作为完整真相 |
-| 持久化 DAO | `audit_log` 表 CRUD + 批量插入 + 分页查询 | `apps/web/dao/auditlog/object.go` | `meta.metric_define_history` / `op_operation_log` DAO 风格 |
+| 持久化 DAO | `activity_log` 表 CRUD + 批量插入 + 分页查询 | `apps/web/dao/auditlog/object.go` | `meta.metric_define_history` / `op_operation_log` DAO 风格 |
 | OP 查询接口 | 内部排障查询 API | `apps/web/op/controller/project_audit.go` + `apps/web/op/service/project_audit.go` | 现有 OP `ListByQuery` 模式 |
 | 迁移任务 | AB / Metric 历史导入，新表回填 | `script/migration/scripts/...` + `apps/web/cmd/...` 或等价任务入口 | 现有 OP 迁移脚本模式 |
 
 ### 4.2 数据模型
 
-项目内标准落点继续采用 `spec.md` 已定义的 `meta.audit_log`：
+项目内标准落点继续采用 `spec.md` 已定义的 `meta.activity_log`：
 
 - 主键：`id`
 - 主查询键：`(object_type, object_id, created_at DESC)`
@@ -62,7 +62,7 @@
 
 #### 4.2.1 枚举规范
 
-所有 `audit_log` 的枚举值采用字符串类型（非 int），自描述，不依赖代码注释。
+所有 `activity_log` 的枚举值采用字符串类型（非 int），自描述，不依赖代码注释。
 
 **ObjectType** — 被审计对象的类型，UPPER_SNAKE_CASE：
 
@@ -314,7 +314,7 @@ V1 不承诺：
 | `ab_feature_flag.details.operation_records` | 是 | 这是 AB 唯一真实历史源，必须统一收口 |
 | `meta.metric_define_history` | 是 | 属于明确历史债务，且 Metric 已纳入统一规范 |
 | `meta.asset_behavior` | 否 | 当前实际只有 VIEW 有效，且不具备可靠审计语义 |
-| `global.op_operation_log` | 否 | 作用域不同（OP 配置操作），继续留在 global 管理审计链路；客户侧管理操作已进入 `global.audit_log` |
+| `global.op_operation_log` | 否 | 作用域不同（OP 配置操作），继续留在 global 管理审计链路；客户侧管理操作已进入 `global.activity_log` |
 
 迁移时的映射规则：
 
@@ -348,7 +348,7 @@ V1 不承诺：
 
 ### 4.7 审计场景全量目录
 
-以下是对审计范围内所有操作的完整盘点。每条记录进入 `meta.audit_log`，标注 `[G]` 表示该操作同时影响 global 审计域（但项目内审计行仍写入 `audit_log`）。
+以下是对审计范围内所有操作的完整盘点。每条记录进入 `meta.activity_log`，标注 `[G]` 表示该操作同时影响 global 审计域（但项目内审计行仍写入 `activity_log`）。
 
 #### 4.7.1 资产对象
 
@@ -485,25 +485,25 @@ Pipeline 目前**完全没有操作审计**。现有的执行级日志（`exec_i
 | 删除 Pipeline | `delete` | web/openapi | 至少 `name` 快照 | `snapshot.pipeline_type`, `snapshot.work` | 软删除 |
 | 停止 Pipeline | `stop` | web/openapi/mcp | `exec_status` before/after | `extra.stop_reason` | 用户主动停止 |
 
-以下**不进入** `audit_log`：
+以下**不进入** `activity_log`：
 - Pipeline Process（系统级执行，已有 `exec_info` 和 batch_export_run 跟踪）
 - Pipeline callback（AB target 状态同步，属基础设施层状态变更）
 
 #### 4.7.5 明确不进入项目审计表的操作
 
-以下操作有变更，但**不写入** `audit_log`：
+以下操作有变更，但**不写入** `activity_log`：
 
 | 操作 | 不记录原因 | 替代落点 |
 |------|-----------|---------|
 | `asset_behavior` 的 VIEW/MODIFY/DELIVER 记录 | 分析/热度用途，非审计语义 | 保持现有 `asset_behavior` 表 |
 | Cohort 定时重算执行（RunCohortJob cron 回调）| 系统自动运维操作，非用户触发 | scheduler 自身日志 |
 | Cohort 清理任务（cohort-clean cron）| 系统维护操作 | scheduler 自身日志 |
-| AB target pipeline 状态同步（pipeline callback）| 基础设施层状态变更 | 可考虑后续加入 `audit_log`，V1 先不做 |
+| AB target pipeline 状态同步（pipeline callback）| 基础设施层状态变更 | 可考虑后续加入 `activity_log`，V1 先不做 |
 | AB 调度报告任务创建/停止 | 已在 Experiment/Update status→Online/Offline 的 `extra` 中引用 | 不单独成行 |
 | Asset 收藏（Add/Remove）| 轻量交互，排障价值低 | 保持现有 `asset_favorite` 表 |
 | Asset 权限变更 | V1 先不做，后续可扩展 | 无当前落点 |
-| 项目成员增删/角色变更 | global 管理审计域 | `global.audit_log` |
-| 组织成员管理 | global 管理审计域 | `global.audit_log` |
+| 项目成员增删/角色变更 | global 管理审计域 | `global.activity_log` |
+| 组织成员管理 | global 管理审计域 | `global.activity_log` |
 
 ## 5. 接入策略
 
@@ -544,7 +544,7 @@ Pipeline 目前**完全没有操作审计**。现有的执行级日志（`exec_i
 
 ### Phase 0：基础设施
 
-- 建 `audit_log` 表
+- 建 `activity_log` 表
 - 建 `auditlog` 域类型、DAO、公共服务、序列化器、diff 引擎
 - 建 OP / 内部查询 API
 - 项目对象 live-write 按调用方传入的 `consistency` 参数执行，高风险操作推荐 `Strong`，常规 CRUD 推荐 `Core`；global / OP audit 继续保留 fallback 风格
