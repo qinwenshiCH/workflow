@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS mgmt_audit_log (
     operator_name   VARCHAR(255) NOT NULL DEFAULT '',
     source          VARCHAR(32)  NOT NULL DEFAULT 'web',
     detail_version  SMALLINT     NOT NULL DEFAULT 1,
-    detail_payload  TEXT         NOT NULL DEFAULT '{}',
+    detail_payload  BYTEA        NOT NULL DEFAULT '\x',
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -137,7 +137,7 @@ object_type = `"PROJECT_MEMBER"`，object_id = `account_id`，project_id = 项�
 
 **批量操作约束**：单次 `BatchInsert` 不超过 500 行（见 DAO 节约束），避免大事务锁表。
 
-**detail_payload** 大小约束与 `object_audit_log` 对齐：单条序列化后最大 64KB，超出时优先 LZ4 压缩；压缩后仍超则逐字段截断并记录警告。
+**detail_payload** 存储为 BYTEA、LZ4 压缩。大小约束与 `object_audit_log` 对齐：单条序列化后最大 64KB，超出时优先 LZ4 压缩；压缩后仍超则逐字段截断并记录警告。写入时由 AuditService 自动完成序列化和压缩，调用方直接传入 Detail 结构体即可。
 
 ## 6. 查询接口
 
@@ -204,39 +204,45 @@ Migration 即 Section 2 的 DDL 脚本，无历史数据迁移——老 member �
 
 ```go
 // 单人操作（Upsert create）
-dao.Insert(ctx, &MgmtAuditLog{
-    OrgID:         orgID,
-    ObjectType:    "ORG_MEMBER",
-    ObjectID:      accountID,
-    ObjectName:    member.DisplayName,
-    ActionType:    "create",
-    OperatorID:    pvctx.Aid(ctx),
-    OperatorName:  pvctx.Aname(ctx),
-    Source:        "web",
-    DetailVersion: 1,
-    DetailPayload: `{"level":"member","role_ids":[1,2]}`,
+svc := auditlogsvc.GetAuditService()
+svc.WriteMgmtLogWithFallback(ctx, MgmtWriteInput{
+    OrgID:      orgID,
+    ObjectType: "ORG_MEMBER",
+    ObjectID:   accountID,
+    ObjectName: member.DisplayName,
+    ActionType: "create",
+    Source:     "web",
+    OperatorID: pvctx.Aid(ctx),
+    OperatorName: pvctx.Aname(ctx),
+    Detail: auditlog.Detail{
+        Version: 1,
+        Extra: map[string]interface{}{
+            "level":    "member",
+            "role_ids": []int{1, 2},
+        },
+    },
 })
 
 // 批量操作（BatchUpdateLevel）
-var logs []*MgmtAuditLog
+svc := auditlogsvc.GetAuditService()
 for _, m := range updatedMembers {
-    logs = append(logs, &MgmtAuditLog{
-        OrgID:         orgID,
-        ObjectType:    "ORG_MEMBER",
-        ObjectID:      m.AccountID,
-        ObjectName:    m.DisplayName,
-        ActionType:    "update",
-        OperatorID:    pvctx.Aid(ctx),
-        OperatorName:  pvctx.Aname(ctx),
-        Source:        "web",
-        DetailVersion: 1,
-        DetailPayload: fmt.Sprintf(
-            `{"old_level":"%s","new_level":"%s"}`,
-            m.OldLevel, m.NewLevel,
-        ),
+    svc.WriteMgmtLogWithFallback(ctx, MgmtWriteInput{
+        OrgID:      orgID,
+        ObjectType: "ORG_MEMBER",
+        ObjectID:   m.AccountID,
+        ObjectName: m.DisplayName,
+        ActionType: "update",
+        Source:     "web",
+        OperatorID: pvctx.Aid(ctx),
+        OperatorName: pvctx.Aname(ctx),
+        Detail: auditlog.Detail{
+            Version: 1,
+            Changes: []auditlog.Change{
+                {Field: "level", Action: "changed", Before: m.OldLevel, After: m.NewLevel},
+            },
+        },
     })
 }
-dao.BatchInsert(ctx, logs)
 ```
 
 ## 10. 边缘场景

@@ -33,7 +33,7 @@
 - 2026-06-30: **一致性等级**：调用方在每个 `Log`/`BatchLog` 调用时通过 `consistency` 参数自行决定。API 提供三种等级 `Strong` / `Core` / `BestEffort`。不设系统级一刀切策略。建议：删除/发布/高风险操作用 `Strong`，常规 CRUD 用 `Core`，内部操作/回填用 `BestEffort`。
 - 2026-06-30: **BatchLog 原子性**：同一业务事务内的多条审计记录通过 `BatchLog` 一次性写入。任一记录的核心字段写入失败 → 整体失败 → 业务事务回滚。
 - 2026-06-30: **审计保留策略**：V1 不实现自动清理，预留 `created_at` 作为未来分区键；按月份分区为推荐扩展路径。
-- 2026-06-30: `detail_payload` 使用 TEXT 而非 JSONB 是 V1 的有意识选择——V1 查询只按 (object_type, object_id) 过滤，不在 detail 上做搜索。未来如需全文检索 detail，需评估从 TEXT 迁移到 JSONB + GIN 索引的成本。
+- 2026-06-30: `detail_payload` 使用 BYTEA + LZ4 压缩——LZ4 压缩后是二进制数据，BYTEA 是自然选择。不使用 JSONB，因为 V1 查询只按 (object_type, object_id) 过滤，不在 detail 上做搜索。未来如需全文检索 detail，需评估从 TEXT / JSONB + GIN 索引迁移的成本。
 - 2026-06-30: `object_audit_log` 部署在 project schema（meta），`project_id` 列冗余，不设。索引为 `(object_type, object_id, created_at DESC)`。
 - 2026-06-30: **枚举规范最终定义**：
   - `ObjectType` 使用 UPPER_SNAKE_CASE 字符串，共 13 个值（含 PIPELINE）
