@@ -68,6 +68,8 @@
 
 用户已明确：当前最真实的使用场景是**内部排查问题**。因此，V1 不应假设自己已经是一个成熟的企业级合规产品，而应优先解决“出了问题后能快速还原最近变更链路”这个核心场景。同时，设计上要显式为另外 3 类更长期的商业价值预留空间。
 
+在交付边界上，这也意味着：**V1 的重点是把统一审计记录和内部可审查能力做好，而不是在官方产品中同步推出新的通用审计页面**。除 AB / Metric 已有查看能力继续保留外，其他对象的审计查看能力优先通过 OP / 内部接口承接，页面不是前置要求。
+
 这次需求的 4 个价值点，按当前判断排序如下：
 
 1. **事故止损 / 根因定位（P0）**：对象被改坏、配置异常、指标口径变化后，内部同学可以沿着单对象历史快速定位最近一次关键变更，不再同时翻多套历史机制
@@ -89,6 +91,7 @@
 ### 用户角色
 
 - **内部支持 / 研发 / 值班同学**：对象出问题后，需要第一时间定位是谁、在什么时候、从哪里改了什么
+- **OP 审查 / 运维同学**：在需要协助排障、核对变更、做内部审查时，需要通过 OP 或内部接口查看统一审计记录
 - **项目负责人 / 实验负责人 / 分析师**：多人协作编辑对象时，希望事后能明确责任链路，减少“不敢放权”的顾虑
 - **组织管理员 / 项目管理员**：需要保留组织与项目级配置变更的可追溯记录
 - **产品 owner / 安全评审对接人**：未来面对客户安全问询、采购评审或内部治理建设时，需要证明关键对象变更具备可追溯能力
@@ -115,7 +118,7 @@
 
 ### 用户故事 2 — 内部排障时按对象快速还原最近变更链路 (P0)
 
-作为**内部支持 / 研发 / 值班同学**，当某个实验、配置、图表或指标出问题时，我希望能够直接按对象查看最近的变更历史，快速回答 `who / what / when / source`，而不是同时翻多套历史机制。
+作为**内部支持 / 研发 / 值班同学**或**OP 审查同学**，当某个实验、配置、图表或指标出问题时，我希望能够通过统一查询接口按对象查看最近的变更历史，快速回答 `who / what / when / source`，而不是同时翻多套历史机制。
 
 **对应价值**: 事故止损
 
@@ -129,6 +132,7 @@
 2. **Given** 某对象存在多条审计日志，**When** 按 `created_at DESC` 查询，**Then** 最近的操作排在最前面，且每条都包含操作人、时间、来源和必要的变更详情
 3. **Given** 某对象的审计日志量超过一页，**When** 分页查询第 2 页，**Then** 返回第 2 页数据，`total` 字段正确标识该对象的总记录数
 4. **Given** 同一对象的历史此前分散在旧 AB 内嵌记录、Metric 历史表或其他旧机制中，**When** 完成历史复制后按对象查询，**Then** 查询路径不再要求同时访问多套历史存储
+5. **Given** 官方产品没有新增通用审计页面，**When** 内部同学需要审查某个对象历史，**Then** 仍然可以通过 OP 或内部接口完成查询
 
 ---
 
@@ -189,7 +193,7 @@
 
 ### 用户故事 6 — 面向安全问询与采购评审保留可追溯能力 (P2)
 
-作为**产品 owner / 安全评审对接人**，当未来需要回答客户、采购或内部安全团队“关键对象是谁改的、何时改的、是否可追溯”这类问题时，我希望系统已经具备稳定的基础审计模型，而不是临时拼日志和查库。
+作为**产品 owner / 安全评审对接人**，当未来需要回答客户、采购或内部安全团队“关键对象是谁改的、何时改的、是否可追溯”这类问题时，我希望系统已经具备稳定的基础审计模型，而不是临时拼日志和查库，即使官方产品端并没有开放新的通用审计页面。
 
 **对应价值**: 成交门槛、企业信任
 
@@ -228,6 +232,7 @@
 - **同对象高频操作** → 同一对象在短时间内被频繁修改（如自动保存场景），需要明确记录每一条变更而不是合并去重
 - **操作人或对象名变更** → 审计日志中的 operator_name / object_name 是写入时的快照，历史记录不随名称变更而更新
 - **跨项目查询** → 审计表在 meta schema 下按项目隔离，当前不提供跨项目全局查询（如有需要后续可在 global schema 加汇总或由调用方自行跨 schema 查询）
+- **查看入口边界** → V1 不要求在官方产品新增通用审计查看页面；除 AB / Metric 保持既有查看能力外，其余审计查看优先走 OP / 内部接口
 - **协作环境** → 多人同时操作同一对象，审计日志独立记录每条操作，无锁冲突
 - **无对象 ID 的操作** → 极少数项目内规范对象可能不关联具体对象 ID，允许 `object_id = 0` 并用 `object_type` 特殊值标识；组织 / 项目级管理操作优先考虑独立记录链路
 
@@ -242,7 +247,7 @@
 - **FR-003**: 审计规范 MUST 使用审计域自有的 `ObjectType` 体系，不直接沿用 `def.AssetType` 作为顶层概念；该体系至少能表达资产对象与元数据对象
 - **FR-004**: 对已接入现有基础设施的对象类型（如 CHART / DASHBOARD），系统 MUST 在对象操作实现中自动调用审计记录
 - **FR-005**: 对非 AssetOperator、元数据对象或需要手动控制写入的场景，系统 MUST 支持模块直接调用 `AuditService.Log()` 记录
-- **FR-006**: 系统 MUST 提供按对象视角的审计日志分页查询接口，V1 至少支持 `project_id`、`object_type`、`object_id` 过滤，按 `created_at DESC` 排序
+- **FR-006**: 系统 MUST 提供按对象视角的审计日志分页查询接口，V1 至少支持 `project_id`、`object_type`、`object_id` 过滤，按 `created_at DESC` 排序；该接口优先供 OP / 内部链路调用
 - **FR-007**: AB / Metric / Wave 项目内历史操作记录 MUST 复制到新审计规范中，旧字段或旧表保留不删；升级后新操作只写新审计表
 - **FR-008**: 组织 / 项目级管理操作 MUST 具备审计记录能力，但允许采用独立于 `project_audit_log` 的存储结构或表
 - **FR-009**: 账号最近登录时间、最近登出时间、最近活跃时间 MUST 记录在 `account` 表或等价账号主表，不要求写入 `project_audit_log`
@@ -250,13 +255,15 @@
 - **FR-011**: 系统 MUST 保留支撑内部排障所需的最小归因信息集合：`object_type`、`object_id`、`action_type`、`operator_id`、`operator_name`、`source`、`created_at` 以及必要的结构化变更详情
 - **FR-012**: V1 的查询接口与索引策略 MUST 优先优化“单对象最近变更链路”的排查路径，而不是优先满足按操作人、按组织范围的广义分析型查询
 - **FR-013**: 审计模型 MUST 为未来的企业信任与治理场景预留扩展点，包括但不限于敏感字段掩盖、可见性控制、保留策略、审批/告警类上层能力，但这些能力当前不作为 V1 上线前置条件
+- **FR-014**: V1 MUST NOT 在官方产品中新增通用审计查看页面；除 AB / Metric 维持现有查看能力外，其他对象的审计查看能力优先通过 OP / 内部接口提供
+- **FR-015**: 为方便内部审查与排障，系统 SHOULD 在 OP 或等价内部管理链路暴露对象审计查询接口，但页面不是必需交付物
 
 ### 非功能需求
 
 - **NFR-001**: 在既定一致性模式下，审计日志写入的额外延迟目标为 < 50ms（P99）；若方案选择强审计，需在评审中重新确认该指标
 - **NFR-002**: 项目内标准审计表在 meta schema 下按项目隔离，配合 `(object_type, object_id, created_at DESC)` 索引，单项目千万级日志量下查询响应 < 1s（P99）
 - **NFR-003**: 单条 detail 序列化后最大 64KB，超出时优先 LZ4 压缩；压缩后仍超出则逐字段截断并记录警告
-- **NFR-004**: 审计日志对用户不可见（无 UI 展示），仅通过 API 供管理端或未来审计页面调用
+- **NFR-004**: 审计日志默认对官方产品用户不可见；V1 以 OP / 内部接口消费为主，不要求新增通用 UI 页面
 
 ---
 
@@ -270,17 +277,22 @@
 | `project_id` | INTEGER | NOT NULL | 所属项目 ID（数据冗余，meta schema 已隔离） |
 | `object_type` | VARCHAR(64) | NOT NULL | 审计对象类型：如 CHART / DASHBOARD / COHORT / EXPERIMENT / FEATURE_GATE / FEATURE_CONFIG / METRIC / TRACKED_EVENT / EVENT_PROPERTY / USER_PROPERTY / VIRTUAL_PROPERTY / VIRTUAL_EVENT |
 | `object_id` | INTEGER | NOT NULL | 对象 ID |
-| `object_name` | VARCHAR(255) | NOT NULL DEFAULT '' | 记录时的对象名称（快照） |
+| `object_name` | VARCHAR(255) | NOT NULL DEFAULT '' | 记录时的对象名称展示快照，便于列表展示和删除后追溯，不随对象后续改名回写 |
 | `action_type` | VARCHAR(32) | NOT NULL | 操作类型：create / update / delete / copy |
 | `operator_id` | INTEGER | NOT NULL | 操作人账号 ID |
-| `operator_name` | VARCHAR(255) | NOT NULL DEFAULT '' | 记录时的操作人姓名（快照，不随用户改名而更新） |
+| `operator_name` | VARCHAR(255) | NOT NULL DEFAULT '' | 记录时的操作人姓名展示快照，不随用户改名或删除而更新 |
 | `source` | VARCHAR(32) | NOT NULL DEFAULT '' | 操作来源：web / openapi / mcp / internal |
-| `detail_version` | SMALLINT | NOT NULL DEFAULT 1 | 审计详情版本号，支持后续兼容演进 |
+| `detail_version` | SMALLINT | NOT NULL DEFAULT 1 | 审计详情 schema 版本号，由审计服务写入；V1 固定为 1，仅在 `detail_payload` 解码语义发生不兼容变化时升级 |
 | `detail_payload` | TEXT | NOT NULL DEFAULT '' | 版本化序列化审计详情；由应用层维护稳定 envelope，不使用 JSONB，不直接存业务结构体 |
-| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT CURRENT_TIMESTAMP | 记录时间 |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT CURRENT_TIMESTAMP | 操作时间 / 审计事件时间；在线写入时通常等于操作发生时刻，历史迁移时回填原始事件时间 |
 
 **索引**（V1 精简，后续根据实际查询模式补充）:
 - `idx_pal_object` ON `(object_type, object_id, created_at DESC)` — 主索引，按对象查询
+
+补充说明：
+- `object_name` 与 `operator_name` 是**展示快照字段**，不是当前对象或当前账号主表的真相字段
+- `detail_version` 属于 `detail_payload` 的 schema version，不是业务对象版本号
+- `created_at` 语义明确为审计事件发生时间，而不是“这条记录插入数据库的时间”
 
 ### ObjectType（审计域对象类型）
 
@@ -299,7 +311,7 @@
 
 - `Log(ctx, input)` → `error`：单条写入，失败返回 error
 - `BatchLog(ctx, inputs)` → `error`：批量写入
-- `ListByQuery(ctx, query)` → `(items, total, error)`：分页查询
+- `ListByQuery(ctx, query)` → `(items, total, error)`：分页查询，优先供 OP / 内部排障链路调用
 
 若最终选择 best-effort，可在服务层额外提供 `LogWithFallback(ctx, input)` 或等价包装；该接口当前不是已锁定的 V1 契约。
 
@@ -313,6 +325,7 @@
 | ActionType | string | 是 | |
 | OperatorID | int64 | 是 | 自动从 ctx 解析 |
 | OperatorName | string | 否 | 写入时快照，自动从 ctx 解析 |
+| OccurredAt | `*time.Time` | 否 | 审计事件时间；为空时由服务层取当前时间，历史迁移可显式回填旧事件时间 |
 | Detail | `*AuditDetail` | 否 | 审计域详情对象，不直接传业务结构体 |
 
 ### action_type 约定
@@ -439,6 +452,7 @@
 - **SC-005**: 单项目百万级审计日志下，按 `object_type + object_id` 的分页查询响应 < 500ms（P99）
 - **SC-006**: 组织 / 项目级管理操作具备清晰的审计落点；账号最近登录 / 登出 / 活跃时间具备明确字段落点
 - **SC-007**: 单个对象的最近变更链路可以通过统一审计查询路径直接获得 `who / what / when / source`，内部排障不再需要同时翻 AB 内嵌记录、Metric 历史表和 Asset Behavior 等多套机制
+- **SC-008**: V1 不新增官方产品通用审计页面；内部同学仍可通过 OP / 内部接口完成对象历史审查，AB / Metric 既有查看能力不受影响
 
 ---
 
