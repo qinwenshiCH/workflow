@@ -34,14 +34,14 @@
 - 2026-06-30: **BatchLog 原子性**：同一业务事务内的多条审计记录通过 `BatchLog` 一次性写入。任一记录的核心字段写入失败 → 整体失败 → 业务事务回滚。
 - 2026-06-30: **审计保留策略**：V1 不实现自动清理，预留 `created_at` 作为未来分区键；按月份分区为推荐扩展路径。
 - 2026-06-30: `detail_payload` 使用 BYTEA + LZ4 压缩——LZ4 压缩后是二进制数据，BYTEA 是自然选择。不使用 JSONB，因为 V1 查询只按 (object_type, object_id) 过滤，不在 detail 上做搜索。未来如需全文检索 detail，需评估从 TEXT / JSONB + GIN 索引迁移的成本。
-- 2026-06-30: `object_audit_log` 部署在 project schema（meta），`project_id` 列冗余，不设。索引为 `(object_type, object_id, created_at DESC)`。
+- 2026-06-30: `meta.audit_log` 部署在 project schema（meta），`project_id` 列冗余，不设。索引为 `(object_type, object_id, created_at DESC)`。
 - 2026-06-30: **枚举规范最终定义**：
   - `ObjectType` 使用 UPPER_SNAKE_CASE 字符串，共 13 个值（含 PIPELINE）
   - `action_type` 使用全小写描述性字符串，所有常量**统一定义在 `auditlog/types.go`**（守口到审计模块）。新增 action_type 需在此文件加 const 并 PR review 确认语义无重叠。
   - 内部操作（冲突解决）的 action_type 与正常操作保持一致，用 `source="internal"` 区分。
   - `source` 使用全小写字符串，共 4 个值：`web` / `openapi` / `internal` / `backfill`
-- 2026-06-30: **表名定稿为 `object_audit_log`**（在 project schema 内，`project_` 前缀冗余）。
-- 2026-06-30: **两期交付策略**：第一期（Phase 0+1）交付项目对象审计底座（object_audit_log + auditlog 模块 + 对象 live-write + 历史迁移 + OP 查询），独立可验证。第二期（Phase 2+3）交付 metadata 长尾 + account/org/project 管理审计。两期分别 commit，但都在本 spec 内完成。
+- 2026-06-30: **表名定稿为 `meta.audit_log`**（在 project schema 内，`project_` 前缀冗余）。
+- 2026-06-30: **两期交付策略**：第一期（Phase 0+1）交付项目对象审计底座（meta.audit_log + auditlog 模块 + 对象 live-write + 历史迁移 + OP 查询），独立可验证。第二期（Phase 2+3）交付 metadata 长尾 + account/org/project 管理审计。两期分别 commit，但都在本 spec 内完成。
 
 ## 边界 & 异常处理
 
@@ -80,7 +80,7 @@
 ## 其他
 
 - 2026-06-29: 审计日志默认对官方产品用户不可见；V1 以 OP / 内部接口消费为主，页面不是前置要求
-- 2026-06-30: **Member/生命周期审计不往 `op_operation_log` 塞**。新建 `global.mgmt_audit_log`（增加 `org_id`/`project_id`，无 `customer_id`/`result_status`/`error_message`）。理由：`op_operation_log` 为 OP 设计，OP 未来可能独立拆分，member 数据不应随 OP 迁移。OP 端 9 项配置操作继续走 `op_operation_log` 不动。
+- 2026-06-30: **Member/生命周期审计不往 `op_operation_log` 塞**。新建 `global.global.audit_log`（增加 `org_id`/`project_id`，无 `customer_id`/`result_status`/`error_message`）。理由：`op_operation_log` 为 OP 设计，OP 未来可能独立拆分，member 数据不应随 OP 迁移。OP 端 9 项配置操作继续走 `op_operation_log` 不动。
 - 2026-06-30: **ObjectType 常量也统一定义在 `auditlog/types.go`**，与 action_type 同文件。
 - 2026-06-30: **plan.md 拆分为 3 个**：`plan-object.md`（项目对象审计）、`plan-org.md`（组织/项目管理审计）、`plan-account.md`（账号活跃字段），三条链路独立演进、独立 commit。
 - 2026-06-30: 同一事务中跨对象操作（如 CopyDashboard 同时复制 dashboard 和 charts）产生多条审计记录，通过 `BatchLog` 写入，共享事务。
@@ -88,18 +88,18 @@
 
 ## autoplan 审查（2026-06-30）
 
-- 2026-06-30: **mgmt_audit_log 的 action_type** 使用自有枚举（create/update/delete），不共享 object_audit_log 的枚举。域操作语义由 object_type + detail_payload 承载，不设 object_action 字段。模块可注册新 object_type 来扩展，无需改 action_type。
-- 2026-06-30: **新增操作人索引 idx_mgmt_audit_operator**。支撑"按操作人反查组织操作"的排障路径。新增 DAO 方法 ListByOperator。
+- 2026-06-30: **global.audit_log 的 action_type** 使用自有枚举（create/update/delete），不共享 meta.audit_log 的枚举。域操作语义由 object_type + detail_payload 承载，不设 object_action 字段。模块可注册新 object_type 来扩展，无需改 action_type。
+- 2026-06-30: **新增操作人索引 idx_audit_operator**。支撑"按操作人反查组织操作"的排障路径。新增 DAO 方法 ListByOperator。
 - 2026-06-30: **BatchInsert 上限 500 行**。超过时调用方自行分批，DAO 层不接受超过 500 行的参数。
 - 2026-06-30: **增加 write-only feature flag**。部署方案增加 feature flag 保护，异常时可快速关闭审计写入而不影响业务逻辑。
-- 2026-06-30: **detail 格式与 object_audit_log 对齐**。mgmt_audit_log 增加 detail_version + detail_payload（替代原 detail TEXT），V1 固定 detail_version=1。
-- 2026-06-30: **一致性模型由调用方决定**。审计服务层提供 `Log`（强审计）和 `LogWithFallback`（best-effort）两种方法，管理审计推荐 `LogWithFallback`，但不硬编码。detail_payload 大小约束对齐 object_audit_log（64KB + LZ4）。
+- 2026-06-30: **detail 格式与 meta.audit_log 对齐**。global.audit_log 增加 detail_version + detail_payload（替代原 detail TEXT），V1 固定 detail_version=1。
+- 2026-06-30: **一致性模型由调用方决定**。审计服务层提供 `Log`（强审计）和 `LogWithFallback`（best-effort）两种方法，管理审计推荐 `LogWithFallback`，但不硬编码。detail_payload 大小约束对齐 meta.audit_log（64KB + LZ4）。
 
 ## autoplan scope 确认（2026-06-30）
 
 - 2026-06-30: **PROJECT_MEMBER 确认纳入 V1**。与 org/member 独立，是独立的权限授予操作。
-- 2026-06-30: **不承诺统一查询层**。op_operation_log / mgmt_audit_log / object_audit_log 三套独立存储，按需分别查询。
-- 2026-06-30: **UpdateAccountProjectAuths 是一条 mgmt audit log**。记录 action_type=update, object_type=ORG_MEMBER，detail 含变更摘要。
-- 2026-06-30: **邀请流程**：邀请建在自有表上，接受邀请后触发 mgmt_audit_log 记录。邀请本身（创建/发送/撤回）不落审计。
-- 2026-06-30: **OP 操作 vs 客户操作分界**：OP 人员在 OP 后台的操作走 op_operation_log；客户在业务系统中的操作走 mgmt_audit_log。OP 未来在内部接口同时展示两类日志。
+- 2026-06-30: **不承诺统一查询层**。op_operation_log / global.audit_log / meta.audit_log 三套独立存储，按需分别查询。
+- 2026-06-30: **UpdateAccountProjectAuths 是一条 global.audit_log 记录**。记录 action_type=update, object_type=ORG_MEMBER，detail 含变更摘要。
+- 2026-06-30: **邀请流程**：邀请建在自有表上，接受邀请后触发 global.audit_log 记录。邀请本身（创建/发送/撤回）不落审计。
+- 2026-06-30: **OP 操作 vs 客户操作分界**：OP 人员在 OP 后台的操作走 op_operation_log；客户在业务系统中的操作走 global.audit_log。OP 未来在内部接口同时展示两类日志。
 - 2026-06-30: **第一期受众为内部排障**。查询端点通过 OP 内部接口暴露，不对外。

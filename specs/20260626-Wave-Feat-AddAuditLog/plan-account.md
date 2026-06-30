@@ -2,7 +2,7 @@
 
 ## 目标
 
-在 `global.account` 表记录账号最近登录、登出、活跃时间，不进入 `object_audit_log`。
+在 `global.account` 表记录账号最近登录、登出、活跃时间，不进入 `meta.audit_log`。
 
 ## 数据模型
 
