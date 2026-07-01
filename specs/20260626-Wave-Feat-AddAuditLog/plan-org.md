@@ -11,7 +11,7 @@
 
 分界原则：OP 人员在 OP 后台的操作走 `op_operation_log`；客户（含组织管理员）在业务系统中的操作走 `activity_log`。OP 未来通过内部接口在同一页面展示两类日志。
 
-字段集 = `meta.activity_log` + `org_id` + `project_id`。管理活动与项目对象活动共享基础事件模型：稳定 `action_type`（create/update/delete/copy），可选 `action_name` 表达领域语义；detail 使用同一套 JSON envelope。
+字段集 = `meta.activity_log` + `org_id` + `project_id`。管理活动与项目对象活动共享基础事件模型：稳定 `action_type`（V1 默认 create/update/delete/copy），领域语义通过 `item_type` 和 `detail` 表达；detail 使用同一套 JSON envelope。
 
 邀请流程：邀请建在自有表上。接受邀请 → 触发生效操作 → 写入 `activity_log`。邀请本身（创建/发送/撤回）不落活动。
 
@@ -25,15 +25,12 @@ CREATE TABLE IF NOT EXISTS activity_log (
     item_type     VARCHAR(64)  NOT NULL,            -- 'ORG_MEMBER' / 'ORGANIZATION' / 'PROJECT'/ ...
     item_id       BIGINT       NOT NULL,            -- account_id / org_id / project_id
     item_name     VARCHAR(255) NOT NULL DEFAULT '', -- 展示快照
-    action_type     VARCHAR(32)  NOT NULL,            -- create / update / delete
-    action_name     VARCHAR(64)  NOT NULL DEFAULT '',
-    operator_kind   VARCHAR(32)  NOT NULL DEFAULT 'account',
-    operator_id     BIGINT       DEFAULT NULL,
+    action_type     VARCHAR(32)  NOT NULL,            -- 基础动作枚举，管理域 V1 主要使用 create / update / delete
+    operator_id     BIGINT       NOT NULL,
     operator_name   VARCHAR(255) NOT NULL DEFAULT '',
     source          VARCHAR(32)  NOT NULL DEFAULT 'web',
     correlation_id  VARCHAR(64)  NOT NULL DEFAULT '',
-    detail_version  SMALLINT     NOT NULL DEFAULT 1,
-    detail_payload  JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    detail_payload  TEXT         NOT NULL DEFAULT '{}',
     occurred_at     TIMESTAMPTZ  NOT NULL,
     recorded_at     TIMESTAMPTZ  NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -48,8 +45,7 @@ CREATE INDEX idx_activity_operator
     ON activity_log(operator_id, occurred_at DESC, id DESC);
 ```
 
-- `action_type` 复用共享基础枚举；管理域细语义放在 `action_name`
-- `detail_version` 与 `meta.activity_log` 复用同一版本号空间，V1 固定为 1
+- `action_type` 复用共享基础枚举；管理域细语义通过 `item_type` + `detail` 表达，不新增 `action_name`
 - `idx_activity_project` 支撑"查某个 project 的成员变更"场景
 - `idx_activity_operator` 支撑"某操作人最近对组织做了什么"的排障路径
 
@@ -57,20 +53,20 @@ CREATE INDEX idx_activity_operator
 
 ### 3.1 全量 item_type（含 V1 / 后续）
 
-| item_type | action_type / action_name | V1 | 说明 |
+| item_type | action_type | V1 | 说明 |
 |------------|-------------|:--:|------|
-| `ORGANIZATION` | `create` / `create_org` | ✓ | 组织初始化 |
-| | `update` / `archive_org` | ✓ | 组织归档（status→archived） |
+| `ORGANIZATION` | `create` | ✓ | 组织初始化 |
+| | `update` | ✓ | 组织归档（status→archived） |
 | | — | — | config 变更走 `op_operation_log`，不进此表 |
-| `ORG_MEMBER` | `create` / `add_org_member` | ✓ | 添加成员 |
-| | `update` / `update_org_member_level` 或 `replace_org_supervisor` | ✓ | 变更成员级别 / 替换主管 |
-| | `delete` / `remove_org_member` | ✓ | 移除成员 |
-| `PROJECT` | `create` / `create_project` | ✓ | 创建项目 |
-| | `delete` / `delete_project` | ✓ | 删除项目 |
+| `ORG_MEMBER` | `create` | ✓ | 添加成员 |
+| | `update` | ✓ | 变更成员级别 / 替换主管 |
+| | `delete` | ✓ | 移除成员 |
+| `PROJECT` | `create` | ✓ | 创建项目 |
+| | `delete` | ✓ | 删除项目 |
 | | — | — | config 变更走 `op_operation_log`，不进此表 |
-| `PROJECT_MEMBER` | `create` / `add_project_member` | ✓ | 将成员加入项目 |
-| | `update` / `update_project_member_roles` | ✓ | 变更成员在项目中的角色 |
-| | `delete` / `remove_project_member` | ✓ | 将成员移出项目 |
+| `PROJECT_MEMBER` | `create` | ✓ | 将成员加入项目 |
+| | `update` | ✓ | 变更成员在项目中的角色 |
+| | `delete` | ✓ | 将成员移出项目 |
 | `ORG_INVITE` | — | V2 | V1 不做：成员加入已有 `create ORG_MEMBER` |
 | `ORG_ROLE` | — | V2 | V1 不做：预设角色变更极低频 |
 
@@ -87,12 +83,12 @@ CREATE INDEX idx_activity_operator
 
 item_type = `"ORG_MEMBER"`，item_id = `account_id`，project_id = NULL。
 
-| action_type / action_name | 接入位置 | 触发条件 | item_name | detail |
+| action_type | 接入位置 | 触发条件 | item_name | detail |
 |------------|---------|---------|------------|--------|
-| `create` / `add_org_member` | `organization/member.go` `Upsert` | 成员不存在 | `display_name` | `{"level":"<level>","role_ids":[<ids>]}` |
-| `update` / `update_org_member_level` | `organization/member.go` `BatchUpdateLevel` | level 实际变更 | `display_name` | `{"old_level":"<old>","new_level":"<new>"}` |
-| `update` / `replace_org_supervisor` | `organization/member.go` `BatchReplaceSupervisor` | supervisor 集合变更 | `display_name` | `{"role":"supervisor_added"}` 或 `"supervisor_removed"` |
-| `delete` / `remove_org_member` | `organization/member.go` `DeleteByOrgAndAccounts` | 成员被软删除 | `display_name` | `{}` |
+| `create` | `organization/member.go` `Upsert` | 成员不存在 | `display_name` | `{"level":"<level>","role_ids":[<ids>]}` |
+| `update` | `organization/member.go` `BatchUpdateLevel` | level 实际变更 | `display_name` | `{"old_level":"<old>","new_level":"<new>"}` |
+| `update` | `organization/member.go` `BatchReplaceSupervisor` | supervisor 集合变更 | `display_name` | `{"change_kind":"supervisor_added"}` 或 `{"change_kind":"supervisor_removed"}` |
+| `delete` | `organization/member.go` `DeleteByOrgAndAccounts` | 成员被软删除 | `display_name` | `{}` |
 
 **Upsert 的 create vs update 判定**：先读已有成员状态。不存在 → `create`；已存在且 level/roles 变更 → `update`；已存在且未变更 → 不记。
 
@@ -102,32 +98,32 @@ item_type = `"ORG_MEMBER"`，item_id = `account_id`，project_id = NULL。
 
 item_type = `"PROJECT_MEMBER"`，item_id = `account_id`，project_id = 项目 ID。
 
-| action_type / action_name | 接入位置 | 触发条件 | item_name | detail |
+| action_type | 接入位置 | 触发条件 | item_name | detail |
 |------------|---------|---------|------------|--------|
-| `create` / `add_project_member` | `project/member.go` `BatchUpsert` | 成员在项目中不存在 | `display_name` | `{"roles":[<ids>]}` |
-| `update` / `update_project_member_roles` | `project/member.go` `BatchUpdateRoles` | 角色实际变更 | `display_name` | `{"old_roles":[<ids>],"new_roles":[<ids>]}` |
-| `delete` / `remove_project_member` | `project/member.go` `BatchDeleteByProjectAndAccounts` | 成员被移出项目 | `display_name` | `{}` |
+| `create` | `project/member.go` `BatchUpsert` | 成员在项目中不存在 | `display_name` | `{"roles":[<ids>]}` |
+| `update` | `project/member.go` `BatchUpdateRoles` | 角色实际变更 | `display_name` | `{"old_roles":[<ids>],"new_roles":[<ids>]}` |
+| `delete` | `project/member.go` `BatchDeleteByProjectAndAccounts` | 成员被移出项目 | `display_name` | `{}` |
 
 **org member 和 project member 是否重复？** 不重复。一个用户可以是 org member（能看到 org 下的项目列表）但没有某个项目的成员资格（不能访问该项目数据）。`create PROJECT_MEMBER` 是独立的权限授予操作，排障价值等同于 org member。两者的操作链不同："Alice 什么时候被加到 org 的"和"Alice 什么时候被加到 project X 的"是两个不同的问题。
 
-**`UpdateAccountProjectAuths`**（全量同步用户的跨项目授权）：视作一条 management activity log 记录。内部批处理逻辑不细拆到单行写入，而是记录一次 `action_type=update, action_name=sync_project_auths, item_type=ORG_MEMBER`，detail 包含变更摘要（涉及项目数、成员数）。
+**`UpdateAccountProjectAuths`**（全量同步用户的跨项目授权）：视作一条 management activity log 记录。内部批处理逻辑不细拆到单行写入，而是记录一次 `action_type=update, item_type=ORG_MEMBER`，detail 包含变更摘要（涉及项目数、成员数）。
 
 #### 组织/项目生命周期（4 项）
 
-| action_type / action_name | item_type | item_id | project_id | 接入位置 | item_name | detail |
+| action_type | item_type | item_id | project_id | 接入位置 | item_name | detail |
 |------------|------------|-----------|----------|---------|------------|--------|
-| `create` / `create_org` | `ORGANIZATION` | org_id | NULL | `organization/organization.go` `Init` | org name | `{"creator_id":<id>}` |
-| `update` / `archive_org` | `ORGANIZATION` | org_id | NULL | `organization/organization.go` `Archive` | org name | `{}` |
-| `create` / `create_project` | `PROJECT` | project_id | project_id | `project/create.go` `Create` | project name | `{"org_id":<id>}` |
-| `delete` / `delete_project` | `PROJECT` | project_id | project_id | `project/delete.go` `Archive` | project name | `{"org_id":<id>}` |
+| `create` | `ORGANIZATION` | org_id | NULL | `organization/organization.go` `Init` | org name | `{"creator_id":<id>}` |
+| `update` | `ORGANIZATION` | org_id | NULL | `organization/organization.go` `Archive` | org name | `{"status_before":"active","status_after":"archived"}` |
+| `create` | `PROJECT` | project_id | project_id | `project/create.go` `Create` | project name | `{"org_id":<id>}` |
+| `delete` | `PROJECT` | project_id | project_id | `project/delete.go` `Archive` | project name | `{"org_id":<id>}` |
 
 ## 4. 操作人解析
 
-| 场景 | operator_kind | operator_id / operator_name 来源 |
-|------|---------------|-------------------------------|
-| Web 用户操作 | `account` | `pvctx.Aid(ctx)` / `pvctx.Aname(ctx)` |
-| 注册时自动创建组织 | `account` | 注册用户本人 |
-| 系统同步 / 回填 | `system` / `backfill` | 可为空，或继承触发任务的账号 |
+| 场景 | operator_id / operator_name 来源 |
+|------|-------------------------------|
+| Web 用户操作 | `pvctx.Aid(ctx)` / `pvctx.Aname(ctx)` |
+| 注册时自动创建组织 | 注册用户本人 |
+| 系统同步 / 回填 | 优先继承触发任务的账号；查不到则按约定写默认值 |
 
 `operator_name` 是写入时的展示快照，不随用户后续改名回写。
 
@@ -143,11 +139,17 @@ item_type = `"PROJECT_MEMBER"`，item_id = `account_id`，project_id = 项目 ID
 
 **批量操作约束**：单次 `BatchInsert` 不超过 500 行（见 DAO 节约束），避免大事务锁表。
 
-**detail_payload** 存储为 JSONB。大小约束与 `meta.activity_log` 对齐：通过字段投影与大小预算控制单条 detail；超限时优先截断明确的大字段并记录 warning。V1 不默认引入应用层压缩。
+**detail_payload** 存储为 `TEXT`。大小约束与 `meta.activity_log` 对齐：通过字段投影与大小预算控制单条 detail；超限时优先截断明确的大字段并记录 warning。V1 不默认引入应用层压缩。查询接口统一返回解析后的 `detail`，不暴露存储层字段名。
 
 ## 6. 查询接口
 
-新增 OP 查询端点，按 org 维度拉取该客户侧的所有管理活动记录，供 OP 内部排障使用。查询模型优先 cursor，而不是 `page + total`。
+新增 OP 查询端点，按 org 维度拉取该客户侧的所有管理活动记录，供 OP 内部排障使用。查询模型优先保持简单分页，返回 `total`。
+
+保留 `total` 的原因：
+
+- 管理活动的使用者同样是内部排障和审查同学，需要先判断历史规模
+- 当前查询量级主要是 org / member 维度，count 成本可控
+- 对外不暴露 cursor-only 契约，降低 OP 端接入复杂度
 
 **Request**：
 ```json
@@ -155,14 +157,15 @@ item_type = `"PROJECT_MEMBER"`，item_id = `account_id`，project_id = 项目 ID
   "org_id": 1,
   "item_type": "ORG_MEMBER",
   "operator_id": 7,
-  "cursor": "",
-  "limit": 20
+  "page": 1,
+  "page_size": 20
 }
 ```
 
 **Response**：
 ```json
 {
+  "total": 5,
   "items": [
     {
       "id": 1001,
@@ -171,17 +174,13 @@ item_type = `"PROJECT_MEMBER"`，item_id = `account_id`，project_id = 项目 ID
       "item_id": 42,
       "item_name": "Alice",
       "action_type": "create",
-      "action_name": "add_org_member",
-      "operator_kind": "account",
       "operator_id": 7,
       "operator_name": "Bob",
       "source": "web",
-      "detail_payload": {"level": "member", "role_ids": [1, 2]},
-      "detail_version": 1,
+      "detail": {"extra": {"level": "member", "role_ids": [1, 2]}},
       "occurred_at": "2026-07-01T10:00:00Z"
     }
-  ],
-  "next_cursor": "opaque-cursor"
+  ]
 }
 ```
 
@@ -194,10 +193,10 @@ item_type = `"PROJECT_MEMBER"`，item_id = `account_id`，project_id = 项目 ID
 ```go
 func (d *ManagementActivityDao) Insert(ctx context.Context, log *ManagementActivity) error
 func (d *ManagementActivityDao) BatchInsert(ctx context.Context, logs []*ManagementActivity) error
-func (d *ManagementActivityDao) ListByOrg(ctx context.Context, orgID int64, itemType string, cursor string, limit int) ([]*ManagementActivity, string, error)
-func (d *ManagementActivityDao) ListByProject(ctx context.Context, projectID int64, itemType string, cursor string, limit int) ([]*ManagementActivity, string, error)
-func (d *ManagementActivityDao) ListByItem(ctx context.Context, itemType string, itemID int64, cursor string, limit int) ([]*ManagementActivity, string, error)
-func (d *ManagementActivityDao) ListByOperator(ctx context.Context, operatorID int64, cursor string, limit int) ([]*ManagementActivity, string, error)
+func (d *ManagementActivityDao) ListByOrg(ctx context.Context, orgID int64, itemType string, page, pageSize int) ([]*ManagementActivity, int64, error)
+func (d *ManagementActivityDao) ListByProject(ctx context.Context, projectID int64, itemType string, page, pageSize int) ([]*ManagementActivity, int64, error)
+func (d *ManagementActivityDao) ListByItem(ctx context.Context, itemType string, itemID int64, page, pageSize int) ([]*ManagementActivity, int64, error)
+func (d *ManagementActivityDao) ListByOperator(ctx context.Context, operatorID int64, page, pageSize int) ([]*ManagementActivity, int64, error)
 ```
 
 `BatchInsert` 用于批量操作（`BatchUpdateLevel` / `BatchReplaceSupervisor` / `DeleteByOrgAndAccounts` 同时涉及多个成员），单次 INSERT 多行，上限 500 行。超出由调用方自行分批。
@@ -216,16 +215,13 @@ svc := activitysvc.GetActivityService()
 svc.Log(ctx, ManagementWriteInput{
     OrgID:      orgID,
     ItemType: "ORG_MEMBER",
-    ObjectID:   accountID,
-    ObjectName: member.DisplayName,
+    ItemID:     accountID,
+    ItemName:   member.DisplayName,
     ActionType: "create",
-    ActionName: "add_org_member",
     Source:     "web",
-    OperatorKind: "account",
     OperatorID: pvctx.Aid(ctx),
     OperatorName: pvctx.Aname(ctx),
     Detail: activity.Detail{
-        Version: 1,
         Extra: map[string]interface{}{
             "level":    "member",
             "role_ids": []int{1, 2},
@@ -239,16 +235,13 @@ for _, m := range updatedMembers {
     svc.Log(ctx, ManagementWriteInput{
         OrgID:      orgID,
         ItemType: "ORG_MEMBER",
-        ObjectID:   m.AccountID,
-        ObjectName: m.DisplayName,
+        ItemID:     m.AccountID,
+        ItemName:   m.DisplayName,
         ActionType: "update",
-        ActionName: "update_org_member_level",
         Source:     "web",
-        OperatorKind: "account",
         OperatorID: pvctx.Aid(ctx),
         OperatorName: pvctx.Aname(ctx),
         Detail: activity.Detail{
-            Version: 1,
             Changes: []activity.Change{
                 {Field: "level", Action: "changed", Before: m.OldLevel, After: m.NewLevel},
             },
@@ -263,7 +256,7 @@ for _, m := range updatedMembers {
 |------|------|
 | `Upsert` 到已存在且 level/roles 未变 | 不记活动（无实际变更） |
 | `BatchReplaceSupervisor` 前后 supervisor 集合相同 | 不记活动（无变更，前提是接入侧做了 diff） |
-| `BatchReplaceSupervisor` 加了两名、删了一名 | 3 条记录：2 条 `create` + 1 条 `delete` |
+| `BatchReplaceSupervisor` 加了两名、删了一名 | 3 条记录：都为 `update ORG_MEMBER`，detail 分别标记 `change_kind=supervisor_added` / `supervisor_removed` |
 | `DeleteByOrgAndAccounts` 传入已删除成员 | 不记活动（`is_deleted = true` 已过滤，不会触发） |
 | `DeleteByOrgAndAccounts` 传入不存在的 account_id | 不上报错，DAO 层 `is_deleted = false` 条件自动跳过 |
 | 同一事务内批量操作部分成功 | 行为由中心化 `WritePolicy` 决定；`required_core/full` 回滚，`best_effort` 记录 warning |
@@ -292,13 +285,13 @@ for _, m := range updatedMembers {
 
 ## 13. 验证
 
-- 添加成员 → `activity_log` 出现 `action_type=create, action_name=add_org_member, item_type=ORG_MEMBER`
-- 变更角色 → `action_type=update, action_name=update_org_member_level`，detail 含 old/new level
-- 替换主管 → 每个变更的主管各一条，`action_name=replace_org_supervisor`
-- 移除成员 → `action_type=delete, action_name=remove_org_member`
-- 创建/归档组织 → `create/create_org`、`update/archive_org`
-- 创建/删除项目 → `create/create_project`、`delete/delete_project`
+- 添加成员 → `activity_log` 出现 `action_type=create, item_type=ORG_MEMBER`
+- 变更角色 → `action_type=update`，detail 含 old/new level
+- 替换主管 → 每个变更的主管各一条 `update`
+- 移除成员 → `action_type=delete`
+- 创建/归档组织 → `create`、`update`
+- 创建/删除项目 → `create`、`delete`
 - 批量操作 → `BatchInsert` 多行落地，不超过 500 行
 - DB insert 失败 → 行为符合对应 `WritePolicy`
-- `ListByOrg` / `ListByProject` / `ListByItem` / `ListByOperator` cursor 分页正确
+- `ListByOrg` / `ListByProject` / `ListByItem` / `ListByOperator` 分页和 `total` 正确
 - OP 查询权限：非管理员被拒绝

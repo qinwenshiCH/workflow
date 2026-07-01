@@ -131,7 +131,7 @@
 
 1. **Given** 项目中存在多个对象的活动日志，**When** 按 `item_type = CHART` 且 `item_id = 123` 查询，**Then** 返回结果仅包含该对象的日志
 2. **Given** 某对象存在多条活动日志，**When** 按 `(occurred_at DESC, id DESC)` 查询，**Then** 最近的操作排在最前面，且每条都包含操作人、时间、来源和必要的变更详情
-3. **Given** 某对象的活动日志量超过一页，**When** 使用上一页返回的 cursor 查询下一页，**Then** 返回稳定的下一页数据，不要求同步返回 `total`
+3. **Given** 某对象的活动日志量超过一页，**When** 分页查询第 2 页，**Then** 返回第 2 页数据，`total` 字段正确标识该对象的总记录数
 4. **Given** 同一对象的历史此前分散在旧 AB 内嵌记录、Metric 历史表或其他旧机制中，**When** 完成历史复制后按对象查询，**Then** 查询路径不再要求同时访问多套历史存储
 5. **Given** 官方产品没有新增通用活动页面，**When** 内部同学需要审查某个对象历史，**Then** 仍然可以通过 OP 或内部接口完成查询
 
@@ -149,7 +149,7 @@
 
 **验收场景**:
 
-1. **Given** 多位成员可以编辑同一个对象，**When** 不同成员分别发起修改，**Then** 活动日志中可以明确区分每次修改的 `operator_kind`、`operator_id`、`operator_name` 和 `source`
+1. **Given** 多位成员可以编辑同一个对象，**When** 不同成员分别发起修改，**Then** 活动日志中可以明确区分每次修改的 `operator_id`、`operator_name` 和 `source`
 2. **Given** 项目负责人需要追溯某次异常变更，**When** 查看对象历史，**Then** 可以从记录中辨认责任链路，而不是只看到匿名或无法归因的系统变更
 3. **Given** 某次修改来自内部任务、OpenAPI 或 MCP，**When** 查询对象历史，**Then** 可以和人工 Web 操作区分开来
 
@@ -186,10 +186,10 @@
 
 **验收场景**:
 
-1. **Given** 管理员添加成员到组织，**When** 添加成功，**Then** `global.activity_log` 出现 `action_type = "create"`、`action_name = "add_org_member"` 的记录，含 `account_id` 和角色信息
-2. **Given** 管理员变更成员角色（如 Analyst → Admin），**When** 保存成功，**Then** `global.activity_log` 出现 `action_type = "update"`、`action_name = "update_org_member_level"` 的记录，含 `old_level` / `new_level`
-3. **Given** 管理员移除组织成员，**When** 操作成功，**Then** `global.activity_log` 出现 `action_type = "delete"`、`action_name = "remove_org_member"` 的记录
-4. **Given** 用户创建/删除组织或项目，**When** 操作成功，**Then** `global.activity_log` 出现对应基础 `action_type` 与领域 `action_name` 组合，如 `create + create_org` / `update + archive_org` / `create + create_project` / `delete + delete_project`
+1. **Given** 管理员添加成员到组织，**When** 添加成功，**Then** `global.activity_log` 出现 `action_type = "create"` 的记录，含 `account_id` 和角色信息
+2. **Given** 管理员变更成员角色（如 Analyst → Admin），**When** 保存成功，**Then** `global.activity_log` 出现 `action_type = "update"` 的记录，含 `old_level` / `new_level`
+3. **Given** 管理员移除组织成员，**When** 操作成功，**Then** `global.activity_log` 出现 `action_type = "delete"` 的记录
+4. **Given** 用户创建/删除组织或项目，**When** 操作成功，**Then** `global.activity_log` 出现对应 `create` / `update` / `delete` 记录，领域语义通过 `item_type` 和 `detail` 体现
 5. **Given** OP 管理员修改组织配置/项目配额（已有），**When** 保存成功，**Then** 继续沿用现有 `update_org_config` / `update_project_quota` 记录，不做变更
 
 ---
@@ -248,19 +248,20 @@
 - **FR-001**: 系统 MUST 为项目内对象定义统一活动规范，并在 meta schema 下提供 `activity_log` 作为项目内对象的标准落盘表
 - **FR-002**: 系统 MUST 提供 `ActivityService` 作为公共写入入口，支持 `Log(ctx, input)` 和 `BatchLog(ctx, inputs)` 方法；写入一致性等级由活动模块内的中心化策略决定，而不是由调用方自由传入
 - **FR-003**: 活动规范 MUST 使用活动域自有的 `ItemType` 体系，不直接沿用 `def.AssetType` 作为顶层概念；该体系至少能表达资产对象与元数据对象
+- **FR-003-bis**: 活动规范 MUST 先提供一组共享基础 `action_type`（V1 为 `create` / `update` / `delete` / `copy`）；如后续确有必要扩展自定义 `action_type`，必须在活动模块统一注册并经过评审，不能由调用方自由拼接
 - **FR-004**: 对已接入现有基础设施的对象类型（如 CHART / DASHBOARD），系统 MUST 在对象操作实现中自动调用操作记录
 - **FR-005**: 对非 AssetOperator、元数据对象或需要手动控制写入的场景，系统 MUST 支持模块直接调用 `ActivityService.Log()` 记录
-- **FR-006**: 系统 MUST 提供按对象视角的活动日志查询接口，V1 至少支持 `item_type`、item_id 过滤，按 `(occurred_at DESC, id DESC)` 排序，并优先提供 cursor 分页；表在 project schema 内天然隔离，不出 project scope；该接口优先供 OP / 内部链路调用
+- **FR-006**: 系统 MUST 提供按对象视角的活动日志分页查询接口，V1 至少支持 `item_type`、item_id 过滤，按 `(occurred_at DESC, id DESC)` 排序，并返回 `page`、`page_size`、`total`；表在 project schema 内天然隔离，不出 project scope；该接口优先供 OP / 内部链路调用
 - **FR-007**: AB / Metric / Wave 项目内历史操作记录 MUST 复制到新活动规范中，旧字段或旧表保留不删；升级后新操作只写新活动表
-- **FR-008**: 以下组织 / 项目级管理操作 MUST 记录在 global schema，不写入 `meta.activity_log`。OP 端配置操作继续走 `global.op_operation_log`；Member + 生命周期操作进入 `global.activity_log`（OP 未来可能独立拆分，member 数据不应随 OP 迁移）。管理活动沿用基础 `action_type`，并通过 `action_name` 表达领域语义：
-  - **组织成员**：添加成员（`action_name = add_org_member`）、变更成员角色/级别（`update_org_member_level`）、替换主管（`replace_org_supervisor`）、移除成员（`remove_org_member`）
-  - **组织生命周期**：创建组织（`create_org`）、归档组织（`archive_org`）
-  - **项目生命周期**：创建项目（`create_project`）、删除项目（`delete_project`）
+- **FR-008**: 以下组织 / 项目级管理操作 MUST 记录在 global schema，不写入 `meta.activity_log`。OP 端配置操作继续走 `global.op_operation_log`；Member + 生命周期操作进入 `global.activity_log`（OP 未来可能独立拆分，member 数据不应随 OP 迁移）：
+  - **组织成员**：添加成员、变更成员角色/级别、替换主管、移除成员
+  - **组织生命周期**：创建组织、归档组织
+  - **项目生命周期**：创建项目、删除项目
   - 以下明确 V1 不做：邀请操作（成员加入已有 `create`）、重命名（排障价值低）、预设角色变更（极低频）
 - **FR-009**: 账号最近登录时间（`last_login_at`）、最近登出时间（`last_logout_at`）、最近活跃时间（`last_active_at`）MUST 作为 3 个 `TIMESTAMPTZ NULL` 列记录在 `global.account` 表。写入点：登录成功（密码 + OAuth）写 `last_login_at`；登出成功写 `last_logout_at`；`last_active_at` 通过 Redis SetNX 做 15 分钟节流刷新，每个认证请求触发但同一账号 15 分钟内最多写一次 DB。不要求写入 `activity_log`
 - **FR-009-bis**: 会话活跃刷新 MUST 在 Redis 不可用时跳过本次 DB 写入，并记录 warning 日志与监控指标；不得在故障态降级为每次请求写 DB。
 - **FR-010**: 系统 MUST 在技术方案中明确活动写入的中心化失败策略；至少区分“必须写入核心活动行”“允许 detail 降级”“best-effort”三类语义，但不要求调用方自由传参选择
-- **FR-011**: 系统 MUST 保留支撑内部排障所需的最小归因信息集合：`item_type`、item_id、`action_type`、可选 `action_name`、`operator_kind`、`operator_id`、`operator_name`、`source`、`occurred_at` 以及必要的结构化变更详情
+- **FR-011**: 系统 MUST 保留支撑内部排障所需的最小归因信息集合：`item_type`、item_id、`action_type`、`operator_id`、`operator_name`、`source`、`occurred_at` 以及必要的结构化变更详情
 - **FR-012**: V1 的查询接口与索引策略 MUST 优先优化“单对象最近变更链路”的排查路径，而不是优先满足按操作人、按组织范围的广义分析型查询
 - **FR-012-bis**: 系统 SHOULD 为一次业务操作影响多个对象的场景提供可选 `correlation_id`；该标识由活动基础设施自动生成或继承请求上下文，不要求业务调用方手工维护 `operation_group_id`
 - **FR-013**: 活动模型 MUST 为未来的企业信任与治理场景预留扩展点，包括但不限于敏感字段掩盖、可见性控制、保留策略、审批/告警类上层能力，但这些能力当前不作为 V1 上线前置条件
@@ -271,7 +272,7 @@
 
 - **NFR-001**: 在既定一致性模式下，活动日志写入的额外延迟目标为 < 50ms（P99）；若方案选择强活动，需在评审中重新确认该指标
 - **NFR-002**: 项目内标准活动表在 meta schema 下按项目隔离，配合 `(item_type, item_id, occurred_at DESC, id DESC)` 索引，单项目千万级日志量下查询响应 < 1s（P99）
-- **NFR-003**: V1 的活动详情优先以可读 JSON envelope 持久化；通过字段投影与大小预算控制 payload，暂不默认引入应用层压缩
+- **NFR-003**: V1 的活动详情以可读 JSON 文本持久化到 `TEXT` 列；通过字段投影与大小预算控制 payload，暂不默认引入应用层压缩
 - **NFR-004**: 活动日志默认对官方产品用户不可见；V1 以 OP / 内部接口消费为主，不要求新增通用 UI 页面
 
 ---
@@ -284,17 +285,14 @@
 |---|---|---|---|
 | `id` | BIGSERIAL | PK | 自增主键 |
 | `item_type` | VARCHAR(64) | NOT NULL | 活动对象类型：如 CHART / DASHBOARD / COHORT 等，详见 plan-object.md 枚举规范 |
-| item_id | INTEGER | NOT NULL | 对象 ID |
+| `item_id` | INTEGER | NOT NULL | 对象 ID |
 | `item_name` | VARCHAR(255) | NOT NULL DEFAULT '' | 记录时的对象名称展示快照，便于列表展示和删除后追溯，不随对象后续改名回写 |
 | `action_type` | VARCHAR(32) | NOT NULL | 基础操作类型：create / update / delete / copy |
-| `action_name` | VARCHAR(64) | NOT NULL DEFAULT '' | 可选的领域动作名：如 `online` / `release` / `add_org_member` |
-| `operator_kind` | VARCHAR(32) | NOT NULL DEFAULT 'account' | 操作人类型：`account` / `system` / `backfill` |
-| `operator_id` | INTEGER | NULL | 操作人账号 ID；system/backfill 场景允许为空 |
+| `operator_id` | INTEGER | NOT NULL | 操作人账号 ID |
 | `operator_name` | VARCHAR(255) | NOT NULL DEFAULT '' | 记录时的操作人姓名展示快照，不随用户改名或删除而更新 |
 | `source` | VARCHAR(32) | NOT NULL DEFAULT '' | 操作来源：web / openapi / internal / backfill |
 | `correlation_id` | VARCHAR(64) | NOT NULL DEFAULT '' | 批量写入或跨对象单次操作的关联标识，由活动基础设施自动生成或继承上下文 |
-| `detail_version` | SMALLINT | NOT NULL DEFAULT 1 | 活动详情 schema 版本号，由活动服务写入；V1 固定为 1，仅在 `detail_payload` 解码语义发生不兼容变化时升级 |
-| `detail_payload` | JSONB | NOT NULL DEFAULT `'{}'::jsonb` | 活动详情稳定 envelope；V1 以可读 JSON 持久化，不直接存业务结构体 |
+| `detail_payload` | TEXT | NOT NULL DEFAULT `'{}'` | 活动详情稳定 envelope 的 JSON 文本；V1 不直接存业务结构体；对外查询时返回解析后的 `detail` 对象 |
 | `occurred_at` | TIMESTAMPTZ | NOT NULL | 操作时间 / 活动事件时间；在线写入时通常等于操作发生时刻，历史迁移时回填原始事件时间 |
 | `recorded_at` | TIMESTAMPTZ | NOT NULL DEFAULT CURRENT_TIMESTAMP | 活动写入数据库的时间，用于区分事件时间与入库时间 |
 
@@ -303,7 +301,6 @@
 
 补充说明：
 - `item_name` 与 `operator_name` 是**展示快照字段**，不是当前对象或当前账号主表的真相字段
-- `detail_version` 属于 `detail_payload` 的 schema version，不是业务对象版本号
 - `occurred_at` 是活动事件发生时间，`recorded_at` 是数据库入库时间，两者语义明确区分
 
 ### ItemType（活动域对象类型）
@@ -323,7 +320,7 @@
 
 - `Log(ctx, input)` → `error`：单条写入，失败策略由活动模块按场景中心化决策
 - `BatchLog(ctx, inputs)` → `error`：批量写入；同批次内自动共享 `correlation_id`
-- `ListByQuery(ctx, query)` → `(items, nextCursor, error)`：cursor 查询，优先供 OP / 内部排障链路调用
+- `ListByQuery(ctx, query)` → `(items, total, error)`：分页查询，优先供 OP / 内部排障链路调用
 
 **ActivityWriteInput**:
 | 字段 | 类型 | 必填 | 说明 |
@@ -332,9 +329,7 @@
 | ItemID | int64 | 是 | |
 | ItemName | string | 否 | 写入时快照 |
 | ActionType | string | 是 | |
-| ActionName | string | 否 | 可选领域动作名，统一在活动模块注册 |
-| OperatorKind | string | 否 | `account` / `system` / `backfill` |
-| OperatorID | int64 | 否 | 自动从 ctx 解析；system/backfill 可为空 |
+| OperatorID | int64 | 是 | 自动从 ctx 解析 |
 | OperatorName | string | 否 | 写入时快照，自动从 ctx 解析 |
 | OccurredAt | `*time.Time` | 否 | 活动事件时间；为空时由服务层取当前时间，历史迁移可显式回填旧事件时间 |
 | CorrelationID | string | 否 | 批量或跨对象关联标识；为空时由服务层自动补齐 |
@@ -342,18 +337,19 @@
 
 ### action_type 约定
 
-活动采用两层动作模型：
-
 - `create` — 创建
 - `update` — 更新
 - `delete` — 删除
 - `copy` — 复制
 
-`action_type` 只表达基础动作类别；对象域若需要更细语义（如 `online`、`release`、`relate`、`stop`），通过可选 `action_name` 表达，并由活动模块统一注册，避免基础枚举不断膨胀。
+扩展约束：
+- V1 默认只要求以上基础动作集
+- 如未来某领域确实无法仅靠 `item_type + detail` 表达语义，才允许新增自定义 `action_type`
+- 新增动作必须由活动模块统一注册，避免调用方各自发明近义词
 
 ### detail schema 约定
 
-参考 PostHog 的结构化变更设计，活动详情采用**结构化 diff 优先**的稳定 envelope，V1 以可读 JSON 持久化，避免直接持久化当前业务结构体，降低历史兼容成本：
+参考 PostHog 的结构化变更设计，活动详情采用**结构化 diff 优先**的稳定 envelope，V1 以可读 JSON 文本持久化，避免直接持久化当前业务结构体，降低历史兼容成本：
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
@@ -362,6 +358,7 @@
 | `snapshot` | object | 否 | 必要时补充的稳定快照片段（如 delete 场景下的规则摘要），不要求完整业务结构体 |
 
 注：对象名称快照由表字段 `item_name` 承载，`detail` 内不重复。`operator_name` 同理。若 name 在本次操作中被变更，通过 `changes` 中 `field: "name"` 的 before/after 体现。
+`detail` 顶层 envelope 由活动模块统一拥有，V1 不新增 `detail_version` 字段；若未来需要不兼容演进，由活动模块统一升级 serializer/parser 兼容逻辑，而不是由各业务域各自管理版本。
 
 **Change 结构**:
 
@@ -451,12 +448,12 @@
 
 ### 变更检测（diff 引擎）
 
-系统应提供通用 diff 函数 `ChangesBetween(old, new, objectType)`，比较两个模型实例的稳定活动字段并生成 `[]Change`。对象类型通过 registry 注册 include / exclude / mask / transform 规则来控制 diff 行为，避免把当前业务结构直接写入活动载荷。
+系统应提供通用 diff 函数 `ChangesBetween(old, new, itemType)`，比较两个模型实例的稳定活动字段并生成 `[]Change`。对象类型通过 registry 注册 include / exclude / mask / transform 规则来控制 diff 行为，避免把当前业务结构直接写入活动载荷。
 
 ### 依赖接口
 
 各对象类型需配合提供获取当前对象快照的能力（用于 diff 引擎在 update 前读取旧值）：
-- `GetSnapshot(ctx, objectType, objectID) → (interface{}, error)` — 可选接口，非必实现
+- `GetSnapshot(ctx, itemType, itemID) → (interface{}, error)` — 可选接口，非必实现
 
 ---
 
@@ -468,7 +465,7 @@
 - **SC-002**: 活动失败策略在真实故障注入场景下与最终选定方案一致，并由中心化策略决定不同场景的 required / degraded / best-effort 语义
 - **SC-003**: P99 活动写入延迟 < 50ms（含 detail 序列化和 DB INSERT；若选择强活动需在评审中重新确认）
 - **SC-004**: AB / Metric / Wave 历史操作记录完成复制，新操作全部走新活动表，旧的 `details.operation_records` 或历史表保留不删
-- **SC-005**: 单项目百万级活动日志下，按 `item_type + item_id` 的 cursor 查询响应 < 500ms（P99）
+- **SC-005**: 单项目百万级活动日志下，按 `item_type + item_id` 的分页查询响应 < 500ms（P99）
 - **SC-006**: 组织 / 项目级管理操作具备清晰的活动落点；账号最近登录 / 登出 / 活跃时间具备明确字段落点
 - **SC-007**: 单个对象的最近变更链路可以通过统一活动查询路径直接获得 `who / what / when / source`，内部排障不再需要同时翻 AB 内嵌记录、Metric 历史表和 Asset Behavior 等多套机制
 - **SC-008**: V1 不新增官方产品通用活动页面；内部同学仍可通过 OP / 内部接口完成对象历史审查，AB / Metric 既有查看能力不受影响
@@ -481,4 +478,4 @@
 > - 各对象类型排除字段清单（需各模块确认）
 > - registry 中敏感字段规则与调用方投影边界
 > - 各对象的中心化写入策略矩阵（required / degraded / best-effort）
-> - 是否在 V1 同步引入 `operator_kind` 与 `recorded_at`
+> - 是否在 V1 同步引入 `recorded_at`
