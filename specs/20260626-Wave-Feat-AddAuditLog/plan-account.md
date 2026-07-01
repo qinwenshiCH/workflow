@@ -27,7 +27,7 @@
 ```
 
 - 15 分钟粒度对"最近活跃时间"足够，不需要批处理
-- Redis 不可用：SetNX 报错 → 降级为每次写 DB + warning 日志
+- Redis 不可用：SetNX 报错 → 跳过本次刷新 + warning 日志 + 指标上报，不在故障态放大 DB 写压力
 
 ## 接入点
 
@@ -47,7 +47,7 @@
 
 - **并发登录**：同一账号多设备同时登录，各自写 `last_login_at`，最后覆盖即可
 - **登出失败**：`session.Delete` 失败不写 `last_logout_at`，不阻塞登出响应
-- **Redis 不可用**：降级为每次写 DB + warning 日志
+- **Redis 不可用**：跳过本次刷新 + warning 日志 + 指标上报
 - **账号已删除**：`UpdateFields` 带 `is_deleted = false`，软删除账号自动跳过
 
 ## 验证
@@ -56,4 +56,4 @@
 - 登出后检查 `last_logout_at` 已刷新
 - 认证请求后检查 15 分钟内 `last_active_at` 只刷新一次
 - 并发登录不报错，各自时间戳落地
-- Redis 不可用时降级为每次写 DB
+- Redis 不可用时不写 DB，但会打 warning 和指标

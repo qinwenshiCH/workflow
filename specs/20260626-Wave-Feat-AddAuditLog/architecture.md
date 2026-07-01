@@ -1,21 +1,24 @@
 # 架构总览：活动日志
 
-> 一套引擎，两个表。共享类型和序列化，独立存储和服务路由。
+> 一套引擎，两个表。共享事件模型、diff/redaction、写入策略，独立存储和服务路由。
 
 ## 设计原则
 
-- **共享引擎**：ItemType 枚举、detail 序列化（LZ4 + BYTEA）、diff 引擎三件套与两个表共用
+- **共享引擎**：ItemType 枚举、基础 `action_type` + 可选 `action_name`、diff/redaction、中心化写入策略与两个表共用
 - **独立存储**：`meta.activity_log` 在 project schema（meta）内，`global.activity_log` 在 global schema 内。不试图统一
 - **显式路由**：`WriteItemLog` / `WriteManagementLog`，调用方选哪个就写哪个表，不搞自省
 - **展示快照**：`item_name` 和 `operator_name` 写入时快照，不随主表变更回写
+- **可读优先**：V1 的 detail payload 以可读 JSON 落盘，不默认使用应用层压缩
 
 ## 模块结构
 
 ```
 apps/web/activity/              # 共享类型与引擎
   types.go                      # ItemType / ActionType / Source 枚举
-  detail.go                     # Detail 结构体 + SerializeDetail / DeserializeDetail（含 LZ4）
+  detail.go                     # Detail 结构体 + JSON envelope 序列化
   diff.go                       # ChangesBetween diff 引擎
+  redact.go                     # 敏感字段掩盖 / 字段规则应用
+  policy.go                     # 中心化写入策略
 
 apps/web/dao/activity/          # DAO 层
   item.go                     # ItemActivity 模型 + DAO（metadb）
@@ -37,7 +40,9 @@ flowchart TD
     subgraph types["activity/ - 共享"]
         types_go["types.go<br/>ItemType / ActionType / Source"]
         diff_go["diff.go<br/>ChangesBetween"]
-        detail_go["detail.go<br/>序列化 + LZ4 压缩"]
+        detail_go["detail.go<br/>稳定 JSON envelope"]
+        redact_go["redact.go<br/>敏感字段掩盖"]
+        policy_go["policy.go<br/>中心化写入策略"]
     end
     subgraph dao["dao/activity/ - DAO"]
         item_dao["item.go<br/>ItemActivityDao (metadb)"]
@@ -62,25 +67,29 @@ flowchart TD
 | item_type | VARCHAR(64) | CHART / DASHBOARD / COHORT / ... |
 | item_id | INTEGER | |
 | item_name | VARCHAR(255) | 展示快照 |
-| action_type | VARCHAR(32) | 自有枚举（create / update / delete / copy + 扩展） |
-| operator_id | INTEGER | |
+| action_type | VARCHAR(32) | 基础动作：create / update / delete / copy |
+| action_name | VARCHAR(64) | 可选领域动作：online / release / add_org_member / ... |
+| operator_kind | VARCHAR(32) | account / system / backfill |
+| operator_id | INTEGER NULL | |
 | operator_name | VARCHAR(255) | 展示快照 |
 | source | VARCHAR(32) | web / openapi / internal / backfill |
+| correlation_id | VARCHAR(64) | 批量或跨对象关联标识 |
 | detail_version | SMALLINT | V1 固定 1 |
-| detail_payload | BYTEA | LZ4 压缩序列化 |
-| created_at | TIMESTAMPTZ | 操作时间 |
+| detail_payload | JSONB | 稳定 envelope |
+| occurred_at | TIMESTAMPTZ | 活动事件时间 |
+| recorded_at | TIMESTAMPTZ | DB 入库时间 |
 
-索引：`(item_type, item_id, created_at DESC)`
+索引：`(item_type, item_id, occurred_at DESC, id DESC)`
 
 ### global.activity_log（global schema）
 
 同 meta.activity_log + org_id（BIGINT NOT NULL）+ project_id（BIGINT DEFAULT NULL）。
 
 索引：
-- `(org_id, item_type, created_at DESC)`
-- `(project_id, item_type, created_at DESC)`
-- `(item_type, item_id, created_at DESC)`
-- `(operator_id, created_at DESC)`
+- `(org_id, item_type, occurred_at DESC, id DESC)`
+- `(project_id, item_type, occurred_at DESC, id DESC)`
+- `(item_type, item_id, occurred_at DESC, id DESC)`
+- `(operator_id, occurred_at DESC, id DESC)`
 
 ## 链路分界
 

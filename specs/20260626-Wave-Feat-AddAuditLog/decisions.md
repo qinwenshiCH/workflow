@@ -24,17 +24,17 @@
 
 - 2026-06-26: `meta.activity_log`（meta schema）是**项目内对象**的标准落盘表，但活动体系不要求所有场景都共用这一张表
 - 2026-06-26: 组织 / 项目级管理操作可以基于现有 `global.op_operation_log` 演进，或设计新的 global 级记录表；不强行并入 `meta.activity_log`
-- 2026-06-26: 活动一致性等级（强一致性 vs best-effort）重新打开，需在方案评审中显式定夺；`LogWithFallback` 仅作为候选方案，不视为最终结论
-- 2026-06-26: detail 采用**活动域自有的版本化载荷**，结构化 `changes: [{field, action, before, after}]` 优先，必要时允许 `extra` / `snapshot` 补充；不使用 JSONB，不直接持久化现有业务结构体（来源：PostHog 研究 D-01 + 本轮会话确认）
+- 2026-06-26: 活动一致性等级（强一致性 vs best-effort）重新打开，需在方案评审中显式定夺；`LogWithFallback` 仅作为早期候选方案，后续已被中心化 policy 设计覆盖
+- 2026-06-26: detail 采用**活动域自有的版本化载荷**，结构化 `changes: [{field, action, before, after}]` 优先，必要时允许 `extra` / `snapshot` 补充；不直接持久化现有业务结构体（来源：PostHog 研究 D-01 + 本轮会话确认）
 - 2026-06-26: V1 的查询路径和索引策略优先服务**单对象变更链路排查**，不优先按操作人或全局分析视角优化
 - 2026-06-26: 活动模型需要为未来企业信任与治理能力预留扩展点（如敏感字段掩盖、可见性控制、保留策略、审批/告警），但这些不作为 V1 上线前置条件
 - 2026-06-29: V1 不在官方产品中新增通用活动查看入口；仅保留 AB / Metric 既有查看能力，其他活动查看能力优先通过 OP / 内部接口提供
 - 2026-06-29: 为了方便内部审查与排障，可以在 OP 暴露对象活动查询接口，但不要求同步建设页面
-- 2026-06-30: **一致性等级**：调用方在每个 `Log`/`BatchLog` 调用时通过 `consistency` 参数自行决定。API 提供三种等级 `Strong` / `Core` / `BestEffort`。不设系统级一刀切策略。建议：删除/发布/高风险操作用 `Strong`，常规 CRUD 用 `Core`，内部操作/回填用 `BestEffort`。
+- 2026-06-30: **一致性等级**：本轮讨论曾尝试由调用方在每个 `Log`/`BatchLog` 上显式传 `Strong` / `Core` / `BestEffort`，该方案后续已被 2026-07-01 的中心化 policy 设计覆盖。
 - 2026-06-30: **BatchLog 原子性**：同一业务事务内的多条活动记录通过 `BatchLog` 一次性写入。任一记录的核心字段写入失败 → 整体失败 → 业务事务回滚。
-- 2026-06-30: **活动保留策略**：V1 不实现自动清理，预留 `created_at` 作为未来分区键；按月份分区为推荐扩展路径。
-- 2026-06-30: `detail_payload` 使用 BYTEA + LZ4 压缩——LZ4 压缩后是二进制数据，BYTEA 是自然选择。不使用 JSONB，因为 V1 查询只按 (item_type, item_id) 过滤，不在 detail 上做搜索。未来如需全文检索 detail，需评估从 TEXT / JSONB + GIN 索引迁移的成本。
-- 2026-06-30: `meta.activity_log` 部署在 project schema（meta），`project_id` 列冗余，不设。索引为 `(item_type, item_id, created_at DESC)`。
+- 2026-06-30: **活动保留策略**：V1 不实现自动清理，预留 `occurred_at` 作为未来分区键；按月份分区为推荐扩展路径。
+- 2026-06-30: `detail_payload` 使用 BYTEA + LZ4 压缩的方案已在 2026-07-01 被“JSONB 可读 envelope 优先”覆盖，保留为历史讨论痕迹。
+- 2026-06-30: `meta.activity_log` 部署在 project schema（meta），`project_id` 列冗余，不设。当前对象查询索引口径已更新为 `(item_type, item_id, occurred_at DESC, id DESC)`。
 - 2026-06-30: **枚举规范最终定义**：
   - `ItemType` 使用 UPPER_SNAKE_CASE 字符串，共 13 个值（含 PIPELINE）
   - `action_type` 使用全小写描述性字符串，所有常量**统一定义在 `activity/types.go`**（守口到活动模块）。新增 action_type 需在此文件加 const 并 PR review 确认语义无重叠。
@@ -44,22 +44,28 @@
 - 2026-06-30: **两期交付策略**：第一期（Phase 0+1）交付项目对象活动底座（meta.activity_log + activity 模块 + 对象 live-write + 历史迁移 + OP 查询），独立可验证。第二期（Phase 2+3）交付 metadata 长尾 + account/org/project 管理活动。两期分别 commit，但都在本 spec 内完成。
 - 2026-07-01: **基础能力方案重新打开评审，不宣称已最终锁定**。当前需重新收敛的一组核心设计包括：一致性模型、action_type 体系、payload 物理格式、批量/跨对象关联模型、脱敏职责边界。
 - 2026-07-01: **action_type 先提供基础动作集，再允许扩展自定义动作**。基础集合优先保持精简（如 `create` / `update` / `delete` / `copy`），对象域如确有高价值语义，可在活动模块统一注册扩展 action_type；当前不锁死最终全集。
+- 2026-07-01: **动作模型升级为两层**：`action_type` 保持基础动作集，新增可选 `action_name` 承载领域语义（如 `online` / `release` / `add_org_member`）。这条结论覆盖此前“把大量领域动作直接做成 action_type 主枚举”的方案。
+- 2026-07-01: **写入一致性策略中心化**。不再要求业务调用方在每次 `Log`/`BatchLog` 时自由传 `Strong/Core/BestEffort`；改为由活动模块内部 policy registry 按 `item_type + action_type + action_name` 决定 `required_full` / `required_core` / `best_effort`。
+- 2026-07-01: **V1 detail_payload 改为可读 JSONB envelope**，不默认使用 BYTEA + LZ4 应用层压缩。先通过字段投影和大小预算控 payload，待真实规模证明有必要时再评估 codec 升级。
 
 ## 边界 & 异常处理
 
-- 2026-06-26: 单条 detail 序列化后最大 64KB（可配置），超出时优先 LZ4 压缩（复用 `pkg/lib/util/compress.go`）；压缩后仍超则逐字段截断并记录警告（D-09）
+- 2026-06-26: 单条 detail 仍保留大小预算（64KB 可配置）作为工程约束；V1 优先通过字段投影和截断控制大小，而不是默认应用层压缩（D-09）。
 - 2026-06-26: 同一对象高频操作每条独立记录，不合并去重
 - 2026-06-26: AB / Metric / Wave 项目内历史操作记录需要复制进新活动规范；升级后新操作只写新活动表，不要求双写；旧字段或旧表保留不删（D-10，本轮会话确认）
 - 2026-07-01: `last_active_at` 的 Redis 节流若不可用，**不降级为每次请求写 DB**。改为跳过本次刷新并记录 warning / 指标，避免在故障态放大数据库写压力。
+- 2026-07-01: **不引入 `operation_group_id` 作为业务维护字段**。若需串联一次操作影响的多条活动记录，使用可选 `correlation_id`，由活动基础设施自动生成或继承请求上下文。
 
 ## 数据模型
 
 - 2026-06-26: 活动域使用自有 `ItemType` 体系，不直接复用 `def.AssetType`
-- 2026-06-26: V1 不做分区，主索引 `(item_type, item_id, created_at DESC)`，按需后续补充（D-04/D-06）
+- 2026-06-26: V1 不做分区，主索引口径已更新为 `(item_type, item_id, occurred_at DESC, id DESC)`，按需后续补充（D-04/D-06）
 - 2026-06-26: action_type 精简为 create/update/delete/copy，状态变更通过 changes[] 字段级 changed 表达（D-03，与 PostHog 理念对齐）
 - 2026-06-26: item_id 允许为 0（仅用于极少数项目内规范对象的特殊场景；组织/项目级管理操作优先独立记录）
 - 2026-06-26: 当前不提供跨项目全局查询，由调用方自行跨 schema 查询
 - 2026-06-26: V1 查询范围收敛为**按对象视角查看历史**，当前不要求按操作人维度检索，因此不承诺 `operator_id` 维度查询/索引
+- 2026-07-01: **事件时间与入库时间拆分**：活动表使用 `occurred_at` 表示事件发生时间，使用 `recorded_at` 表示数据库入库时间；对象查询默认按 `(occurred_at DESC, id DESC)` 排序。
+- 2026-07-01: **对象查询改为 cursor 优先**。V1 的内部查询接口优先返回 `next_cursor`，不要求同步返回 `total`。
 
 ## 数据字段
 
@@ -67,16 +73,17 @@
 - 2026-06-29: 保留 `item_name` 字段，作为对象名称的展示快照；它不是当前对象主表真相，而是为了删除后追溯和列表可读性
 - 2026-06-29: `operator_name`、`item_name` 都按展示快照处理，不要求随主表数据变更回写历史
 - 2026-06-26: 新增 `source` 字段，区分操作来源：web / openapi / internal / backfill（D-13）
-- 2026-06-26: 不需要 `operation_group_id`，同一条记录天然是一组操作（D-12）
+- 2026-06-26: 不需要业务方维护 `operation_group_id`（D-12）；若需串联多条活动记录，后续统一使用由基础设施生成的 `correlation_id`
 - 2026-06-26: 账号最近登录/登出/活跃时间不进入 `meta.activity_log`，而是作为账号活跃字段落在 `account` 表或等价账号主表
 - 2026-06-29: `detail_version` 表示 `detail_payload` 的 schema version，不是业务对象版本号；V1 固定为 `1`，仅在 detail 解码语义发生不兼容变化时升级
-- 2026-06-29: `created_at` 直接定义为操作时间 / 活动事件时间，而不是数据库插入时间；历史迁移时回填旧事件时间
+- 2026-06-29: 早期曾用 `created_at` 承载活动事件时间；当前口径已拆为 `occurred_at`（事件时间）与 `recorded_at`（入库时间）。
 - 2026-06-30: V1 不记录 IP 地址。排障场景 operator_id 已够用，不增加字段复杂度。
 - 2026-06-30: **Account 活跃字段完整方案**：3 个 `TIMESTAMPTZ NULL` 列加在 `global.account` 表。详见 [plan-account.md](./plan-account.md)。
+- 2026-07-01: **操作者模型补充 `operator_kind`**。`operator_id` 允许在 `system` / `backfill` 场景为空，`operator_name` 继续作为展示快照保留。
 
 ## 代码对齐
 
-- 2026-06-30: LZ4 压缩复用 `pkg/lib/util/compress.go` 中的 `LZ4()`/`UnLZ4()` 函数，非 gzip 函数。
+- 2026-06-30: 若未来重新引入应用层压缩，优先复用 `pkg/lib/util/compress.go` 中的 `LZ4()`/`UnLZ4()`，非 gzip。
 - 2026-06-30: Dashboard 的 `AddChartsToDashboard`/`RemoveChartsFromDashboard` 不单独产生 Chart 活动记录。关联变更只在 Dashboard 的 `update` 活动中体现。
 - 2026-06-30: Cohort 的 `DeleteCohort` 接收 `*dto.CohortDeleteDTO`（仅含 ID 和 Name），delete 场景需要的规则快照（snapshot.rule_summary）需额外从 DB 读取。
 
@@ -91,12 +98,12 @@
 
 ## autoplan 审查（2026-06-30）
 
-- 2026-06-30: **global.activity_log 的 action_type** 使用自有枚举（create/update/delete），不共享 meta.activity_log 的枚举。域操作语义由 item_type + detail_payload 承载，不设 object_action 字段。模块可注册新 item_type 来扩展，无需改 action_type。
+- 2026-06-30: **global.activity_log 的动作模型** 当前与 meta 活动域对齐：共享基础 `action_type`，域操作语义通过可选 `action_name` + detail 承载。
 - 2026-06-30: **新增操作人索引 idx_activity_operator**。支撑"按操作人反查组织操作"的排障路径。新增 DAO 方法 ListByOperator。
 - 2026-06-30: **BatchInsert 上限 500 行**。超过时调用方自行分批，DAO 层不接受超过 500 行的参数。
 - 2026-06-30: **增加 write-only feature flag**。部署方案增加 feature flag 保护，异常时可快速关闭活动写入而不影响业务逻辑。
 - 2026-06-30: **detail 格式与 meta.activity_log 对齐**。global.activity_log 增加 detail_version + detail_payload（替代原 detail TEXT），V1 固定 detail_version=1。
-- 2026-06-30: **一致性模型由调用方决定**。活动服务层提供 `Log`（强一致性）和 `LogWithFallback`（best-effort）两种方法，管理活动推荐 `LogWithFallback`，但不硬编码。detail_payload 大小约束对齐 meta.activity_log（64KB + LZ4）。
+- 2026-06-30: **一致性模型** 当前已统一改为中心化 policy 决策；管理活动不再要求业务调用方在 `Log` / `LogWithFallback` 间自行选择。
 
 ## autoplan scope 确认（2026-06-30）
 
