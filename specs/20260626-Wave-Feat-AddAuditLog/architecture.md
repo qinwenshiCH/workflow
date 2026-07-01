@@ -74,7 +74,7 @@ flowchart TD
 | correlation_id | VARCHAR(64) | 批量或跨对象关联标识 |
 | detail_payload | TEXT | 稳定 envelope 的 JSON 文本；查询接口读出后返回解析后的 `detail` 对象 |
 | occurred_at | TIMESTAMPTZ | 活动事件时间 |
-| recorded_at | TIMESTAMPTZ | DB 入库时间 |
+| created_at | TIMESTAMPTZ | DB 入库时间 |
 
 索引：`(item_type, item_id, occurred_at DESC, id DESC)`
 
@@ -85,8 +85,6 @@ flowchart TD
 索引：
 - `(org_id, item_type, occurred_at DESC, id DESC)`
 - `(project_id, item_type, occurred_at DESC, id DESC)`
-- `(item_type, item_id, occurred_at DESC, id DESC)`
-- `(operator_id, occurred_at DESC, id DESC)`
 
 ## 链路分界
 

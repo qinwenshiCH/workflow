@@ -67,7 +67,7 @@
 - 2026-06-26: item_id 允许为 0（仅用于极少数项目内规范对象的特殊场景；组织/项目级管理操作优先独立记录）
 - 2026-06-26: 当前不提供跨项目全局查询，由调用方自行跨 schema 查询
 - 2026-06-26: V1 查询范围收敛为**按对象视角查看历史**，当前不要求按操作人维度检索，因此不承诺 `operator_id` 维度查询/索引
-- 2026-07-01: **事件时间与入库时间拆分**：活动表使用 `occurred_at` 表示事件发生时间，使用 `recorded_at` 表示数据库入库时间；对象查询默认按 `(occurred_at DESC, id DESC)` 排序。
+- 2026-07-01: **事件时间与入库时间拆分**：活动表使用 `occurred_at` 表示事件发生时间，使用 `created_at` 表示数据库入库时间；对象查询默认按 `(occurred_at DESC, id DESC)` 排序。
 
 ## 数据字段
 
@@ -79,7 +79,7 @@
 - 2026-06-26: 账号最近登录/登出/活跃时间不进入 `meta.activity_log`，而是作为账号活跃字段落在 `account` 表或等价账号主表
 - 2026-07-01: **V1 不引入 `detail_version` 字段**。当前只有单一 envelope 结构，版本管理收益不足；envelope 的 serializer/parser 兼容由活动模块统一维护，不下放给业务域各自管理。
 - 2026-07-01: **查询接口返回 `detail`，不直接暴露 `detail_payload`**。`detail_payload` 是存储层字段名；服务层读出后统一反序列化为 `detail` 响应对象。
-- 2026-06-29: 早期曾用 `created_at` 承载活动事件时间；当前口径已拆为 `occurred_at`（事件时间）与 `recorded_at`（入库时间）。
+- 2026-06-29: 早期曾用 `created_at` 承载活动事件时间；当前口径已拆为 `occurred_at`（事件时间）与 `created_at`（入库时间）。
 - 2026-06-30: V1 不记录 IP 地址。排障场景 operator_id 已够用，不增加字段复杂度。
 - 2026-06-30: **Account 活跃字段完整方案**：3 个 `TIMESTAMPTZ NULL` 列加在 `global.account` 表。详见 [plan-account.md](./plan-account.md)。
 - 2026-07-01: **是否引入 `operator_kind` 暂不锁定**。V1 先不把它写进主契约；如后续发现仅靠 `source + operator_id` 无法清晰表达 system/backfill 场景，再单独评估。
@@ -142,13 +142,36 @@ autoplan 使用双声音机制（Claude subagent + Codex）独立评审，以下
 | 6 | **竞品风险**（Codex 独家）：直接竞品（PostHog、LaunchDarkly、Datadog）已内建活动记录，Wave 的无 UI 策略会让竞品在安全问询环节胜出。 | Codex 提出 | 需在产品策略层面纳入考虑 |
 | 7 | **一致性模型与事务耦合**（Claude 独家）：required_full 策略将活动写入与业务事务耦合，可能成为写入瓶颈。Claude 建议评估异步队列作为替代。 | Claude 提出 | 需在 Eng Review 中评估异步写入路径 |
 
+### P4 存储格式（2026-07-01，已讨论、暂不锁定）
+
+- 2026-07-01: **P4 存储格式暂不锁定**。CEO 前提门要求从 TEXT + JSON 调整，但确认影响不大，搁置后续讨论。完整按规模评审分析移入 [discussion.md](./discussion.md)，包括 JSONB / TEXT + LZ4 / 保留 TEXT 三方案对比、行业参考、风险矩阵、推荐路径。
+
 ### 审查裁定
 
 - **mode**: HOLD SCOPE（保持当前 scope，最大化 rigor，不扩展也不收缩）
 - **评审结论**: DONE_WITH_CONCERNS — 上述 #1（北极星）和 #2（产品面）需要在 Final Approval Gate 呈现给用户决策；#3-#7 纳入 plan 文档更新和 Eng Review 范围
 - **动作项**：
   1. [x] 前提门确认（P4 调整已记录）
-  2. [ ] plan-object.md 更新：P4 存储格式、补充 CDC/outlook 排除理由、补充接入文档计划
-  3. [ ] spec.md 扩展：设计原则增加企业信任视角
-  4. [ ] Eng Review：架构审查、性能评估、JSONB vs TEXT+LZ4 选型
-  5. [ ] Final Approval Gate：呈现 #1/#2 给用户决策
+  2. [ ] plan-object.md 更新：补充 CDC/outbox 排除理由、补充接入文档计划
+  3. [ ] spec.md 扩展：设计原则增加企业信任/合规视角（Enterprise Traceability）
+  4. [x] Eng Review：架构审查通过，P4 移入 discussion.md 待后续讨论
+  5. [x] Final Approval Gate：已决策
+
+## autoplan Final Approval Gate（2026-07-01）
+
+| # | 议题 | 双声音共识 | 决策 | 理由 |
+|---|------|-----------|------|------|
+| 1 | **设计原则扩展**（北极星太窄） | 高度一致 | ✅ **扩展** | 在 spec.md 补充 Enterprise Traceability 视角，可追溯性本身就是独立价值维度，不影响 V1 scope |
+| 2 | **最小产品面**（缺少活动页） | 高度一致 | ❌ **V1 不做** | V1 排障场景使用者主要是内部同学，产品面留到 V2 评估；OP/内部接口已满足当前需求 |
+| 3 | **接入文档 + 测试工具**（DX 补充） | 高度一致 | ✅ **补充** | 在 plan 中补充 ActivityService 接入指南和测试 mock 辅助函数 |
+| 4 | **CDC/outbox 排除理由** | 高度一致 | ✅ **补充** | 在 plan-object.md 新增备选方案对比节点排除理由 |
+| 5 | **P4 存储格式** | 方向一致 | ⏳ **移入 discussion.md** | 确认影响不大，不阻塞 V1，后续讨论锁定 |
+
+### 最终裁定
+
+- **审查结论**: DONE_WITH_CONCERNS — 2 个战略议题已决策，3 个补充项已确认
+- **plan 更新范围**:
+  1. spec.md → 扩展设计原则（Enterprise Traceability）
+  2. plan-object.md → 补充 CDC/outbox 排除理由 + DX 接入文档计划 + 测试辅助工具
+  3. discussion.md → P4 存储格式评审分析（已移入）
+- **后续**: plan 文档更新 → 归档 → 提交

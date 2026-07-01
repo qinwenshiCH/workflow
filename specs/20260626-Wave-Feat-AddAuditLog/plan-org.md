@@ -32,22 +32,17 @@ CREATE TABLE IF NOT EXISTS activity_log (
     correlation_id  VARCHAR(64)  NOT NULL DEFAULT '',
     detail_payload  TEXT         NOT NULL DEFAULT '{}',
     occurred_at     TIMESTAMPTZ  NOT NULL,
-    recorded_at     TIMESTAMPTZ  NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX idx_activity_org
     ON activity_log(org_id, item_type, occurred_at DESC, id DESC);
 CREATE INDEX idx_activity_project
     ON activity_log(project_id, item_type, occurred_at DESC, id DESC);
-CREATE INDEX idx_activity_item
-    ON activity_log(item_type, item_id, occurred_at DESC, id DESC);
-CREATE INDEX idx_activity_operator
-    ON activity_log(operator_id, occurred_at DESC, id DESC);
 ```
 
 - `action_type` 复用共享基础枚举；管理域细语义通过 `item_type` + `detail` 表达，不新增 `action_name`
 - `idx_activity_project` 支撑"查某个 project 的成员变更"场景
-- `idx_activity_operator` 支撑"某操作人最近对组织做了什么"的排障路径
 
 ## 3. 能力矩阵
 
@@ -56,14 +51,14 @@ CREATE INDEX idx_activity_operator
 | item_type | action_type | V1 | 说明 |
 |------------|-------------|:--:|------|
 | `ORGANIZATION` | `create` | ✓ | 组织初始化 |
-| | `update` | ✓ | 组织归档（status→archived） |
-| | — | — | config 变更走 `op_operation_log`，不进此表 |
+| | `update` | ✓ | 组织信息修改、配置变更 |
+| | `delete` | ✓ | 组织归档 |
 | `ORG_MEMBER` | `create` | ✓ | 添加成员 |
 | | `update` | ✓ | 变更成员级别 / 替换主管 |
 | | `delete` | ✓ | 移除成员 |
 | `PROJECT` | `create` | ✓ | 创建项目 |
+| | `update` | ✓ | 项目信息修改、配置变更 |
 | | `delete` | ✓ | 删除项目 |
-| | — | — | config 变更走 `op_operation_log`，不进此表 |
 | `PROJECT_MEMBER` | `create` | ✓ | 将成员加入项目 |
 | | `update` | ✓ | 变更成员在项目中的角色 |
 | | `delete` | ✓ | 将成员移出项目 |
@@ -73,9 +68,8 @@ CREATE INDEX idx_activity_operator
 **V1 不做项说明**：
 
 - 邀请创建/发送/撤回 — 邀请建在自有表上，接受邀请后触发生效操作走 activity_log
-- org/project 重命名 — 排障价值低
 - 预设角色变更 — 极低频
-- 组织级联操作子项（Archive 内部删 member/project/RBAC） — 顶层 `update ORGANIZATION` 已记录
+- 组织级联操作子项（Archive 内部删 member/project/RBAC） — 顶层 `delete ORGANIZATION` 已记录
 
 ### 3.2 接入点
 
@@ -108,13 +102,15 @@ item_type = `"PROJECT_MEMBER"`，item_id = `account_id`，project_id = 项目 ID
 
 **`UpdateAccountProjectAuths`**（全量同步用户的跨项目授权）：视作一条 management activity log 记录。内部批处理逻辑不细拆到单行写入，而是记录一次 `action_type=update, item_type=ORG_MEMBER`，detail 包含变更摘要（涉及项目数、成员数）。
 
-#### 组织/项目生命周期（4 项）
+#### 组织/项目生命周期（6 项）
 
 | action_type | item_type | item_id | project_id | 接入位置 | item_name | detail |
 |------------|------------|-----------|----------|---------|------------|--------|
 | `create` | `ORGANIZATION` | org_id | NULL | `organization/organization.go` `Init` | org name | `{"creator_id":<id>}` |
-| `update` | `ORGANIZATION` | org_id | NULL | `organization/organization.go` `Archive` | org name | `{"status_before":"active","status_after":"archived"}` |
+| `update` | `ORGANIZATION` | org_id | NULL | 组织信息/配置变更入口 | org name | 按 diff 记录变更字段 |
+| `delete` | `ORGANIZATION` | org_id | NULL | `organization/organization.go` `Archive` | org name | `{"status_before":"active","status_after":"archived"}` |
 | `create` | `PROJECT` | project_id | project_id | `project/create.go` `Create` | project name | `{"org_id":<id>}` |
+| `update` | `PROJECT` | project_id | project_id | 项目信息/配置变更入口 | project name | 按 diff 记录变更字段 |
 | `delete` | `PROJECT` | project_id | project_id | `project/delete.go` `Archive` | project name | `{"org_id":<id>}` |
 
 ## 4. 操作人解析
@@ -264,7 +260,7 @@ for _, m := range updatedMembers {
 | `BatchInsert` 超过 500 行 | 调用方必须自行分批，DAO 不接受超过 500 行的参数 |
 | 并发操作同一成员 | 各自事务各自写，两条活动记录都落地，时间戳区分 |
 | 注册时自动创建组织然后 add member | 两条：`create ORGANIZATION` + `create ORG_MEMBER`（注册用户既是 creator 也是 member） |
-| `Archive` 删 org（级联删 member/project/RBAC） | 一条 `update ORGANIZATION`。内部级联删除不单独记（否则 N 条记录，且与 活动粒度原则冲突） |
+| `Archive` 删 org（级联删 member/project/RBAC） | 一条 `delete ORGANIZATION`。内部级联删除不单独记（否则 N 条记录，且与 活动粒度原则冲突） |
 
 ## 11. 可观测性
 
@@ -289,8 +285,9 @@ for _, m := range updatedMembers {
 - 变更角色 → `action_type=update`，detail 含 old/new level
 - 替换主管 → 每个变更的主管各一条 `update`
 - 移除成员 → `action_type=delete`
-- 创建/归档组织 → `create`、`update`
-- 创建/删除项目 → `create`、`delete`
+- 创建/归档组织 → `create`、`delete`
+- 创建/更新/删除项目 → `create`、`update`、`delete`
+- 组织信息/配置修改 → `update`
 - 批量操作 → `BatchInsert` 多行落地，不超过 500 行
 - DB insert 失败 → 行为符合对应 `WritePolicy`
 - `ListByOrg` / `ListByProject` / `ListByItem` / `ListByOperator` 分页和 `total` 正确

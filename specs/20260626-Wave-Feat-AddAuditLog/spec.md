@@ -84,6 +84,7 @@
 2. **Attribution by Default**：任何进入统一活动规范的记录，都应默认保留对象、操作、操作人、来源、时间和必要变更详情，确保责任链路完整
 3. **Enterprise-Ready, Not Enterprise-Heavy**：设计上要支持未来走向更强企业活动能力，但 V1 不为假想合规要求过度建设，避免把当前最核心的排障价值稀释掉
 4. **Governance-Extensible**：活动 detail、对象类型和查询模型要保持稳定与可扩展，使后续审批、告警、策略控制可以建立在同一套历史记录之上
+5. **Enterprise Traceability**：活动记录的可追溯性本身就是独立价值维度，不是排障的副产品。设计时应显式考虑"客户安全问询时能否直接展示可追溯能力"这一场景，确保 V1 的字段取舍和语义表达在企业视角下同样完整。这不等同于 V1 建设产品 UI，而是确保当客户问"你们能追溯谁改了什么吗"时，回答是"能"，而不是"能，但得查库"。
 
 ---
 
@@ -294,14 +295,14 @@
 | `correlation_id` | VARCHAR(64) | NOT NULL DEFAULT '' | 批量写入或跨对象单次操作的关联标识，由活动基础设施自动生成或继承上下文 |
 | `detail_payload` | TEXT | NOT NULL DEFAULT `'{}'` | 活动详情稳定 envelope 的 JSON 文本；V1 不直接存业务结构体；对外查询时返回解析后的 `detail` 对象 |
 | `occurred_at` | TIMESTAMPTZ | NOT NULL | 操作时间 / 活动事件时间；在线写入时通常等于操作发生时刻，历史迁移时回填原始事件时间 |
-| `recorded_at` | TIMESTAMPTZ | NOT NULL DEFAULT CURRENT_TIMESTAMP | 活动写入数据库的时间，用于区分事件时间与入库时间 |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT CURRENT_TIMESTAMP | 活动写入数据库的时间，用于区分事件时间与入库时间 |
 
 **索引**（V1 精简，后续根据实际查询模式补充）:
 - `idx_pal_object` ON `(item_type, item_id, occurred_at DESC, id DESC)` — 主索引，按对象查询
 
 补充说明：
 - `item_name` 与 `operator_name` 是**展示快照字段**，不是当前对象或当前账号主表的真相字段
-- `occurred_at` 是活动事件发生时间，`recorded_at` 是数据库入库时间，两者语义明确区分
+- `occurred_at` 是活动事件发生时间，`created_at` 是数据库入库时间，两者语义明确区分
 
 ### ItemType（活动域对象类型）
 
@@ -478,4 +479,3 @@
 > - 各对象类型排除字段清单（需各模块确认）
 > - registry 中敏感字段规则与调用方投影边界
 > - 各对象的中心化写入策略矩阵（required / degraded / best-effort）
-> - 是否在 V1 同步引入 `recorded_at`
