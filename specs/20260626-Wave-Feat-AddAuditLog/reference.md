@@ -73,7 +73,7 @@ ApplyMaskRules → `"phone"` 命中 `MaskRules`，脱敏后：
 
 **Step ④: 处理结果**
 
-PolicyKey `account.update_profile` → WritePolicy `required_core` → 主行已落，detail 失败时记 warning 不阻塞业务。
+PolicyKey `account.update_profile` → WritePolicy `blocking` → err != nil 则返回 error。
 
 ---
 
@@ -155,7 +155,7 @@ ApplyMaskRules → MaskRules 为空，跳过。组装 Extra。
 
 **Step ④: 处理结果**
 
-PolicyKey `ab.release` → WritePolicy `required_full` → 如果 `err != nil` 则返回 error 回滚事务。
+PolicyKey `ab.release` → WritePolicy `blocking` → 如果 `err != nil` 则返回 error 回滚事务。
 
 ---
 
@@ -911,7 +911,7 @@ V1 需提供：
 |------|------|------|
 | ActivityService 接入指南 | 调用契约、必填字段、detail 构建规范、常见错误 | Markdown |
 | 对象类型接入模板 | 每个 ItemType 的写入调用示例 | Go 示例代码 |
-| WritePolicy 选择指南 | required_full/core/best_effort 适用场景、决策树 | Markdown |
+| WritePolicy 选择指南 | blocking/best_effort 适用场景、决策树 | Markdown |
 | Detail helper 使用说明 | `ChangesBetween` 调用方式、稳定投影约定、敏感字段禁入规则 | Markdown + 注释 |
 
 测试辅助工具：
@@ -944,7 +944,7 @@ V1 需提供：
 |------|------|------|
 | ActivityService 接入指南 | 调用契约、必填字段、detail 构建规范、常见错误 | Markdown |
 | 对象类型接入模板 | 每个 ItemType 的写入调用示例 | Go 示例代码 |
-| WritePolicy 选择指南 | required_full/core/best_effort 适用场景、决策树 | Markdown |
+| WritePolicy 选择指南 | blocking/best_effort 适用场景、决策树 | Markdown |
 | Detail helper 使用说明 | `ChangesBetween` 调用方式、稳定投影约定、敏感字段禁入规则 | Markdown + 注释 |
 
 测试辅助工具：

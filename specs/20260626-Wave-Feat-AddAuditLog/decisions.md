@@ -61,13 +61,13 @@
 ## 写入与一致性
 
 - 由调用方运行时显式传入 Strong/Core/BestEffort 的方案已废弃，改为通过稳定 `PolicyKey` 解析
-- `WritePolicy` 三种等级：`required_full`（主行/detail 失败返回 error）、`required_core`（主行失败返回 error，detail 可降级）、`best_effort`（warning）
+- `WritePolicy` 两种等级：`blocking`（写入失败返回 error）和 `best_effort`（写入失败记 warning）
 - 策略由业务 owner 在接入场景注册时声明，ActivityService 负责执行，不按模块或 `item_type + action_type` 一刀切
-- 不允许调用方运行时自由传 `required_full` / `best_effort`
+- 不允许调用方运行时自由传 `blocking` / `best_effort`
 - PolicyKey 注册保障：运行时拒绝是最后防线。加 init-time test，用反射扫描所有 `ActivityPolicyKey` 常量，断言每个都调了 `RegisterPolicy`
 - 文档不引入额外平台概念；是否阻塞业务由具体接入点的 PolicyKey 和事务边界共同决定
 - `PolicyKey` 在 V1 只是稳定场景名到返回行为的轻量映射，不建设复杂策略框架
-- 批量写入：同批共享 `correlation_id`；任一核心字段失败 → 整体返回 error（required_full/core）、warning（best_effort）
+- 批量写入：同批共享 `correlation_id`；任一核心字段失败 → 整体返回 error（blocking）、warning（best_effort）
 - 同一事务跨对象操作（如 CopyDashboard）通过批量写入接口写入
 - V1 不实现自动清理、分区、TTL；这些能力进入后续讨论
 
