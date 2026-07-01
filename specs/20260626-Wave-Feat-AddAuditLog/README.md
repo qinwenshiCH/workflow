@@ -1,159 +1,63 @@
-# AddAuditLog 评审入口
+# AddAuditLog — 活动日志统一基础设施
 
-> 这份 README 是评审入口。目标是让读者先理解整体设计和闭环流程，再进入各分域方案；详细决策、历史讨论和研究资料仍保留在原文件中。
+> Wave 新增一套 `activity` 基础设施，用统一的 `item_type + action_type + detail` 模型记录关键活动。<br/>
+> 项目内 item → `meta.activity_log` | Global item → `global.activity_log` | OP 操作 → 维持 `op_operation_log` | 账号活跃 → `global.account` 字段
 
-## 一句话方案
+---
 
-Wave 新增一套 `activity` 基础设施，用统一的 `item_type + action_type + detail` 模型记录关键活动：
+## 当前状态
 
-- 项目内 item 写 `meta.activity_log`
-- web global schema 下的 item 写 `global.activity_log`
-- OP 后台人员操作继续写 `global.op_operation_log`
-- 账号最近登录 / 登出 / 活跃时间写 `global.account` 字段，不进入活动表
+| 维度 | 状态 | 下一步 |
+|------|------|--------|
+| spec 评审 | 🔎 评审中 | 继续收敛 global 查询模型与交付边界 |
+| 技术方案 | 🔎 评审中 | 按 V1 最小闭环裁剪后再锁定 |
+| 代码实现 | ⏳ 未开始 | Phase 0：建表 + activity 模块 + 查询 API |
+| Wave 项目 | `add_audit_record` worktree | 代码落点为 `/Users/wenshiqin/wave-worktrees/add_audit_record` |
 
-## 推荐阅读顺序
-
-| 顺序 | 文件 | 读完应理解什么 |
-|------|------|----------------|
-| 1 | [architecture.md](./architecture.md) | 总架构、两张活动表、服务路由、完整接入流程 |
-| 2 | [plan-object.md](./plan-object.md) | `meta.activity_log` 的项目 item 接入细节 |
-| 3 | [plan-global.md](./plan-global.md) | `global.activity_log` 的 global item 接入细节，含组织/项目/账号级 item |
-| 4 | [plan-account.md](./plan-account.md) | 账号最近登录 / 登出 / 活跃字段方案 |
-| 5 | [spec.md](./spec.md) | 需求边界、验收标准、详细用户场景 |
-| 6 | [discussion.md](./discussion.md) | 当前唯一未锁定的 TEXT codec 问题 |
-| 7 | [decisions.md](./decisions.md) | 历史决策和被覆盖的旧方案 |
-
-研究资料在 [_research/](./_research/) 中，评审主线不需要先读。
-
-## 总体边界
+### 总体边界
 
 | 域 | 存储 | 典型 item | 查询主视角 |
 |----|------|-----------|------------|
 | Project item activity | `meta.activity_log` | Chart / Dashboard / Cohort / AB / Metric / Pipeline / Event / Property | `item_type + item_id` |
-| Global item activity | `global.activity_log` | Organization / Project / Org Member / Project Member / Account API Token，后续可扩展 integration、billing config 等 | `org_id` / `project_id` / `account_id` + `item_type` |
-| OP operation log | `global.op_operation_log` | OP 人员配置客户、配额、模板 | 维持现状 |
+| Global item activity | `global.activity_log` | Organization / Project / Org Member / Project Member / Account API Token | `org_id / project_id / account_id` + `item_type` |
+| OP operation log | `global.op_operation_log`（维持现状） | OP 人员配置客户、配额、模板 | 维持现状 |
 | Account activity fields | `global.account` | last_login_at / last_logout_at / last_active_at | account 主表字段 |
 
-`global.activity_log` 不是 org 专用表。它是 web global schema 内的 item activity 表，org/project/member/account token 都只是 global schema item 的不同 scope。账号 API Token 这类对象没有天然 `org_id`，因此 global activity 的 scope 字段必须支持 `org_id`、`project_id`、`account_id` 按场景为空或填写，不能把 `org_id` 设计成所有记录的必填字段。
+---
 
-## 闭环流程
+## 阅读指南
 
-一次新活动接入必须按这个流程走，避免各业务模块临时拼 JSON：
+| 角色 | 先看 | 再看 |
+|------|------|------|
+| **评审者**：检查方案完整性 | [spec.md](spec.md) — 需求、验收标准 | [plan.md](plan.md) — 能否满足需求 |
+| **实现者**：开始编码 | [plan.md](plan.md) §2.3 — 端到端流程闭环 | [plan.md](plan.md) §12 接入 SOP |
+| **新成员**：快速了解完整方案 | [plan.md](plan.md) §1-3 范围、流程与数据模型 | [plan.md](plan.md) §5 写入模型 |
+| **决策者**：了解关键选择和理由 | [decisions.md](decisions.md) | [discussion.md](discussion.md) |
 
-```text
-1. 定义对象
-   -> 注册 ItemType
-   -> 确定 storage scope: project 或 global
-   -> 明确 item_id / item_name 规则
+---
 
-2. 定义动作
-   -> 优先使用 create / update / delete / copy
-   -> 如确实需要扩展 action_type，先走注册评审
+## 关键决策速览
 
-3. 定义接入场景
-   -> 注册 PolicyKey
-   -> 配置 required_full / required_core / best_effort
-   -> 不允许调用方运行时自由传策略
+| 决策 | 结论 | 详见 |
+|------|------|------|
+| 副本集字段 | `action_name` 不新增，领域语义通过 `item_type + action_type + detail` 表达 | [decisions.md](decisions.md) #枚举与数据模型 |
+| 扩展 action_type | 必须注册评审，未注册字符串在入口拒绝 | [plan.md](plan.md) §3.3 |
+| 关联标识 | 用 `correlation_id`（基础设施生成），不用业务维护的 `operation_group_id` | [plan.md](plan.md) §5.1 |
+| detail_version | 不引入，serializer/parser 兼容由 activity 模块统一维护 | [plan.md](plan.md) §3.4 |
+| 存储类型 | `detail_payload` 使用 TEXT，不使用 PG JSONB；V1 默认 readable JSON，压缩仅讨论 | [plan.md](plan.md) §15 |
+| 失败策略 | `PolicyKey` 只是稳定场景名到返回行为的轻量映射，不做策略平台 | [plan.md](plan.md) §5.3 |
+| Detail 构造 | 写入契约只接收标准 `Detail`；helper 可选，不强制通用 diff 框架 | [plan.md](plan.md) §6 |
+| 查询 | 保留 `total`，V1 不引入 cursor-only | [plan.md](plan.md) §7 |
+| `last_active_at` 降级 | Redis 故障时跳过 DB 刷新，不倒灌 | [plan.md](plan.md) §10 |
 
-4. 定义 detail 生成规则
-   -> 注册 projection allowlist
-   -> 注册 exclude / mask / drop / transform
-   -> 活动模块统一 diff、redaction、截断、序列化
+---
 
-5. 接入业务事务
-   -> create 使用创建后的 ID 和展示名
-   -> update/delete 在修改前读取旧快照
-   -> 批量操作使用 BatchWrite*，共享 correlation_id
+## 文档列表
 
-6. 写入与降级
-   -> ActivityService 校验注册项
-   -> 按 PolicyKey 决定失败行为
-   -> DAO 写 meta.activity_log 或 global.activity_log
-
-7. 查询与验证
-   -> 查询接口返回 page/page_size/total/items
-   -> detail 统一反序列化后返回
-   -> 单测 / 集成测试覆盖成功、无变更、失败策略、权限
-```
-
-## 核心 API 形态
-
-项目 item：
-
-```go
-activity.WriteProjectItemLog(ctx, activity.ProjectItemWriteInput{
-    ItemType:   activity.ItemTypeChart,
-    ItemID:     chart.ID,
-    ItemName:   chart.Name,
-    ActionType: activity.ActionTypeUpdate,
-    PolicyKey:  activity.PolicyChartUpdate,
-    Source:     activity.SourceWeb,
-    OldValue:   oldChart,
-    NewValue:   chart,
-})
-```
-
-global item：
-
-```go
-activity.WriteGlobalItemLog(ctx, activity.GlobalItemWriteInput{
-    OrgID:      orgID,
-    ProjectID:  projectID,
-    ItemType:   activity.ItemTypeProjectMember,
-    ItemID:     accountID,
-    ItemName:   member.DisplayName,
-    ActionType: activity.ActionTypeCreate,
-    PolicyKey:  activity.PolicyGlobalProjectMemberCreate,
-    Source:     activity.SourceWeb,
-    Extra:      map[string]any{"roles": roleIDs},
-})
-```
-
-account-scoped global item：
-
-```go
-activity.WriteGlobalItemLog(ctx, activity.GlobalItemWriteInput{
-    AccountID:  accountID,
-    ItemType:   activity.ItemTypeAccountAPIToken,
-    ItemID:     token.ID,
-    ItemName:   token.Label,
-    ActionType: activity.ActionTypeUpdate,
-    PolicyKey:  activity.PolicyAccountAPITokenUpdate,
-    Source:     activity.SourceWeb,
-    OldValue:   oldToken,
-    NewValue:   token,
-})
-```
-
-## 已锁定决策
-
-- 不新增 `action_name`；领域语义通过 `item_type + action_type + detail` 表达。
-- 基础 `action_type` 为 `create / update / delete / copy`；扩展 action_type 必须注册评审。
-- 不引入业务维护的 `operation_group_id`；批量/跨对象串联用基础设施生成或继承的 `correlation_id`。
-- `detail_version` 不下放给业务方；serializer/parser 兼容由 activity 模块统一维护。
-- `detail_payload` 列类型为 `TEXT`，不使用 PG `JSONB`。
-- `global.activity_log` 是 web global schema item activity 表，不是 org 专用表；scope 使用 `org_id` / `project_id` / `account_id` 表达，不强制所有记录都有 `org_id`。
-- diff/redaction 由 activity 模块统一处理；调用方提供业务快照或必要 extra，不手写敏感字段 diff。
-- 查询接口保留 `total`，因为 V1 主场景是 OP / 内部排障。
-- `last_active_at` Redis 故障时跳过本次 DB 写入，不降级为每个请求写 DB。
-
-## 尚未锁定
-
-`detail_payload` 的 TEXT 内部 codec 尚未锁定：
-
-- `TEXT + readable JSON`
-- `TEXT + compressed payload`
-
-最终用真实样本测算 P50/P95/P99 payload 大小、压缩率、写入量、保留周期和排障体验后再定。详见 [discussion.md](./discussion.md)。
-
-## Wave 代码对齐
-
-Wave 项目代码路径：`/Users/wenshiqin/wave-worktrees/add_audit_record`
-
-当前接入点主要位于：
-
-- Project item：`apps/web/service/chart`、`apps/web/service/dashboard`、`apps/web/service/cohort`、`apps/web/service/ab`、`apps/web/service/metadata`、`apps/web/service/pipeline`
-- Global item：`apps/web/service/organization`、`apps/web/service/project`、`apps/web/service/account/apitoken`
-- DAO 风格参考：`apps/web/ma/dao/operation_log.go`、`apps/web/dao/global/*`、`pkg/dal/pgsqlx/metadb`、`pkg/dal/pgsqlx/globaldb`
-
-因此方案采用显式 service 接入，而不是 CDC / trigger / AssetOperator 自动覆盖。
+| 文件 | 内容 | 大小 |
+|------|------|------|
+| [spec.md](spec.md) | 需求规格：用户故事、验收场景、功能/非功能需求 | 精简后 |
+| [plan.md](plan.md) | 技术方案：架构、数据模型、写入/查询契约、场景目录、接入指南 | 合并后（原 architecture + 三个 plan） |
+| [decisions.md](decisions.md) | 决策记录：只保留最终确认的关键决策 | 精炼后 |
+| [discussion.md](discussion.md) | 待讨论：TEXT codec 是否压缩、global 聚合查询是否引入 target 投影 | 持续更新 |
+| [_research/](./_research/) | 研究资料：PostHog 调研等 | 未变 |
