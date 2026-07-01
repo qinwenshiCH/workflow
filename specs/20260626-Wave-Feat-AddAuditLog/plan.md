@@ -15,9 +15,7 @@
 | **Global item 活动** | `global.activity_log` | 组织/项目生命周期、成员管理、Account API Token |
 | **账号活跃字段** | `global.account` 表 3 列 | last_login_at / last_logout_at / last_active_at |
 
-**OP 操作记录**（`global.op_operation_log`）维持现状不变，OP 人员配置操作继续走既有链路。
-
-分界原则：OP 人员在 OP 后台的操作走 `op_operation_log`；客户（含组织管理员）在业务系统中的操作走 `global.activity_log`。
+**OP 操作记录**（`global.op_operation_log`）维持现状不变，OP 需要保持独立，OP 人员配置操作继续走既有链路。
 
 ### 1.1 首批对象范围
 
@@ -63,6 +61,9 @@
 ActivityService 内部（业务不感知）：校验 → `ChangesBetween(oldProj, newProj)` → 按声明对敏感字段 ApplyMaskRules → 补齐 operator/source → 敏感字段兜底拦截 → Delete 时自动捕获 snapshot = oldProj→ 组装 Detail → 序列化 → INSERT。
 
 > **关于脱敏**：脱敏在 ChangesBetween **之后**做。原因是：投影时脱敏会丢失敏感字段的变更事件（old/new 都被抹成 `"***"`，ChangesBetween 认为没变）。先投影原始值 → 检测到变更 → 再抹值，才能同时保留"敏感字段被改了"的事实和防止敏感值泄露。详见 §5.7。
+
+<details>
+<summary>完整示例（3 个场景，点击展开）</summary>
 
 以下三个示例展示完整的数据流：从业务投影 → WriteInput → ActivityService 构造 → 序列化落盘。
 
@@ -282,6 +283,8 @@ svc.BatchWriteLog(ctx, []activity.WriteInput{
 **Step ④: 处理结果**
 
 PolicyKey `chart.delete` → WritePolicy `required_full` → 任一失败则整体返回 error，业务事务回滚。
+
+</details>
 
 ### 2.3 设计原则
 
