@@ -15,7 +15,7 @@
 - Cohort 定时重算执行（RunCohortJob cron 回调）不进入活动表（系统运维操作）
 - Dashboard 的 Chart 关联/移除记在 Dashboard 的活动记录中（`changes[]` 体现 `chart_ids` diff）
 - Pipeline CRUD 接入项目对象活动；内部 Process / callback 不进入活动表
-- MA Campaign CRUD 接入项目对象活动；状态流转（Launch/Pause/Resume/Finish）通过 `update` + `extra.transition` 表达，现有 `ma_operation_log` 历史迁移到新活动表
+- MA Campaign CRUD 接入项目对象活动；状态流转（Launch/Pause/Resume/Finish）通过独立 action_type 表达，现有 `ma_operation_log` 历史不迁移
 - AB target pipeline 状态同步 V1 不做活动
 - PROJECT_MEMBER 确认纳入 V1，与 org member 独立（独立的权限授予操作）
 - 邀请流程：邀请建在自有表上，接受邀请后触发活动记录；邀请本身不落活动
@@ -36,8 +36,8 @@
 
 - `ItemType` 使用全小写字符串（不沿用 `def.AssetType`）
 - `action_type` 使用全小写字符串，统一定义在 `activity/types.go`（守口到活动模块）
-- 基础动作集锁定为 `create / update / delete / copy`；不新增 `action_name` 字段
-- 扩展 action_type 必须注册评审（动作名、理由、detail 最小 schema、迁移映射、测试）
+- 基础动作集锁定为 `create / update / delete / copy`；状态流转类动作（`online / launch / stop` 等）可注册为扩展 action_type，不设 `action_name` 字段
+- 扩展 action_type 必须注册评审（动作名、理由、detail 最小 schema、迁移映射、测试）；基础动作 + extra 不足表达时优先用扩展 action_type
 - source 为4个值：`web / openapi / internal / backfill`
 - 表名定稿为 `meta.activity_log`（在 project schema 内，`project_` 前缀冗余）
 - 枚举与常量统一定义在 `activity/types.go`
@@ -104,7 +104,7 @@
 - `last_active_at` Redis 不可用时跳过 DB 写入并记录 warning，不降级
 - BatchInsert 上限 500 行
 - 未注册 action_type 在写入入口直接拒绝，不能透传调用方拼出来的字符串
-- AB 状态流转（online / release / debug）的语义通过 `detail.changes` + `extra.transition` 表达，不注册额外 action_type
+- AB 状态流转（online / release / debug / offline）注册为扩展 action_type（`online / release / debug / offline`），不通过 extra 表达
 - `extra` key 实行注册制：新增 key 需与 action_type 同等评审（key 名、值类型、变化预期、历史兼容方案），注册于 `activity/extra_keys.go`
 - `extra` 不得承载字段变更信息（不得替代 changes[]），值应为历史稳定的简单类型（string/number/bool），读者对未知 key 或未知值宽容展示
 

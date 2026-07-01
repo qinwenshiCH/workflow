@@ -113,12 +113,11 @@ svc.WriteLog(ctx, activity.WriteInput{
     ItemType:      "experiment",
     ItemID:        15,
     ItemName:      "new_checkout",
-    ActionType:    "update",
+    ActionType:    "release",
     PolicyKey:     "ab.release",
     OldProjection: oldProj,
     NewProjection: newProj,
-    Extra:         map[string]any{"transition": "running_to_released"},
-    // 无敏感字段，MaskRules 为空
+    // 无敏感字段，MaskRules 为空；extra 为空（状态语义已在 action_type 中表达）
 })
 ```
 
@@ -147,7 +146,7 @@ ApplyMaskRules → MaskRules 为空，跳过。组装 Extra。
     {"field": "bucket",       "action": "changed", "before": "slot_7",  "after": ""},
     {"field": "bucket_bits",  "action": "changed", "before": 10,        "after": 0}
   ],
-  "extra": {"transition": "running_to_released"}
+  "extra": {}
 }
 ```
 
@@ -335,11 +334,36 @@ AB、Metric、MA Campaign 三套系统各自维护内部操作记录，下面是
 
 | 系统 | 现存存储 | 现状评估 | 归并策略 | 理由 |
 | ----- | ---------- | --------- | ---------- | ------- |
-| **AB** | `details.operation_records` JSONB 数组，嵌在 `ab_feature_flag` 行内 | **差**——操作记录埋在深层 JSONB 里，无法独立查询和索引 | **新操作走 activity_log，旧历史全量迁移** | 现存存储严重拖累可查性，而 AB 操作是活动日志第一排障需求源；action_type 映射清晰，extra.transition 承载状态流转，conflict resolution 通过 source=internal 表达 |
+| **AB** | `details.operation_records` JSONB 数组，嵌在 `ab_feature_flag` 行内 | **差**——操作记录埋在深层 JSONB 里，无法独立查询和索引 | **新操作走 activity_log，旧历史全量迁移** | 现存存储严重拖累可查性，而 AB 操作是活动日志第一排障需求源；状态流转映射为独立 action_type（online/release/…），conflict resolution 通过 source=internal 表达 |
 | **Metric** | `meta.metric_define_history` 独立表 | **好**——表结构简单，已独立可查，只记录 define 字段变更，目的单一 | **新操作走 activity_log，旧历史不迁移** | 现存表已够用，迁移到 activity_log 反而因投影模型只保留 define 的 changes before/after 而非全文，fidelity 未必更高；迁移收益低，不值得为此承担映射成本 |
-| **MA Campaign** | `ma_operation_log` 独立表 | **中**——结构完整，可独立查询，但 schema 与活动模型不同，无法串查 | **新操作走 activity_log，旧历史不迁移** | 新写入用 extra.transition + action_type=update 能很好表达状态流转（Launch/Pause/Resume/Finish）；旧 `ma_operation_log` 已是独立可查表，迁移收益抵不上映射成本和 fidelity 损失 |
+| **MA Campaign** | `ma_operation_log` 独立表 | **中**——结构完整，可独立查询，但 schema 与活动模型不同，无法串查 | **新操作走 activity_log，旧历史不迁移** | 新写入用独立 action_type（launch/pause/resume/finish）表达状态流转；旧 `ma_operation_log` 已是独立可查表，迁移收益抵不上映射成本和 fidelity 损失 |
 
 **共性前提**：活动日志模型（action_type + changes[] + extra + source）对三者均可行，覆盖所有操作语义。分歧只在"历史数据是否迁移"。
+
+#### 活动日志的定位差异
+
+活动日志与业务自有日志的本质区别在于**完整度**：
+
+| 维度 | 业务自有日志 | 活动日志 |
+|------|------------|---------|
+| 操作覆盖 | 单一场景（Metric 只记 define update，Campaign 只记状态跳转） | **全生命周期**（每个对象的 create/update/delete，面向排障的完整时序） |
+| 字段覆盖 | 只记录业务关心的字段 | **投影声明了什么就记什么**，字段有变更就在 `changes[]` 中体现 |
+| 快照 | 无（删除后查不到对象名等上下文） | `item_name` / `operator_name` 写入时快照，删除后仍可追溯 |
+| 操作人 | 可有可无（类型/可空性不一致） | `operator_id` + `operator_name` 双快照，系统操作兜底填 0 |
+| 关联性 | 孤岛（不能跨对象查"前后发生了什么"） | `correlation_id` 串联跨对象操作（如 CopyDashboard 同时影响 dashboard + charts） |
+
+业务日志不是"活动日志的弱化版"，它们**根本不打算回答"这个对象一生发生了什么"**（Metric 的表名叫 `metric_define_history` 不叫 `metric_activity_log`）。活动日志填补的是**对象全生命周期**这个整个缺失的维度，每个业务系统自己的日志不会也没动力去覆盖它。
+
+#### 活动记录完整，但展示可以窄
+
+活动日志记录完整不等于业务页面必须展示完整。**写端由活动模块控制（完整），读端由业务控制（按需）**：
+
+- **查询条件已可筛选**：`ListByQuery` 支持 `item_type + item_id + action_type` 等条件，业务只查自己需要的部分
+- **业务层做展示过滤**：业务 service 拿到 `ListByQuery` 返回的完整 `detail` 后，只渲染自己关心的字段和场景。例如 AB 历史页只展示该 flag 的操作记录（通过 `item_type + item_id`），不需要过滤其它对象的数据
+- **AB / Metric / Campaign 的既有页面数据源切换到 activity_log 后，展示范围不变**：它们各自通过 `item_type + item_id` 查询，天然隔离，不会看到对方的数据
+- **额外的展示过滤策略**：如果一个业务不想展示所有 action_type（如某些 update 是内部噪音），可以在业务 service 中后过滤，activity 模块不负责展示语义
+
+**结论**：activity 模块提供完整记录 + 基础筛选（item_type/item_id/action_type），不提供字段级预过滤。业务层在查询结果上做展示决策。
 
 ### 3.1 CHART
 
@@ -384,11 +408,13 @@ AB、Metric、MA Campaign 三套系统各自维护内部操作记录，下面是
 |------|------------|---------------------------|--------------|
 | 创建 | `create` | `ffkey`, `name`, `status`, `enabled`, `traffic`, `version` | Experiment 额外 `extra.subject_id`, `extra.layer_id` |
 | 更新配置 | `update` | 变更字段 before/after | 若 `details` 变更则仅投影摘要 |
-| 状态变更：Debug/Online/Offline | `update` | `status`, `enabled` before/after | `extra.transition`；Online 触冲突解决时补 `extra.conflict_resolution` |
-| 状态变更：Delete | `delete` | `status` before/after, 至少 `name` 快照 | `extra.buckets_released`, `extra.references_removed` |
-| Release | `update` | `status`, `release_plan` before/after | `extra.transition = "release"`；`extra.release_scope` |
+| 状态变更：Debug | `debug` | `status`, `enabled` before/after | |
+| 状态变更：Online | `online` | `status`, `enabled` before/after | 触发冲突解决时补 `extra.conflict_resolution` |
+| 状态变更：Offline | `offline` | `status`, `enabled` before/after | |
+| Release | `release` | `status`, `release_plan` before/after | `extra.release_scope` |
+| 删除 | `delete` | `status` before/after, 至少 `name` 快照 | `extra.buckets_released`, `extra.references_removed` |
 | 复制 | `copy` | 可为空 | `extra.source_item_id`, `extra.source_ffkey` |
-| 内部下线（冲突解决） | `update` | `status`, `enabled` before/after | `source=internal`；`extra.transition`, `extra.reason: conflict_resolution`, `extra.conflict_ffkey` |
+| 内部下线（冲突解决） | `offline` | `status`, `enabled` before/after | `source=internal`；`extra.reason: conflict_resolution`, `extra.conflict_ffkey` |
 | 内部删除（冲突解决） | `delete` | `status` before/after, 至少 `name` 快照 | `source=internal`；同上 |
 
 FEATURE_CONFIG 额外：
@@ -419,7 +445,7 @@ FEATURE_CONFIG 额外：
 | 创建 | `create` | `name`, `type`, `pipeline_type`, `data_type` | `extra.work`, `extra.data_source_id` |
 | 更新 | `update` | 变更字段 before/after | |
 | 删除 | `delete` | 至少 `name` 快照 | `snapshot.pipeline_type`, `snapshot.work`；软删除 |
-| 停止 | `update` | `exec_status` before/after | `extra.change_kind = "stop"`；`extra.stop_reason` |
+| 停止 | `stop` | `exec_status` before/after | `extra.stop_reason` |
 
 **不进入 `activity_log`**：
 - Pipeline Process（系统级执行，已有 `exec_info` / `batch_export_run` 跟踪）
@@ -433,10 +459,10 @@ Campaign 现有 `ma_operation_log` 记录状态变更。纳入统一活动模型
 |------|------------|---------------------------|--------------|
 | 创建 | `create` | `name`, `channel`, `trigger_type`, `status` | `extra.audience_type`, `extra.goal_type` |
 | 更新配置 | `update` | 变更字段 before/after | |
-| 状态变更：Launch | `update` | `status` before/after | `extra.transition = "launch"` |
-| 状态变更：Pause | `update` | `status` before/after | `extra.transition = "pause"` |
-| 状态变更：Resume | `update` | `status` before/after | `extra.transition = "resume"` |
-| 状态变更：Finish | `update` | `status` before/after | `extra.transition = "finish"` |
+| 状态变更：Launch | `launch` | `status` before/after | |
+| 状态变更：Pause | `pause` | `status` before/after | |
+| 状态变更：Resume | `resume` | `status` before/after | |
+| 状态变更：Finish | `finish` | `status` before/after | |
 | 删除 | `delete` | 至少 `name` 快照 | `snapshot` 记录触发类型、渠道等关键配置 |
 
 **不进入 `activity_log`**：
@@ -445,7 +471,7 @@ Campaign 现有 `ma_operation_log` 记录状态变更。纳入统一活动模型
 
 **历史迁移**：
 - 源：`ma_operation_log`（campaign 状态变更历史）
-- 映射：`create` → `create`，`update` → `update`，`launch/pause/resume/finish` → `update`（`extra.transition` 承载语义）
+- 映射：`create` → `create`，`update` → `update`，`launch/pause/resume/finish` → 对应同名 action_type
 - 幂等去重键：`ma_operation_log` + `campaign_id` + `operation_type` + `operated_at`
 
 ### 3.9 明确不记录的操作
@@ -676,9 +702,8 @@ item_type = `"account_api_token"`，item_id = token id。
 |-------------------|------|
 | `item_type` | `"campaign"`（常量） |
 | `item_id` | `campaign_id` |
-| `action_type` | `operation_type` → `"update"`（Launch/Pause/Resume/auto_finish 均为 update） |
+| `action_type` | `operation_type` 直接映射（create/update/launch/pause/resume/finish 均与 action_type 同名；auto_finish 映射为 finish） |
 | `operator_id` | `operated_by`（空值填 0） |
-| `extra.transition` | `operation_type`（Launch/Pause/Resume/auto_finish） |
 | `source` | `backfill` |
 | `occurred_at` | `operated_at` |
 
@@ -686,7 +711,7 @@ item_type = `"account_api_token"`，item_id = token id。
 
 **不迁移的理由：**
 - 现存表已经是独立完整的状态变更日志
-- 状态流转语义（Launch/Pause/Resume/Finish）映射到 extra.transition 虽然可行，但旧历史在原表查询效率不亚于在新活动表查询
+- 旧历史在原表查询效率不亚于在新活动表查询
 - 与其他对象的关联查询（"在 campaign launch 前后实验是否有变更"）可以通过 correlation_id 实现，但旧历史不存在 correlation_id，迁移也无法补齐
 
 ---
@@ -715,7 +740,11 @@ item_type = `"account_api_token"`，item_id = token id。
 | 源操作 | → action_type |
 |--------|-------------|
 | AB `CREATE` | `create` |
-| AB `UPDATE` / `DEBUG` / `ONLINE` / `OFFLINE` / `RELEASE` / `VARIANT_CHANGE` | `update` |
+| AB `UPDATE`, `VARIANT_CHANGE` | `update`（配置变更） |
+| AB `DEBUG` | `debug` |
+| AB `ONLINE` | `online` |
+| AB `OFFLINE` | `offline` |
+| AB `RELEASE` | `release` |
 | AB `COPY` | `copy` |
 | AB `DELETE` | `delete` |
 
@@ -825,8 +854,11 @@ func mapABRecordToActivity(flagID int64, flagName, flagType string, rec ABOperat
 func mapABAction(action string) string {
     switch action {
     case "CREATE":         return "create"
-    case "UPDATE", "DEBUG", "ONLINE", "OFFLINE",
-         "RELEASE", "VARIANT_CHANGE": return "update"
+    case "UPDATE", "VARIANT_CHANGE": return "update"
+    case "DEBUG":          return "debug"
+    case "ONLINE":         return "online"
+    case "OFFLINE":        return "offline"
+    case "RELEASE":        return "release"
     case "COPY":           return "copy"
     case "DELETE":         return "delete"
     default:               return "update" // fallback

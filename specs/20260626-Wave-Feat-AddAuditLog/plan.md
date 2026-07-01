@@ -183,13 +183,25 @@ ItemTypeAccountAPIToken = "account_api_token"
 **ActionType** — 全小写描述性字符串：
 
 ```go
+// 基础动作
 ActionTypeCreate = "create"
 ActionTypeUpdate = "update"
 ActionTypeDelete = "delete"
 ActionTypeCopy   = "copy"
+
+// 扩展动作——状态流转（通过扩展注册评审）
+ActionTypeOnline   = "online"     // AB 发布上线
+ActionTypeOffline  = "offline"    // AB 下线
+ActionTypeDebug    = "debug"      // AB 调试模式
+ActionTypeRelease  = "release"    // AB 发布完成
+ActionTypeLaunch   = "launch"     // Campaign 启动
+ActionTypePause    = "pause"      // Campaign 暂停
+ActionTypeResume   = "resume"     // Campaign 恢复
+ActionTypeFinish   = "finish"     // Campaign 完成
+ActionTypeStop     = "stop"       // Pipeline 停止
 ```
 
-扩展原则：只有当 `item_type + detail` 不足表达语义时，才允许统一注册扩展 action_type。未注册字符串在 `WriteLog` / `BatchWriteLog` 入口直接拒绝。
+扩展原则：基础动作（create/update/delete/copy）覆盖对象的 CRUD 语义；状态流转类动作（如 online / launch / stop）在有明确状态迁移语义时注册为扩展 action_type，不通过 extra 表达。未注册字符串在 `WriteLog` / `BatchWriteLog` 入口直接拒绝。
 
 注册流程：
 1. 业务 owner 提交注册说明（动作名、适用 ItemType、无法用基础动作 + detail 表达的理由）
@@ -282,10 +294,11 @@ type WriteInput struct {
 // 与 WriteLog 一样，ItemType 在 registry 中已声明所属 schema（meta/global），
 // ListByQuery 内部通过 ItemType 查 registry 推导目标表，调用方不需要指定。
 type Query struct {
-    ItemType string `json:"item_type"`
-    ItemID   int64  `json:"item_id"`
-    Page     int    `json:"page"`
-    PageSize int    `json:"page_size"`
+    ItemType   string   `json:"item_type"`
+    ItemID     int64    `json:"item_id"`
+    ActionType []string `json:"action_type,omitempty"` // 空 = 不过滤
+    Page       int      `json:"page"`
+    PageSize   int      `json:"page_size"`
 }
 
 type Item struct {
@@ -333,7 +346,7 @@ input := activity.WriteInput{
         "token_hash": func(v any) any { return "***" },
         "email":      activity.MaskEmail,
     },
-    Extra: map[string]any{"ab_action": "RELEASE"},
+    Extra: map[string]any{"trigger": "schedule"},
 }
 ```
 
@@ -527,10 +540,9 @@ func (s *MetricService) PauseSchedule(ctx, id uint64) error {
 ### 5.1 Envelope 结构
 
 ```json
-// Update 场景：changes + extra
+// Update 场景：changes（extra 可选，仅当有非字段变更上下文时使用）
 {
-  "changes": [{"field": "name", "action": "changed", "before": "旧名称", "after": "新名称"}],
-  "extra": {"transition": "online"}
+  "changes": [{"field": "name", "action": "changed", "before": "旧名称", "after": "新名称"}]
 }
 
 // Create 场景：changes（初始字段清单）
@@ -551,7 +563,7 @@ func (s *MetricService) PauseSchedule(ctx, id uint64) error {
 
 - `changes` — 字段级 before/after diff，Update 的主路径，Create 的初始字段清单
 - `snapshot` — 投影全量，Delete 场景自动捕获 oldProj，事后追溯"删了什么"
-- `extra` — 业务语义标记（如 `transition:"online"`），非字段变更
+- `extra` — 非字段变更的业务上下文（如 `batch_id`, `source_item_id`），不得替代 action_type 或 changes
 
 **Change 结构**：
 
@@ -725,7 +737,7 @@ var sensitiveFieldNames = map[string]bool{
 | --- | --- | --- | --- | --- |
 | `changes[]` | **字段级 before/after diff** | `ChangesBetween` 自动生成 | Create/Update 场景 | keys = 投影字段名（稳定）；before/after = 当时值（自包含，不依赖未来 schema） |
 | `snapshot` | **投影全量** | ActivityService 按 ActionType 自动捕获：仅 Delete 产生（oldProj），Create/Update 不产生 | 需要了解被删除对象删除前的最后状态时 | keys = 投影字段名（稳定） |
-| `extra` | **轻量业务语义标记** | 业务方手写 | 标记操作类型（如 `ab_action:"RELEASE"`）、触发条件（如 `trigger:"schedule"`）、关联信息 | 仅用于标记"不属于 DAO 投影的操作上下文"；值应为历史稳定的简单类型（string/number/bool）；key 必须在活动模块注册 |
+| `extra` | **轻量业务语义标记** | 业务方手写 | 标记触发条件（如 `trigger:"schedule"`）、关联信息（如 `batch_id:"b-123"`） | 仅用于标记"不属于 DAO 投影的操作上下文"；值应为历史稳定的简单类型（string/number/bool）；key 必须在活动模块注册 |
 
 **核心规则：**
 
@@ -777,10 +789,11 @@ var sensitiveFieldNames = map[string]bool{
 **Request**：
 ```json
 {
-  "item_type": "chart",
-  "item_id": 123,
-  "page": 1,
-  "page_size": 20
+  "item_type":   "chart",
+  "item_id":     123,
+  "action_type": ["update"],      // 可选，筛选 action_type
+  "page":        1,
+  "page_size":   20
 }
 ```
 
@@ -937,7 +950,11 @@ flowchart LR
 | 源操作 | → action_type |
 |--------|-------------|
 | AB `CREATE` | `create` |
-| AB `UPDATE` / `DEBUG` / `ONLINE` / `OFFLINE` / `RELEASE` / `VARIANT_CHANGE` | `update` |
+| AB `UPDATE`, `VARIANT_CHANGE` | `update`（配置变更） |
+| AB `DEBUG` | `debug` |
+| AB `ONLINE` | `online` |
+| AB `OFFLINE` | `offline` |
+| AB `RELEASE` | `release` |
 | AB `COPY` | `copy` |
 | AB `DELETE` | `delete` |
 
@@ -1047,8 +1064,11 @@ func mapABRecordToActivity(flagID int64, flagName, flagType string, rec ABOperat
 func mapABAction(action string) string {
     switch action {
     case "CREATE":         return "create"
-    case "UPDATE", "DEBUG", "ONLINE", "OFFLINE",
-         "RELEASE", "VARIANT_CHANGE": return "update"
+    case "UPDATE", "VARIANT_CHANGE": return "update"  // 配置变更
+    case "DEBUG":          return "debug"             // 状态流转→独立 action_type
+    case "ONLINE":         return "online"
+    case "OFFLINE":        return "offline"
+    case "RELEASE":        return "release"
     case "COPY":           return "copy"
     case "DELETE":         return "delete"
     default:               return "update" // fallback
