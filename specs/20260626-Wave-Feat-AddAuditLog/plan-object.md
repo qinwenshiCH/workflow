@@ -2,7 +2,7 @@
 
 # 技术方案：项目对象活动（meta.activity_log）
 
-> 本方案聚焦项目内对象活动。组织/项目管理活动见 [plan-org.md](./plan-org.md)，账号活跃字段见 [plan-account.md](./plan-account.md)。
+> 本方案聚焦项目内对象活动。global schema 下的 item 活动见 [plan-global.md](./plan-global.md)，账号活跃字段见 [plan-account.md](./plan-account.md)。
 
 ## 1. 目标
 
@@ -12,7 +12,7 @@
 
 - V1 优先服务**内部排障**，查询主视角是 `item_type + item_id`，不是按人或按组织做分析型报表。
 - detail 采用**结构化 diff 优先**的稳定 envelope，必要时允许 `extra` / `snapshot` 补充；top-level envelope 由活动模块统一拥有。
-- detail **不直接持久化当前业务结构体**；V1 先以可读 JSON envelope 落盘，不默认引入应用层压缩。
+- detail **不直接持久化当前业务结构体**；`detail_payload` 列类型固定为 `TEXT`，是否启用应用层压缩仍未锁定。
 - 升级后**新操作只写新活动记录**，旧 AB / Metric / Wave 历史记录做一次性复制，旧字段或旧表保留不删。
 - V1 **不新增官方产品通用活动页面**；除 AB / Metric 既有查看能力外，其余查看能力优先通过 OP / 内部接口承接。
 
@@ -42,7 +42,7 @@
 | 模块 | 职责 | 建议落点 | 参考现状 |
 |---|---|---|---|
 | 活动域类型 | `ItemType`、`ActionType`、`ActivityDetail`、`Change`、query DTO | `apps/web/service/activity/types.go` | `spec.md` 的 `activity_log` / detail 约定 |
-| 公共服务 | `Log` / `BatchLog` / `ListByQuery` | `apps/web/service/activity/activity.go` | OP 审计的 `apps/web/op/service/audit.go` |
+| 公共服务 | `WriteProjectItemLog` / `BatchWriteProjectItemLog` / `ListByQuery` | `apps/web/service/activity/activity.go` | OP 审计的 `apps/web/op/service/audit.go` |
 | diff 引擎 | 结构化变更生成、排除字段、敏感字段掩盖 | `apps/web/service/activity/diff.go` | `research.md` 对 PostHog 结构化 diff 的总结 |
 | 对象注册表 | 各对象的字段投影、排除规则、mask 规则、对象名提取 | `apps/web/service/activity/registry.go` | 现有 `AssetOperator` 只覆盖 Chart / Dashboard，不能作为完整真相 |
 | 持久化 DAO | `activity_log` 表 CRUD + 批量插入 + 分页查询 | `apps/web/dao/activity/object.go` | `meta.metric_define_history` / `op_operation_log` DAO 风格 |
@@ -59,7 +59,7 @@
 - 动作信息：基础 `action_type`
 - 归因信息：`operator_id`、`operator_name`、`source`、`correlation_id`、`occurred_at`，其中 `operator_name` 是展示快照，`occurred_at` 明确定义为操作时间 / 活动事件时间
 - 表在 project schema（meta）内，`project_id` 字段冗余，不设此列
-- 详情：`detail_payload` 使用 `TEXT` 存稳定 JSON envelope；查询接口统一返回解析后的 `detail`；V1 不引入 `detail_version`
+- 详情：`detail_payload` 使用 `TEXT` 存稳定 envelope payload，不使用 PG JSONB；查询接口统一返回解析后的 `detail`；V1 不引入 `detail_version`
 
 #### 4.2.1 枚举规范
 
@@ -108,6 +108,15 @@ ActionTypeCopy   = "copy"
 - **领域语义不额外落字段**：如 `online`、`release`、`relate`、`stop` 等语义，通过 `item_type` 和 `detail.changes/extra` 表达，不新增 `action_name`
 - 内部操作（冲突解决）复用相同 `action_type`，再用 `source="internal"` 区分
 
+扩展 `action_type` 的注册流程：
+
+1. 业务 owner 提交注册说明：动作名、适用 `item_type`、为什么不能用基础动作 + `detail` 表达、查询/告警/权限是否需要按该动作直接过滤。
+2. 活动模块 owner 审核命名，避免 `publish` / `release` / `online` 这类近义词分裂；通过后只在 `activity/types.go` 增加常量。
+3. 同一 PR 必须补齐 policy registry、detail 最小 schema、迁移映射、单测和接入示例。
+4. 未注册的 action_type 在 `WriteProjectItemLog` / `WriteGlobalItemLog` 入口直接拒绝，不能透传调用方拼出来的字符串。
+
+AB 状态流转在 V1 **不注册** `online` / `offline` / `release` / `debug` 等 action_type；统一使用 `action_type=update`，在 `changes[]` 记录 `status/enabled/traffic/release_plan` 的 before/after，并在 `extra.transition` 写状态语义。只有当未来出现“不读取 detail 也必须按状态动作做权限、告警或列表过滤”的明确产品需求时，才重新走上面的注册流程。
+
 **source** — 操作来源，全小写：
 
 ```go
@@ -121,43 +130,47 @@ const (
 
 `web` 和 `openapi` 都代表用户主动操作。`internal` 代表系统行为，但如由用户触发，仍应尽量继承原始用户。`backfill` 用于历史数据迁移。
 
-`detail_payload` 在 V1 使用 **TEXT + 可读 JSON envelope**：
+`detail_payload` 的列类型固定为 **TEXT**，但 codec 不在此处提前锁死：
 
 1. SerializeDetail 生成稳定 JSON（如 `{changes, extra, snapshot}`）
 2. 通过字段投影和大小预算控制 payload
 3. 若超限，优先截断明确的大字段，并把 `extra.truncated_fields`、`extra.payload_hash` 写入上下文
 
-V1 不默认启用应用层 LZ4。等真实写入规模证明 `TEXT` 成为瓶颈后，再评估 codec 升级。
+待锁定的是 `TEXT` 内承载方式：纯可读 JSON，或带 codec marker 的压缩文本。无论选哪种，服务层对外都只暴露解析后的 `detail`，业务调用契约不变化。当前不使用 PG `JSONB`，也不把“是否压缩”写成 V1 已定结论。
 
 `detail` 顶层 envelope 由活动模块维护，业务方只负责提供投影后的 `changes` / `extra` / `snapshot`。当前不新增 `detail_version` 字段，避免把版本治理扩散到每个业务接入点。
 
-#### 4.2.2 为什么 V1 不默认压缩
+#### 4.2.2 是否压缩的影响
 
-- **收益**：排障时可直接查库和比对 JSON；迁移、回填、跨语言消费都更简单；不需要额外 codec 兼容治理
-- **成本**：行宽、WAL、复制带宽和冷热数据占用会更高；超大对象 detail 必须靠预算控制
-- **当前取舍**：V1 先用 `TEXT + 投影 + 截断 + payload 监控`。只有在真实规模证明存储和 IO 成本已经成为瓶颈时，再在 `SerializeDetail` / `ParseDetail` 层引入可替换 codec，不改业务调用契约
+| 方案 | 好处 | 代价 | 对 action_type 的影响 |
+|------|------|------|----------------------|
+| `TEXT` 直接存可读 JSON | 查库、迁移、回填、跨语言消费最简单 | 行宽、WAL、备份体积更高 | detail 可直接读，`action_type` 保持粗粒度更可接受 |
+| `TEXT` 存压缩文本 | 存储、WAL、复制带宽更低 | 需要 codec marker、调试工具、兼容测试；直接查库不可读 | detail 不易 SQL/人工查看，不能靠把所有领域语义塞进 action_type 来补偿，只能为真正需要直接过滤的语义注册扩展动作 |
+
+压缩与否不改变字段模型：`detail_payload` 仍是 `TEXT`，`SerializeDetail` / `ParseDetail` 是唯一 codec 边界。V1 上线前需要根据预估写入量、单条 detail P95/P99 大小、保留周期和排障体验做一次最终选择；在选择前，方案文档不得写成“已确定不压缩”。
 
 ### 4.3 写入模型与一致性等级
 
 统一公共契约保持精简：
 
 ```go
-Log(ctx, input) error
-BatchLog(ctx, inputs) error
+WriteProjectItemLog(ctx, input) error
+BatchWriteProjectItemLog(ctx, inputs) error
 ListByQuery(ctx, query) ([]ActivityLogItem, int64, error)
 ```
 
-其中 `Log` / `BatchLog` 只负责：
+其中 `WriteProjectItemLog` / `BatchWriteProjectItemLog` 只负责：
 
 1. 校验公共字段
-2. 填充 item / operator 展示快照
-3. 生成或接收活动事件时间
-4. 序列化 detail
-5. 调 DAO 写入
+2. 解析已注册接入场景对应的写入策略
+3. 填充 item / operator 展示快照
+4. 生成或接收活动事件时间
+5. 序列化 detail
+6. 调 DAO 写入
 
-#### 4.3.1 一致性等级：由活动模块中心化决策
+#### 4.3.1 一致性等级：按接入场景注册
 
-活动写入的一致性不再由调用方自由传参，而是由活动模块内部的 **policy registry** 中心化决策。策略可以按接入点注册，也可以按 `item_type + action_type` 配默认值，但不要求为此新增落库字段。
+活动写入的一致性确实不能只按模块或 `item_type + action_type` 粗暴决定。删除 Chart、AB 上线、普通 Dashboard 改名、历史回填的风险完全不同。标准做法是：**调用方声明已注册的接入场景，活动模块解析策略**。
 
 ```go
 type WritePolicy string
@@ -166,6 +179,15 @@ const (
     WritePolicyRequiredFull WritePolicy = "required_full"
     WritePolicyRequiredCore WritePolicy = "required_core"
     WritePolicyBestEffort   WritePolicy = "best_effort"
+)
+
+type ActivityPolicyKey string
+
+const (
+    PolicyChartDelete      ActivityPolicyKey = "chart.delete"
+    PolicyDashboardUpdate  ActivityPolicyKey = "dashboard.update"
+    PolicyABStatusOnline   ActivityPolicyKey = "ab.status_online"
+    PolicyBackfillActivity ActivityPolicyKey = "activity.backfill"
 )
 ```
 
@@ -179,24 +201,33 @@ const (
 
 核心字段定义为：`item_type`, `item_id`, `action_type`, `operator_id`, `source`, `occurred_at`（表在 project schema 内，无 `project_id` 列）。
 
-推荐策略由活动模块维护，而不是由业务调用方自行拍板：
+维护方式：
 
-| 写入策略 | 推荐对象/场景 |
-|---------|-------------|
-| `required_full` | AB 发布/上线、Dashboard/Cohort/Chart 删除 |
-| `required_core` | 常规对象 create/update/copy、Metadata CRUD |
-| `best_effort` | 历史回填、明确非关键的内部附属操作 |
+- 每个接入点使用一个稳定 `ActivityPolicyKey`，该 key 不落库，只用于服务层解析策略。
+- policy registry 由活动模块集中维护，但 key 的语义、默认策略由对应业务 owner 和活动模块 owner 一起评审。
+- 未注册 key 在测试和 strict 模式下直接失败；线上可先按 feature flag 控制是否降级为 warning。
+- `item_type + action_type` 只作为兜底默认，不作为高风险场景的唯一判断依据。
+- 策略变更走代码评审，因为它会改变业务事务语义，不允许调用方运行时随意传 `required_full` / `best_effort`。
 
-#### 4.3.2 BatchLog 原子性
+推荐初始矩阵：
+
+| PolicyKey 示例 | 写入策略 | 原因 |
+|----------------|---------|------|
+| `ab.status_online` / `ab.release` | `required_full` | 状态发布类操作风险高，缺活动会直接影响排障与责任链 |
+| `chart.delete` / `dashboard.delete` / `cohort.delete` | `required_core` 或 `required_full` | 删除后对象快照很关键，具体按业务能否接受失败回滚评审 |
+| `dashboard.update` / `metric.update` / metadata CRUD | `required_core` | 主活动行必须有，detail 可按大小或序列化失败降级 |
+| `activity.backfill` / 低价值内部附属操作 | `best_effort` | 不应因历史回填或低价值附属记录阻断主流程 |
+
+#### 4.3.2 批量写入原子性
 
 当单次业务操作涉及多个对象时（如 `CopyDashboard` 同时创建新 dashboard 和多个 chart），需要产生多条活动记录。
 
-`BatchLog` 的原子性约定：
-- 同一业务事务内的多条活动记录，通过 `BatchLog` 一次性写入
-- `BatchLog` 在 `required_full` / `required_core` 策略下：任一记录的核心字段写入失败 → 整体失败 → 业务事务回滚
-- `BatchLog` 在 `best_effort` 策略下：失败折入 warning，不影响业务事务
+`BatchWriteProjectItemLog` 的原子性约定：
+- 同一业务事务内的多条活动记录，通过 `BatchWriteProjectItemLog` 一次性写入
+- `BatchWriteProjectItemLog` 在 `required_full` / `required_core` 策略下：任一记录的核心字段写入失败 → 整体失败 → 业务事务回滚
+- `BatchWriteProjectItemLog` 在 `best_effort` 策略下：失败折入 warning，不影响业务事务
 - 不允许”dashboard 的 copy 记录成功但 chart 的 copy 记录缺失”
-- `BatchLog` 自动为同批记录补同一个 `correlation_id`，用于后续排障串联；不要求业务侧维护 `operation_group_id`
+- `BatchWriteProjectItemLog` 自动为同批记录补同一个 `correlation_id`，用于后续排障串联；不要求业务侧维护 `operation_group_id`
 
 #### 4.3.3 活动日志保留策略
 
@@ -207,7 +238,18 @@ V1 不实现自动清理，但预留扩展位：
 - 未来需要 TTL 清理时，按 `occurred_at` 月份分区，直接 drop 旧分区即可
 - V1 上线后根据实际写入速率评估是否需要分区，不在首批实现
 
-global 管理活动也复用相同的基础事件模型，但可配置不同的默认策略。详见 [plan-org.md](./plan-org.md)。
+#### 4.3.4 为什么不采用 CDC / Outbox / Trigger
+
+| 方案 | 排除理由 |
+|------|----------|
+| DB Trigger | 看不到业务语义、操作人、source、状态机意图；很容易退化成“字段变了”而不是“谁做了什么操作” |
+| CDC / WAL 订阅 | 适合数据同步，不适合生成审计语义；难以拿到请求上下文和稳定 detail 投影 |
+| Outbox | 可降低事务耦合，但 V1 主诉求是对象历史立即可排障；引入 outbox 会增加投递、重试、幂等和延迟治理 |
+| 显式 `WriteProjectItemLog` / `BatchWriteProjectItemLog` | 虽然要求接入方改代码，但语义最清楚，可以携带 operator、source、policy key、detail 投影和 correlation_id |
+
+因此 V1 采用显式写入。后续如果高频写入造成明显事务压力，可在 `ActivityService` 内部把低风险 policy key 切到 outbox，但不改变调用方契约。
+
+global item 活动也复用相同的基础事件模型，但可配置不同的默认策略。详见 [plan-global.md](./plan-global.md)。
 
 ### 4.4 diff 引擎
 
@@ -224,13 +266,39 @@ ChangesBetween(oldValue, newValue, itemType) []Change
 3. **默认掩盖敏感字段**：各类 integration/config 中的敏感配置、用户邮箱、密码、token、密钥类字段，统一替换为 `"masked"`
 4. **只保留稳定字段名**，避免未来业务结构调整把历史读挂
 
-推荐每个对象类型都注册一个 `ActivityProjectionBuilder`，输出稳定 map；敏感字段规则由 registry 声明，再由 redaction 引擎统一应用：
+diff 流水线必须固定为：
+
+1. 调用方在业务事务中读取 old/new 快照，或提供 create/delete 场景的单侧快照；调用方不直接构造 `changes[]` 中的敏感值。
+2. `ActivityProjectionBuilder` 根据 allowlist 把业务对象投影成稳定 map，key 是活动域字段名，不是 GORM 字段名。
+3. registry 对每个字段声明 `include/exclude/mask/transform/max_bytes`，redaction 在 diff 前先处理 old/new 投影，确保秘密不会进入中间态。
+4. `ChangesBetween` 只比较脱敏后的稳定投影，生成 `[]Change`。
+5. serializer 再做 payload size budget、字段截断和 `payload_hash`，最后写入 `detail_payload`。
+
+推荐每个对象类型都注册一个 `ActivityProjectionBuilder`，输出稳定 map；敏感字段规则由 registry 声明，再由 redaction 引擎统一应用。规则形态示例：
+
+```go
+type FieldRule struct {
+    Name      string
+    Path      string
+    Redaction RedactionMode // none / mask / drop / transform
+    MaxBytes  int
+}
+```
 
 - Chart：`name`、`description`、`query_type`、`api_request`、`config`、`version`
 - Dashboard：`name`、`description`、`version`、`chart_ids`、`layout_overrides`
 - Cohort：`name`、`description`、`rule_config`、`calc_mode`、`calc_time`、`cohort_version`
 - AB：公共字段 + 领域摘要，不直接把整个 `details` 原样落盘
 - Metric / Event / Property：只投影用户真正关心的配置字段
+
+敏感字段处理约定：
+
+- `mask`：密码、token、secret、private key 等统一输出 `"masked"`，不读取、不比较真实值。
+- `drop`：OAuth client secret、内部凭据、不可展示的 webhook credential 直接不进入投影。
+- `transform`：邮箱等可读但需脱敏的字段先通过 `ulog.MaskEmail()` 或等价函数转换，再参与 diff。
+- 大字段：如 Chart config、AB details，只投影摘要或稳定子字段；超过预算时截断并记录 `extra.truncated_fields`。
+
+这样权责边界比较清楚：调用方负责在正确时机提供业务快照；对象 registry 负责声明哪些字段可进入活动；活动模块负责统一脱敏、diff、截断和序列化。
 
 ### 4.5 查询接口
 
@@ -309,7 +377,7 @@ V1 不承诺：
 | `ab_feature_flag.details.operation_records` | 是 | 这是 AB 唯一真实历史源，必须统一收口 |
 | `meta.metric_define_history` | 是 | 属于明确历史债务，且 Metric 已纳入统一规范 |
 | `meta.asset_behavior` | 否 | 当前实际只有 VIEW 有效，且不具备可靠活动语义 |
-| `global.op_operation_log` | 否 | 作用域不同（OP 配置操作），继续留在 global 管理活动链路；客户侧管理操作已进入 `global.activity_log` |
+| `global.op_operation_log` | 否 | 作用域不同（OP 配置操作），继续留在 OP 操作记录链路；客户侧 global item 活动进入 `global.activity_log` |
 
 迁移时的映射规则：
 
@@ -359,7 +427,7 @@ V1 不承诺：
 | 创建 Chart | `create` | web/openapi/mcp | `name`, `type`, `query_type`, `api_request`, `config`, `version` | 若关联 dashboard 则记 `dashboard_ids` | `config` 可能需要大字段投影 |
 | 更新 Chart | `update` | web/openapi/mcp | 仅变更字段的 before/after | 无 | 若只有噪音字段变化则跳过 |
 | 删除 Chart | `delete` | web/openapi/mcp | 至少 `name` 快照 | `snapshot.version`, `snapshot.dashboard_ids` | 读 DB 获取删除前快照 |
-| 批量删除 | `delete` × N | web/openapi/mcp | 同上，每条对象一行 | `extra.batch_id`, `extra.batch_index` | 通过 `BatchLog` 写入，共享事务 |
+| 批量删除 | `delete` × N | web/openapi/mcp | 同上，每条对象一行 | `extra.batch_id`, `extra.batch_index` | 通过 `BatchWriteProjectItemLog` 写入，共享事务 |
 | 复制 Chart | `copy` | web/openapi/mcp | 可为空 | `extra.source_item_id`, `extra.source_item_name`, `extra.target_name` | copy 产生新对象 ID |
 
 **DASHBOARD**
@@ -502,8 +570,8 @@ Pipeline 目前**完全没有操作活动**。现有的执行级日志（`exec_i
 | AB 调度报告任务创建/停止 | 已在 Experiment/Update status→Online/Offline 的 `extra` 中引用 | 不单独成行 |
 | Asset 收藏（Add/Remove）| 轻量交互，排障价值低 | 保持现有 `asset_favorite` 表 |
 | Asset 权限变更 | V1 先不做，后续可扩展 | 无当前落点 |
-| 项目成员增删/角色变更 | global 管理活动域 | `global.activity_log` |
-| 组织成员管理 | global 管理活动域 | `global.activity_log` |
+| 项目成员增删/角色变更 | global item 活动域 | `global.activity_log` |
+| 组织成员管理 | global item 活动域 | `global.activity_log` |
 
 ## 5. 接入策略
 
@@ -511,10 +579,37 @@ Pipeline 目前**完全没有操作活动**。现有的执行级日志（`exec_i
 
 接入不依赖 `AssetOperator` 全覆盖，因为现状只注册了 Chart / Dashboard，且接口只覆盖 CRUD。
 
-所以写入分两类：
+项目对象接入必须按下面的 SOP 做，不能只在某个 service 里临时拼一条 JSON：
 
-1. **可借已有对象服务集中接入的路径**：在对象 service 成功路径直接调用 `activity.Log`
-2. **非 CRUD 或分发型路径**：在具体业务 service 中手工记录，不能等待 infra 自动覆盖
+| 步骤 | 要做什么 | 产物 |
+|------|----------|------|
+| 1 | 确认对象身份 | `ItemType`、`item_id`、`item_name` 规则 |
+| 2 | 确认动作语义 | 基础 `action_type`；必要时走扩展 action_type 注册流程 |
+| 3 | 注册接入场景 | `PolicyKey`，例如 `project.chart.update` / `project.ab.status_online` |
+| 4 | 注册投影规则 | allowlist 字段、redaction、transform、max bytes |
+| 5 | 实现领域包装函数 | 固定 `ItemType/ActionType/PolicyKey`，调用方只传业务快照 |
+| 6 | 接业务事务 | create 用创建后对象；update/delete 在修改前读旧快照；批量用 Batch |
+| 7 | 补验证 | 成功写入、无变更不写、失败策略、查询返回 detail/total |
+
+最小代码形态：
+
+```go
+activity.WriteProjectItemLog(ctx, activity.ProjectItemWriteInput{
+    ItemType:   activity.ItemTypeChart,
+    ItemID:     chart.ID,
+    ItemName:   chart.Name,
+    ActionType: activity.ActionTypeUpdate,
+    PolicyKey:  activity.PolicyChartUpdate,
+    Source:     activity.SourceWeb,
+    OldValue:   oldChart,
+    NewValue:   chart,
+})
+```
+
+写入分两类：
+
+1. **可借已有对象服务集中接入的路径**：在对象 service 成功路径调用领域包装函数，包装函数内部调用 `WriteProjectItemLog`
+2. **非 CRUD 或分发型路径**：在具体业务 service 中手工接入包装函数，不能等待 infra 自动覆盖
 
 ### 5.2 每类对象的接入落点
 
@@ -548,8 +643,8 @@ V1 需提供以下开发者文档，确保业务团队能独立完成接入：
 
 | 文档 | 内容 | 交付形式 |
 |------|------|---------|
-| **ActivityService 接入指南** | Log() / BatchLog() 的调用契约、必填字段、detail 构建规范、常见错误 | Markdown 纳入项目文档 |
-| **对象类型接入模板** | 每个 ItemType 的 Log() 调用示例（含 create/update/delete/copy 四类动作） | Go 示例代码文件 |
+| **ActivityService 接入指南** | `WriteProjectItemLog` / `BatchWriteProjectItemLog` 的调用契约、必填字段、detail 构建规范、常见错误 | Markdown 纳入项目文档 |
+| **对象类型接入模板** | 每个 ItemType 的写入调用示例（含 create/update/delete/copy 四类动作） | Go 示例代码文件 |
 | **WritePolicy 选择指南** | required_full / required_core / best_effort 的适用场景、选择决策树、默认值 | Markdown 纳入项目文档 |
 | **diff 引擎使用说明** | ChangesBetween 的调用方式、排除字段注册、敏感字段掩盖配置 | Markdown + 注释示例 |
 
@@ -564,9 +659,9 @@ V1 需提供以下测试基础设施，降低接入门槛：
 | `activitytest.AssertChangesContains` | 断言 detail.changes 中包含特定字段变更的 helper | 验证 diff 正确性 |
 
 MockService 的行为约定：
-- `Log()` 默认直接返回 nil（不检查写入），调用方可配置预期的 error 返回值（测试写入失败场景）
-- `BatchLog()` 默认逐条追加到内存切片，调用方可读取已写入记录进行断言
-- 不提供与真实 DAO 行为完全一致的 mock（那是集成测试的职责），只验证"是否调用了 Log"以及"传入了什么参数"
+- `WriteProjectItemLog()` 默认直接返回 nil（不检查写入），调用方可配置预期的 error 返回值（测试写入失败场景）
+- `BatchWriteProjectItemLog()` 默认逐条追加到内存切片，调用方可读取已写入记录进行断言
+- 不提供与真实 DAO 行为完全一致的 mock（那是集成测试的职责），只验证"是否调用了活动写入"以及"传入了什么参数"
 
 ## 6. 交付阶段
 
@@ -599,19 +694,19 @@ MockService 的行为约定：
 
 Phase 0 先建底座与查询，Phase 1 打通项目对象闭环，Phase 2 扩展 metadata 长尾。不允许把所有 phase 绑成一次总开关上线。
 
-> 组织/项目管理活动和账号活跃字段为独立链路，见 [plan-org.md](./plan-org.md) 和 [plan-account.md](./plan-account.md)，不阻塞 Phase 0/1/2。
+> global item 活动和账号活跃字段为独立链路，见 [plan-global.md](./plan-global.md) 和 [plan-account.md](./plan-account.md)，不阻塞 Phase 0/1/2。
 
 ## 7. 评审结论
 
 经 autoplan 全流程审查（CEO Review + Eng Review + DX Review + Final Approval Gate），以下议题已锁定：
 
-1. **活动一致性等级**：采用中心化 `WritePolicy`（`required_full` / `required_core` / `best_effort`），由活动模块按对象和动作语义决策，不由调用方自由传参。
+1. **活动一致性等级**：采用中心化 `WritePolicy`（`required_full` / `required_core` / `best_effort`），但策略按已注册接入场景解析，不只按模块或 `item_type + action_type` 粗粒度判断，也不允许调用方自由传参。
 
 2. **detail 大对象字段裁剪策略**：统一采用”对象投影 -> JSON envelope -> 超限截断并记录 `truncated_fields` / `payload_hash`”三段式。
 
-3. **detail_payload 存储格式**：暂不锁定，移入 `discussion.md` 按规模分阶段评估（JSONB / TEXT+LZ4 / 保持 TEXT），V1 先用 TEXT，后续可按需原地 ALTER。详见 [discussion.md](./discussion.md) D-P4。
+3. **detail_payload 存储格式**：列类型锁定为 `TEXT`，不使用 PG `JSONB`；是否在 TEXT 内启用应用层压缩尚未锁定，移入 `discussion.md` 按规模评估。详见 [discussion.md](./discussion.md) D-P4。
 
-4. **CDC/Outbox/Trigger 方案**：已排除，保留显式 `Log()`/`BatchLog()` 调用路径。排除理由见 4.3.4 节。
+4. **CDC/Outbox/Trigger 方案**：已排除，保留显式 `WriteProjectItemLog()` / `BatchWriteProjectItemLog()` 调用路径。排除理由见 4.3.4 节。
 
 5. **开发者体验（DX）**：补充接入文档（4 份）和测试辅助工具，详见 5.4 节。
 

@@ -4,6 +4,8 @@
 
 在 `global.account` 表记录账号最近登录、登出、活跃时间，不进入 `meta.activity_log`。
 
+边界说明：Account API Token 的创建、更新、启用/禁用、刷新、删除属于 account-scoped global item activity，进入 `global.activity_log`，详见 [plan-global.md](./plan-global.md)。本文件只负责账号活跃时间字段，不记录 token 管理活动。
+
 ## 数据模型
 
 在 `global.account` 表（现有 DDL：`script/sql/pgsql/global.sql`）新增 3 个 `TIMESTAMPTZ NULL` 列：
