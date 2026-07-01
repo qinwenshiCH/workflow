@@ -42,12 +42,15 @@
   - `source` 使用全小写字符串，共 4 个值：`web` / `openapi` / `internal` / `backfill`
 - 2026-06-30: **表名定稿为 `meta.activity_log`**（在 project schema 内，`project_` 前缀冗余）。
 - 2026-06-30: **两期交付策略**：第一期（Phase 0+1）交付项目对象活动底座（meta.activity_log + activity 模块 + 对象 live-write + 历史迁移 + OP 查询），独立可验证。第二期（Phase 2+3）交付 metadata 长尾 + account/org/project 管理活动。两期分别 commit，但都在本 spec 内完成。
+- 2026-07-01: **基础能力方案重新打开评审，不宣称已最终锁定**。当前需重新收敛的一组核心设计包括：一致性模型、action_type 体系、payload 物理格式、批量/跨对象关联模型、脱敏职责边界。
+- 2026-07-01: **action_type 先提供基础动作集，再允许扩展自定义动作**。基础集合优先保持精简（如 `create` / `update` / `delete` / `copy`），对象域如确有高价值语义，可在活动模块统一注册扩展 action_type；当前不锁死最终全集。
 
 ## 边界 & 异常处理
 
 - 2026-06-26: 单条 detail 序列化后最大 64KB（可配置），超出时优先 LZ4 压缩（复用 `pkg/lib/util/compress.go`）；压缩后仍超则逐字段截断并记录警告（D-09）
 - 2026-06-26: 同一对象高频操作每条独立记录，不合并去重
 - 2026-06-26: AB / Metric / Wave 项目内历史操作记录需要复制进新活动规范；升级后新操作只写新活动表，不要求双写；旧字段或旧表保留不删（D-10，本轮会话确认）
+- 2026-07-01: `last_active_at` 的 Redis 节流若不可用，**不降级为每次请求写 DB**。改为跳过本次刷新并记录 warning / 指标，避免在故障态放大数据库写压力。
 
 ## 数据模型
 
