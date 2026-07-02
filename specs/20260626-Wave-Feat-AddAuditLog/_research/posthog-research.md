@@ -344,7 +344,40 @@ field_name_overrides = {
 
 ## 五、采集集成方式
 
-PostHog 使用 **4 种互补机制** 采集活动日志，覆盖不同场景。
+PostHog 的“自动记录 / 非侵入式”不是数据库层自动审计，而是建立在 **Django 框架能力** 之上的应用层自动化。
+
+准确说，它使用 **4 层互补机制**，覆盖 **5 类事件来源**：
+
+| 层/来源 | 是否产生事件 | 依赖的 Django 能力 | 作用 |
+|---------|--------------|--------------------|------|
+| `ModelActivityMixin` | 是 | Django ORM Model 可继承抽象 Mixin，重写 `save()` / `delete()` | 标准模型 CRUD 自动采集 |
+| PostHog 自定义 Signal Handlers | 是 | Django Signal / 自定义 signal | 把模型变化翻译成 ActivityLog |
+| Django 内置信号 | 是 | `user_logged_in` / `user_logged_out` / `pre_delete` 等框架信号 | 捕获登录、登出、删除等框架生命周期事件 |
+| `ActivityLoggingMiddleware` | 否 | Django Middleware 请求生命周期 | 传播 user / IP / client / impersonation 上下文 |
+| 手动 `log_activity()` | 是 | 普通应用层函数调用，可结合 Django transaction | 覆盖复杂业务动作和非 CRUD 语义 |
+
+这个设计的“非侵入式”含义需要拆开理解：
+
+- **不是零接入**：模型必须显式继承 `ModelActivityMixin`，handler 也要注册。
+- **不是数据库自动审计**：只有经过 Django ORM / 应用层路径的写入才会被这套机制理解；原始 SQL、绕过 ORM 的批量更新、后台脚本如果不走相同路径，就不会天然获得同样语义。
+- **对业务 service 低侵入**：简单 CRUD 不需要每个 service 手写 `log_activity()`，因为 Mixin + Signal 会自动补齐大部分模型变更记录。
+- **复杂业务仍显式记录**：状态流转、复制、导出、撤销等非 CRUD 动作仍需要手动调用或专门 handler 表达业务语义。
+
+### 5.0 Django 相关能力说明
+
+与 Activity Log 相关的 Django 能力主要有四类：
+
+1. **ORM Model 生命周期**
+   Django 模型的 `save()` / `delete()` 是应用层持久化入口。`ModelActivityMixin` 作为抽象 Mixin 重写这些方法，在真正写库前后读取旧值、新值，并发送 activity signal。这使 PostHog 能在“不改每个业务 service”的情况下覆盖一批标准模型。
+
+2. **Signal 机制**
+   Django Signal 是进程内发布-订阅机制。PostHog 一方面定义自己的 `model_activity_signal`，另一方面接入 Django 内置信号（如登录/登出/pre_delete）。需要注意：Django signal 默认不是消息队列异步，也不是数据库 trigger；它是应用进程内的回调机制，优点是解耦，缺点是仍然依赖应用层写入路径。
+
+3. **Middleware 请求上下文**
+   Django Middleware 包裹整个 HTTP 请求生命周期。PostHog 在请求进入时读取当前用户、IP、client、是否 impersonation，并放入 `asgiref.local.Local`。后续 Mixin / Signal Handler / `log_activity()` 可以从本地上下文读取操作者信息，而不需要每层函数显式传参。
+
+4. **事务提交钩子**
+   Django 提供 `transaction.on_commit()`，允许在数据库事务成功提交后执行回调。PostHog 用它避免“业务事务回滚了但活动日志已经写出”的不一致风险。它解决的是事务时机问题，不改变采集仍发生在应用层这一事实。
 
 ### 5.1 ModelActivityMixin（自动采集，覆盖面最广）
 
@@ -393,7 +426,7 @@ class ModelActivityMixin(models.Model):
 
 ### 5.2 Signal Handlers（15+ 信号处理器）
 
-通过 Django Signal 机制，在模型保存/删除后异步处理活动日志：
+通过 Django Signal 机制，在模型保存/删除后解耦处理活动日志：
 
 ```
 model_activity_signal 处理器:
@@ -436,6 +469,8 @@ class ActivityLoggingMiddleware:
 
 使用 `asgiref.local.Local`（线程/协程安全本地存储），在整个请求生命周期内携带用户上下文，信号处理器和 Mixin 从中读取。
 
+这层本身**不产生 ActivityLog**，它只是给自动采集和手动调用提供归因上下文。没有这层，Mixin 仍能知道“哪个模型变了”，但很难稳定知道“是谁、从哪个客户端、是否 impersonation”。
+
 ### 5.4 手动调用（覆盖复杂场景）
 
 对于 Mixin 无法覆盖的复杂场景，直接调用 `log_activity()`：
@@ -458,6 +493,21 @@ log_activity(
     was_impersonated=False,
 )
 ```
+
+### 5.5 这套机制对 Wave 的启发
+
+PostHog 值得 Wave 借鉴的是**分层思想**，不是 Django 具体实现：
+
+| PostHog | Wave 可借鉴形态 | 不建议照搬 |
+|---------|----------------|------------|
+| Middleware + Local | `activity.WithActivityContext` / Web middleware，从 ctx 统一解析 operator/source/correlation | 让每个调用方自由传 operator/source |
+| ModelActivityMixin | 显式 CRUD helper / 接入模板，减少 Chart/Dashboard 这类简单对象重复代码 | GORM hook 自动写业务活动日志 |
+| Signal Handlers | 业务模块 projector / adapter，把 DAO struct 投影为 `OldProjection/NewProjection/MaskRules` | 隐式 signal 链路，让业务动作来源难追踪 |
+| 手动 `log_activity()` | `ActivityService.WriteLog/BatchWriteLog`，AB/Metric/Token 等复杂场景显式调用 | 试图从 DB 行变化反推 `online/release/copy` |
+
+因此，Wave 如果要吸收 PostHog 经验，推荐表述为：
+
+> 使用 Context + ActivityService + CRUD Helper + Domain Projector 的应用层采集模型；简单 CRUD 尽量模板化，复杂业务动作必须显式写入。
 
 ---
 

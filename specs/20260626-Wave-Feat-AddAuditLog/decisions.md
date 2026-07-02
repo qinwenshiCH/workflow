@@ -11,7 +11,7 @@
 - V1 最直接需求价值是**内部排障/根因定位**，不是对外售卖的企业合规功能
 - V1 技术方案收敛为**最小闭环**：写入、落库、查询、迁移；不先做审计平台或治理平台
 - AB 内部冲突解决必须写入活动，`source = "internal"`，operator 继承触发冲突的原始操作人
-- Cohort 调度任务生命周期不单独成行，作为 CRUD 活动行的 extra 记录
+- Cohort 调度任务生命周期不单独成行，在 CRUD 活动行的 snapshot 中体现
 - Cohort 定时重算执行（RunCohortJob cron 回调）不进入活动表（系统运维操作）
 - Dashboard 的 Chart 关联/移除记在 Dashboard 的活动记录中（`changes[]` 体现 `chart_ids` diff）
 - Pipeline CRUD 接入项目对象活动；内部 Process / callback 不进入活动表
@@ -37,8 +37,8 @@
 - `ItemType` 使用全小写字符串（不沿用 `def.AssetType`）
 - `action_type` 使用全小写字符串，统一定义在 `activity/types.go`（守口到活动模块）
 - 基础动作集锁定为 `create / update / delete / copy`；状态流转类动作（`online / launch / stop` 等）可注册为扩展 action_type，不设 `action_name` 字段
-- 扩展 action_type 必须注册评审（动作名、理由、detail 最小 schema、迁移映射、测试）；基础动作 + extra 不足表达时优先用扩展 action_type
-- source 为4个值：`web / openapi / internal / backfill`
+- 扩展 action_type 必须注册评审（动作名、理由、detail 最小 schema、迁移映射、测试）；基础动作不足表达时优先用扩展 action_type
+- source 为5个值：`ui / api_token / internal / scheduler / backfill`
 - 表名定稿为 `meta.activity_log`（在 project schema 内，`project_` 前缀冗余）
 - 枚举与常量统一定义在 `activity/types.go`
 - `operator_id` 不设外键，系统操作无真实用户时填 `operator_id=0, operator_name=''`
@@ -50,10 +50,11 @@
 - `detail_version` 不下放给业务方，serializer/parser 兼容由活动模块统一维护
 - `operator_name` 保留并作为展示快照（不随用户改名回写历史）
 - `item_name` 保留并作为展示快照（删除后仍可追溯对象名）
-- `source` 区分 web / openapi / internal / backfill
+- `source` 区分 ui / api_token / internal / scheduler / backfill
 - `correlation_id` 替代 `operation_group_id`，由基础设施自动生成或继承上下文
 - 查询接口返回 `detail`，不直接暴露存储字段名 `detail_payload`
 - V1 不记录 IP 地址
+- Snapshot 由调用方按需传入（`json.Marshal(entity)`），独立于投影函数，系统不解构、不自动捕获
 - Account 活跃字段为 3 个 `TIMESTAMPTZ NULL` 列加在 `global.account` 表
 - Account API Token 活动的敏感字段规则：raw token 永不进入 detail；`token_hash` drop；`token_hint` 可作为有限线索
 - global item scope 合法性由 ActivityService 简单表驱动规则校验，不通过 DB CHECK 绑定业务枚举
@@ -104,9 +105,8 @@
 - `last_active_at` Redis 不可用时跳过 DB 写入并记录 warning，不降级
 - BatchInsert 上限 500 行
 - 未注册 action_type 在写入入口直接拒绝，不能透传调用方拼出来的字符串
-- AB 状态流转（online / release / debug / offline）注册为扩展 action_type（`online / release / debug / offline`），不通过 extra 表达
-- `extra` key 实行注册制：新增 key 需与 action_type 同等评审（key 名、值类型、变化预期、历史兼容方案），注册于 `activity/extra_keys.go`
-- `extra` 不得承载字段变更信息（不得替代 changes[]），值应为历史稳定的简单类型（string/number/bool），读者对未知 key 或未知值宽容展示
+- AB 状态流转（online / release / debug / offline）注册为扩展 action_type（`online / release / debug / offline`）
+- V1 不设 extra 概念——暂无非字段变更的业务语义需要进入 detail；如有真实查询需求，按需加列而不是通用兜底字段
 
 ## 开发者体验
 

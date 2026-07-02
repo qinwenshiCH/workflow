@@ -11,8 +11,8 @@
 
 | 链路 | 存储 | 覆盖范围 |
 |------|------|---------|
-| **项目 item 活动**（主线） | `meta.activity_log` | Chart / Dashboard / Cohort / AB / Metric / Pipeline / Event / Property |
-| **Global item 活动** | `global.activity_log` | 组织/项目生命周期、成员管理、Account API Token |
+| **项目 item 活动**（主线） | `meta.activity_log` | Chart / Dashboard / Cohort / AB / Metric / Pipeline / Event / Property ... |
+| **Global item 活动** | `global.activity_log` | 组织/项目生命周期、成员管理、Account API Token... |
 | **账号活跃字段** | `global.account` 表 3 列 | last_login_at / last_logout_at / last_active_at |
 
 **OP 操作记录**（`global.op_operation_log`）维持现状不变，OP 需要保持独立，OP 人员配置操作继续走既有链路。
@@ -54,23 +54,46 @@
 | 步骤 | 谁执行 | 发生了什么 | 场景差异 |
 | --- | --- | --- | --- |
 | ① **业务执行** | 业务 service | 读旧值 → DB 变更 → 读新值 | Create: 无旧值；Update: 有旧+新；Delete: 有旧无新 |
-| ② **投影 + 规则声明** | 业务 service | DAO struct → 投影为原始 `map[string]any`（不脱敏）；声明脱敏函数和 extra | 三场景共用同一投影函数；Create 的 old=nil，Delete 的 new=nil |
+| ② **投影 + 规则声明** | 业务 service | DAO struct → 投影为原始 `map[string]any`（不脱敏）；声明脱敏函数和 snapshot | 三场景共用同一投影函数；Create 的 old=nil，Delete 的 new=nil |
 | ③ **调用写入** | 业务 service | `WriteLog` / `BatchWriteLog`，传原始投影 + 规则 | PolicyKey 由注册声明 |
 | ④ **处理结果** | 业务 service | `err != nil` 时按 WritePolicy 决策：`blocking` 回滚事务、`best_effort` 记 warning | 由 PolicyKey 决定 |
 
-ActivityService 内部（业务不感知）：校验 → `ChangesBetween(oldProj, newProj)` → 按声明对敏感字段 ApplyMaskRules → 补齐 operator/source → 敏感字段兜底拦截 → Delete 时自动捕获 snapshot = oldProj→ 组装 Detail → 序列化 → INSERT。
+ActivityService 内部（业务不感知）：校验 → `ChangesBetween(oldProj, newProj)` → 按声明对敏感字段 ApplyMaskRules → 补齐 operator/source → 敏感字段兜底拦截 → 组装 Detail（input.Snapshot 非空时追加）→ 序列化 → INSERT。
 
 > **关于脱敏**：脱敏在 ChangesBetween **之后**做。原因是：投影时脱敏会丢失敏感字段的变更事件（old/new 都被抹成 `"***"`，ChangesBetween 认为没变）。先投影原始值 → 检测到变更 → 再抹值，才能同时保留"敏感字段被改了"的事实和防止敏感值泄露。详见 §5.7。
 
-### 2.3 为什么不采用 CDC / Outbox / Trigger
+### 2.3 为什么不采用 CDC / Outbox / Trigger / pgAudit
 
 | 方案 | 做法 | 为什么不适合 |
 |------|------|-------------|
-| DB Trigger | 表上挂触发器，INSERT/UPDATE/DELETE 时自动写日志 | 运行在数据库层面，拿不到请求上下文——不知道谁操作的、从哪个入口来的、出于什么意图（发布还是回滚），只有行级数据 |
+| DB Trigger | 表上挂触发器，INSERT/UPDATE/DELETE 时自动写日志 | 作为**行级历史留痕**可行，但不适合作为业务活动日志主方案：运行在数据库层面，拿不到完整请求上下文——不知道谁操作的、从哪个入口来的、出于什么意图（发布还是回滚），只有行级数据。详见 [plan-postgre-trigger.md](./plan-postgre-trigger.md) |
+| pgAudit | PostgreSQL 扩展记录 SQL / 对象访问审计日志 | 作为**数据库层安全审计**可行，但不适合作为业务活动日志或行级历史主方案：输出是 PostgreSQL 日志，不是应用表；没有 OLD/NEW 快照，不知道 Wave 业务 action，且官方语义是 best-effort、非事务一致。详见 [plan-pg-audit.md](./plan-pg-audit.md) |
 | CDC / WAL 订阅 | 监听数据库 WAL 日志流（如 Debezium），推送每行变更 | 适合做数据同步，但 WAL 内容只有"column X 从 A 变 B"，没操作人、没业务语义，且引入 replication slot 增加运维复杂度 |
 | Outbox | 业务先写 outbox 表，异步 worker 消费后再写活动表 | 解耦了业务和活动，但引入消息投递、重试、幂等等额外基础设施。V1 主诉求是"即时排障"，异步反而增加不确定性 |
 
-V1 采用显式 `WriteLog` / `BatchWriteLog`：业务代码在事务内直接调用——最简单，无额外中间件，活动和业务在同一个事务里保证一致性。
+### 2.4 为什么不引入异步解耦（事件驱动 / 消息队列）
+
+V1 不采用异步写入，不是因为"异步不好"，而是因为异步解决的问题在 V1 阶段不是真实瓶颈，且异步引入的代价与 V1 的核心价值冲突。
+
+| 考虑 | 分析 |
+|------|------|
+| **写入量级** | 活动日志记录的是"人的操作"——改配置、发实验、增删对象。单次线上操作写 1-2 条记录，额外延迟 1-5ms。频率比业务数据写入低数个数量级，不到引入消息队列的阈值 |
+| **排障即时性** | V1 首要价值是内部排障和根因定位。"我刚刚改了 Chart，怎么没生效"——同步写入保证事务提交即可查。异步引入最终一致性，排障时出现"活动还没写到"的体验不可接受 |
+| **WritePolicy 已覆盖失败场景** | `best_effort` 策略下活动写入失败不阻塞业务，记 warning 继续。这已经解决了"活动拖慢主业务"的核心关切 |
+| **异步的工程成本** | 消息队列 + 消费者 + 投递重试 + 幂等处理 + DLQ + 消费延迟监控 + 消费端故障排查。这些在 V1 都是没有明确收益的额外复杂度 |
+| **事务一致性** | 当前方案在同一事务内保证活动和业务数据一致性。异步方案是最终一致，可能出现"业务写入成功但活动没记录"的窗口 |
+
+**架构层面的正确做法是预留扩展点，不提前实现：**
+
+```go
+// ActivityWriter 接口，当前同步实现，未来可替换为异步实现
+type ActivityWriter interface {
+    Write(ctx context.Context, input *WriteInput) error
+    BatchWrite(ctx context.Context, inputs []*WriteInput) error
+}
+```
+
+V1 的 `syncWriter` 在当前事务内直接写入；如果未来某个域的活动量级增长到同步写入成为瓶颈，只需提供异步的 `asyncWriter` 实现（推 Kafka / Redis stream）。ActivityService 组合 `ActivityWriter`，业务代码不感知变化。
 
 ---
 
@@ -88,7 +111,7 @@ V1 采用显式 `WriteLog` / `BatchWriteLog`：业务代码在事务内直接调
 | `action_type` | VARCHAR(32) | NOT NULL | `create / update / delete / copy`；扩展动作须统一注册 |
 | `operator_id` | INTEGER | NOT NULL | 操作人 ID，不设外键。系统操作（无真实用户）填 0 |
 | `operator_name` | VARCHAR(255) | NOT NULL DEFAULT '' | 写入时展示快照。系统操作填空字符串 |
-| `source` | VARCHAR(32) | NOT NULL DEFAULT '' | `web / openapi / internal / backfill` |
+| `source` | VARCHAR(32) | NOT NULL DEFAULT '' | `ui / api_token / internal / scheduler / backfill` |
 | `correlation_id` | VARCHAR(64) | NOT NULL DEFAULT '' | 跨对象关联标识，基础设施自动生成或继承上下文 |
 | `detail_payload` | TEXT | NOT NULL DEFAULT '{}' | 稳定 JSON envelope；V1 不使用 PG JSONB；查询返回解析后 `detail` |
 | `occurred_at` | TIMESTAMPTZ | NOT NULL | 事件发生时间（历史迁移时回填原始事件时间） |
@@ -141,7 +164,6 @@ CREATE TABLE IF NOT EXISTS global.activity_log (
 
 **索引**：
 - `(item_type, item_id, occurred_at DESC)`
-- `(operator_id, occurred_at DESC)`
 
 ### 3.3 枚举规范
 
@@ -201,7 +223,7 @@ ActionTypeFinish   = "finish"     // Campaign 完成
 ActionTypeStop     = "stop"       // Pipeline 停止
 ```
 
-扩展原则：基础动作（create/update/delete/copy）覆盖对象的 CRUD 语义；状态流转类动作（如 online / launch / stop）在有明确状态迁移语义时注册为扩展 action_type，不通过 extra 表达。未注册字符串在 `WriteLog` / `BatchWriteLog` 入口直接拒绝。
+扩展原则：基础动作（create/update/delete/copy）覆盖对象的 CRUD 语义；状态流转类动作（如 online / launch / stop）在有明确状态迁移语义时注册为扩展 action_type。未注册字符串在 `WriteLog` / `BatchWriteLog` 入口直接拒绝。
 
 注册流程：
 1. 业务 owner 提交注册说明（动作名、适用 ItemType、无法用基础动作 + detail 表达的理由）
@@ -211,10 +233,11 @@ ActionTypeStop     = "stop"       // Pipeline 停止
 **Source** — 全小写：
 
 ```go
-SourceWeb      = "web"       // 用户通过 Web 界面操作
-SourceOpenAPI  = "openapi"   // 用户通过 OpenAPI/MCP 接口操作
-SourceInternal = "internal"  // 系统内部操作（冲突解决、迁移回调等）
-SourceBackfill = "backfill"  // 历史迁移回填
+SourceUI       = "ui"         // 浏览器 Web UI 操作（Session 认证）
+SourceAPIToken = "api_token"  // Account API Token 鉴权的编程访问
+SourceInternal = "internal"   // 系统内部操作（冲突解决、迁移回调等）
+SourceScheduler = "scheduler" // 定时任务自动操作
+SourceBackfill = "backfill"   // 历史迁移回填
 ```
 
 ### 3.4 关键约定
@@ -238,9 +261,8 @@ package activity
 
 // ——— Detail 类型 ———
 type Detail struct {
-    Changes  []Change       `json:"changes,omitempty"`
-    Extra    map[string]any `json:"extra,omitempty"`
-    Snapshot map[string]any `json:"snapshot,omitempty"`
+    Changes  []Change        `json:"changes,omitempty"`
+    Snapshot json.RawMessage `json:"snapshot,omitempty"`
 }
 
 type Change struct {
@@ -279,7 +301,7 @@ type WriteInput struct {
     OldProjection map[string]any   // 投影原始值，Create 为 nil
     NewProjection map[string]any   // 投影原始值，Delete 为 nil
     MaskRules     MaskRules        // 字段名 → 脱敏函数
-    Extra         map[string]any   // 业务语义标记（见下方 Extra 约束）
+    Snapshot      *json.RawMessage // 可选：调用方按需传入的原始实体 dump，不走投影
 
     // 快捷路径：迁移/回填等特殊场景，跳过 ChangesBetween + ApplyMaskRules
     PreBuiltChanges []Change
@@ -346,7 +368,7 @@ input := activity.WriteInput{
         "token_hash": func(v any) any { return "***" },
         "email":      activity.MaskEmail,
     },
-    Extra: map[string]any{"trigger": "schedule"},
+    Snapshot: snapshotJSON,               // 可选：调用方按需传入原始实体
 }
 ```
 
@@ -354,7 +376,7 @@ input := activity.WriteInput{
 
 | 模块 | 负责 |
 |------|------|
-| 业务 service | 在正确事务点读取 old/new 快照；投影为 `map[string]any`；声明脱敏规则；填写 `Extra` |
+| 业务 service | 在正确事务点读取 old/new 快照；投影为 `map[string]any`；声明脱敏规则；按需传入 `Snapshot` |
 | ActivityService | 接收原始投影 + 规则 → `ChangesBetween` → `ApplyMaskRules` → 组装 `*Detail` → 校验 → 序列化 → 落库 |
 
 内置脱敏函数：
@@ -384,7 +406,7 @@ WriteLog(ctx, input)
 │   └─ (b) 标准路径：
 │       ├─ ChangesBetween(input.OldProjection, input.NewProjection)
 │       ├─ ApplyMaskRules(changes, input.MaskRules)
-│       └─ 组装 Detail{Changes, Extra}；Delete 时捕获 Snapshot=oldProj
+│       └─ 组装 Detail{Changes}；input.Snapshot 非空则追加到 Detail
 │
 ├─ ④ 敏感字段兜底拦截（拒绝敏感字段名进入 detail）
 ├─ ⑤ 64KB 预算检查 + TEXT 序列化
@@ -540,7 +562,7 @@ func (s *MetricService) PauseSchedule(ctx, id uint64) error {
 ### 5.1 Envelope 结构
 
 ```json
-// Update 场景：changes（extra 可选，仅当有非字段变更上下文时使用）
+// Update 场景：changes
 {
   "changes": [{"field": "name", "action": "changed", "before": "旧名称", "after": "新名称"}]
 }
@@ -553,17 +575,16 @@ func (s *MetricService) PauseSchedule(ctx, id uint64) error {
   ]
 }
 
-// Delete 场景：snapshot（删前投影全量）
+// Delete 场景：snapshot（调用方按需传入）
 {
   "snapshot": {"name": "DAU趋势", "type": "line", "version": 3, "dashboard_ids": [5, 8]}
 }
 ```
 
-三个顶层容器的语义定位和约束见 [§5.9](#59-detail-envelope-三容器语义)。简短总结：
+两容器的语义定位和约束见 [§5.9](#59-detail-envelope-两容器语义)。简短总结：
 
 - `changes` — 字段级 before/after diff，Update 的主路径，Create 的初始字段清单
-- `snapshot` — 投影全量，Delete 场景自动捕获 oldProj，事后追溯"删了什么"
-- `extra` — 非字段变更的业务上下文（如 `batch_id`, `source_item_id`），不得替代 action_type 或 changes
+- `snapshot` — 调用方按需传入的原始实体 dump（`json.Marshal(entity)`），与投影无关，系统不解构
 
 **Change 结构**：
 
@@ -576,7 +597,7 @@ func (s *MetricService) PauseSchedule(ctx, id uint64) error {
 
 ### 5.2 场景示例
 
-> 完整场景 JSON 示例见 [reference.md](./reference.md)。changes/snapshot 产出规则统一在 [§5.9](#59-detail-envelope-三容器语义)。
+> 完整场景 JSON 示例见 [reference-activity-log.md](./reference-activity-log.md)。changes/snapshot 产出规则统一在 [§5.9](#59-detail-envelope-两容器语义)。
 
 ### 5.3 排除字段体系
 
@@ -592,7 +613,7 @@ V1 不做复杂 redaction registry。原则是：敏感字段默认不进入 `De
 | 密码/密钥/token | 不读 DB 明文，`before`/`after` 统一写 `"masked"` |
 | Account API Token 原文 | 永不进入活动 detail、日志或持久化 payload |
 | `token_hash` | 不进入 `Detail` |
-| `token_hint` | 可作为 `extra` 或 snapshot 线索，但不得扩大长度或反推原 token |
+| `token_hint` | 可作为 snapshot 线索，但不得扩大长度或反推原 token |
 | Integration 敏感配置 | V1 默认不接入；后续接入前先定义字段 allowlist |
 | Webhook/endpoint 含凭据 | 默认不进入 `Detail`；如必须进入，先在业务代码中剔除凭据片段 |
 | OAuth client credentials | 不进入 `Detail` |
@@ -727,29 +748,26 @@ var sensitiveFieldNames = map[string]bool{
 
 ### 5.8 代码模板
 
-> Create / Update / Delete 三种场景的完整 Go 代码模板见 [reference.md](./reference.md)。
+> Create / Update / Delete 三种场景的完整 Go 代码模板见 [reference-activity-log.md](./reference-activity-log.md)。
 
-### 5.9 Detail Envelope 三容器语义
+### 5.9 Detail Envelope 两容器语义
 
-`detail` 的 JSON envelope 固定为三个顶层容器，每个有明确的定位和约束：
+`detail` 的 JSON envelope 固定为两个顶层容器，定位明确：
 
 | 容器 | 定位 | 谁构造 | 使用场景 | 稳定性契约 |
 | --- | --- | --- | --- | --- |
 | `changes[]` | **字段级 before/after diff** | `ChangesBetween` 自动生成 | Create/Update 场景 | keys = 投影字段名（稳定）；before/after = 当时值（自包含，不依赖未来 schema） |
-| `snapshot` | **投影全量** | ActivityService 按 ActionType 自动捕获：仅 Delete 产生（oldProj），Create/Update 不产生 | 需要了解被删除对象删除前的最后状态时 | keys = 投影字段名（稳定） |
-| `extra` | **轻量业务语义标记** | 业务方手写 | 标记触发条件（如 `trigger:"schedule"`）、关联信息（如 `batch_id:"b-123"`） | 仅用于标记"不属于 DAO 投影的操作上下文"；值应为历史稳定的简单类型（string/number/bool）；key 必须在活动模块注册 |
+| `snapshot` | **原始实体 dump（可选）** | 调用方按需传入 | Delete/任何需要记录完整状态时 | 系统不解构，调用方自行维护格式兼容 |
 
 **核心规则：**
 
-1. **`changes[]` 和 `snapshot` 互斥。** Create → ChangesBetween(nil, newProj) 输出 changes[]（初始字段清单）；Update → ChangesBetween(oldProj, newProj) 输出 changes[]（差异字段）；Delete → 不跑 ChangesBetween，oldProj 作为 snapshot 落盘。由 ActionType 硬编码，不由 PolicyKey 配置。
+1. **Changes 是系统拥有的结构化字段，snapshot 是调用方拥有的不透明字段。** ActivityService 负责解析 changes；snapshot 只存储不解读，查询时原样返回。
 
-2. **`extra` 不得承载字段变更信息。** 如果一条信息是字段的新值/旧值，它就应该进投影 → changes[]。extra 只放"不属于任何 DAO 字段的上下文"。反例：不要在 extra 里写 `{"name_before":"foo","name_after":"bar"}`——这应该在 changes[] 里。
+2. **两者不互斥。** 可以同时存在（如 Update + snapshot）：`{"changes": [...], "snapshot": {...}}`。Create 只产生 changes；Delete 由调用方决定是否传 snapshot。
 
-3. **`extra` 的 key 注册制。** 新增 extra key 需要和新增 action_type 一样走注册评审，说明 key 名、值类型、值的变化预期、历史兼容方案。注册位置在 `activity/extra_keys.go`。
+3. **Snapshot 不走投影。** 调用方直接 `json.Marshal(entity)` 传入原始实体全量，不需要写投影函数。调用方自行决定 snapshot 内容（完整 entity、关键字段子集、或自定义结构）。
 
-4. **历史兼容。** `extra` 的值应对未来 reader 友好——使用稳定枚举串而不是业务内部 ID。未知 key 或未知值不应导致 reader 崩溃，展示原文即可。
-
-5. **64KB 预算共享（V1 默认 64KB，可配置）。** `changes[]` + `snapshot` + `extra` 合并受 64KB 约束。extra 不应包含大嵌套结构——如果 extra 内容超过 1KB，说明信息应该进投影。
+4. **64KB 预算共享（V1 默认 64KB，可配置）。** `changes[]` + `snapshot` 合并受 64KB 约束。
 
 ### 5.10 配置归属总结
 
@@ -775,8 +793,8 @@ var sensitiveFieldNames = map[string]bool{
 
 | 模块 | 负责 | 不负责 |
 |------|------|--------|
-| 业务 service | 读 old/new 快照 → 投影为原始 `map[string]any` → 声明 `MaskRules`/`Extra` → 调用 `WriteLog` → 按 Policy 处理结果 | 调 `ChangesBetween`、调 `ApplyMaskRules`、拼 `detail_payload` |
-| ActivityService | `ChangesBetween` → `ApplyMaskRules` → 按 ActionType 捕获 Snapshot → 组装 Detail → 序列化 → INSERT → 按 PolicyKey 返回 error/warning | 理解各业务 struct 含义 |
+| 业务 service | 读 old/new 快照 → 投影为原始 `map[string]any` → 声明 `MaskRules` → 按需传入 `Snapshot` → 调用 `WriteLog` → 按 Policy 处理结果 | 调 `ChangesBetween`、调 `ApplyMaskRules`、拼 `detail_payload` |
+| ActivityService | `ChangesBetween` → `ApplyMaskRules` → 组装 Detail（含 input.Snapshot 非空时追加）→ 序列化 → INSERT → 按 PolicyKey 返回 error/warning | 理解各业务 struct 含义 |
 | `ChangesBetween` | 比较两投影 map、生成 `[]Change`、跳过通用排除字段 | 持有业务事务、读业务表、理解业务 struct |
 
 ---
@@ -810,7 +828,7 @@ var sensitiveFieldNames = map[string]bool{
       "action_type": "update",
       "operator_id": 7,
       "operator_name": "alice",
-      "source": "web",
+      "source": "ui",
       "detail": {
         "changes": [{"field": "name", "action": "changed", "before": "DAU", "after": "DAU 趋势"}]
       },
@@ -876,11 +894,11 @@ sequenceDiagram
 
 ## 7. 项目内对象活动场景目录
 
-> 完整场景目录（CHART / DASHBOARD / COHORT / AB / METRIC / PIPELINE / CAMPAIGN 等 8 个对象的 CRUD 和状态变更场景）见 [reference.md](./reference.md)。
+> 完整场景目录（CHART / DASHBOARD / COHORT / AB / METRIC / PIPELINE / CAMPAIGN 等 8 个对象的 CRUD 和状态变更场景）见 [reference-activity-log.md](./reference-activity-log.md)。
 
 ## 8. Global Item 活动场景目录
 
-> 完整 Global item 场景（组织/项目生命周期、成员管理、Account API Token）见 [reference.md](./reference.md)。
+> 完整 Global item 场景（组织/项目生命周期、成员管理、Account API Token）见 [reference-activity-log.md](./reference-activity-log.md)。
 
 ## 9. 账号活跃字段
 
@@ -926,7 +944,7 @@ flowchart LR
 
 ## 10. 历史迁移
 
-> 完整迁移方案（迁移原则、映射规则、AB/Metric 历史提取脚本、幂等控制、验证 SQL）见 [reference.md](./reference.md)。
+> 完整迁移方案（迁移原则、映射规则、AB/Metric 历史提取脚本、幂等控制、验证 SQL）见 [reference-activity-log.md](./reference-activity-log.md)。
 
 ### 10.1 迁移原则
 
@@ -960,7 +978,7 @@ flowchart LR
 
 对历史 AB 记录缺少 before/after 的场景：
 - 允许 `changes` 为空
-- 必须保留 `name`、`source = "backfill"`、`extra.legacy_source`
+- 必须保留 `name`、`source = "backfill"`、`snapshot.legacy_source`
 - `operator_name` 尽量回填，查不到允许空字符串
 - `occurred_at` 直接回填原始操作时间
 
@@ -1052,13 +1070,17 @@ func mapABRecordToActivity(flagID int64, flagName, flagType string, rec ABOperat
         ActionType:       actionType,
         PolicyKey:        string(activity.PolicyActivityBackfill),
         PreBuiltChanges:  changes,                        // 迁移走快捷路径
-        Extra:            map[string]any{
-            "legacy_source":      "ab_feature_flag.details.operation_records",
-            "legacy_flag_type":   flagType,
-            "legacy_action_type": rec.Action,
-        },
+        Snapshot:          buildLegacySnapshot(rec),
         OccurredAt:       time.Unix(rec.Timestamp, 0),
     }, nil
+}
+
+func buildLegacySnapshot(rec ABOperationRecord) *json.RawMessage {
+    data, _ := json.Marshal(map[string]any{
+        "legacy_source":      "ab_feature_flag.details.operation_records",
+        "legacy_action_type": rec.Action,
+    })
+    return (*json.RawMessage)(&data)
 }
 
 func mapABAction(action string) string {
@@ -1151,7 +1173,7 @@ HAVING COUNT(*) > 1;
 
 ## 11. 接入策略
 
-> 完整接入 SOP、主要接入点清单、开发者体验（文档、测试工具、Feature Flag）见 [reference.md](./reference.md)。
+> 完整接入 SOP、主要接入点清单、开发者体验（文档、测试工具、Feature Flag）见 [reference-activity-log.md](./reference-activity-log.md)。
 
 ### 11.1 接入 SOP
 
@@ -1179,7 +1201,6 @@ err = activitySvc.WriteLog(ctx, activity.WriteInput{
     PolicyKey:     string(activity.PolicyChartUpdate),
     OldProjection: oldProj,                            // 原始值，不脱敏
     NewProjection: newProj,                            // 原始值，不脱敏
-    Extra:         map[string]any{"version": chart.Version},
 })
 
 // Global item — 手写 changes（无投影函数，少量字段）
@@ -1193,7 +1214,6 @@ err = activitySvc.WriteLog(ctx, activity.WriteInput{
         {Field: "level", Action: activity.ChangeCreated, After: "member"},
         {Field: "role_ids", Action: activity.ChangeCreated, After: []int64{1, 2}},
     },
-    Extra: map[string]any{"org_id": orgID},
 })
 
 // Global item — 有敏感字段，声明 MaskRules
@@ -1326,7 +1346,7 @@ MockService 行为约定：
 
 - 活动 DAO insert 失败（验证 blocking → 返回 error，best_effort → warning）
 - detail 序列化失败（验证 blocking → 返回 error，best_effort → warning）
-- detail 超大 → 截断 + `extra.truncated_fields`
+- detail 超大 → 截断 + 字段列表记录在日志中
 - operator 信息缺失 → 兜底处理
 - 迁移批次重复执行 → 幂等键去重
 - OP 查询权限不足 → 拒绝访问

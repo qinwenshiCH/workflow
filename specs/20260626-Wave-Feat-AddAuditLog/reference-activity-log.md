@@ -1,6 +1,6 @@
 # 活动日志实现参考
 
-> 本文档是 [plan.md](./plan.md) 的实现参考，包含完整示例、代码模板、场景目录、迁移方案和接入 SOP。设计方案请参见 plan.md。
+> 本文档是 [plan-activity-log.md](./plan-activity-log.md) 的实现参考，包含完整示例、代码模板、场景目录、迁移方案和接入 SOP。设计方案请参见 plan-activity-log.md。
 
 ## 1. Pipeline 完整示例
 
@@ -221,6 +221,224 @@ svc.BatchWriteLog(ctx, []activity.WriteInput{
 > Delete 时 changes[] 无意义（对象已删、字段级 `{action:"deleted"}` 是噪音）。规则：`Create → changes(nil, newProj)`，`Update → changes(oldProj, newProj)`，`Delete → snapshot(oldProj)`，由 ActionType 自动推导，业务方只管投影。
 
 **Step ④: 处理结果**
+
+## 1.5 读路径：前端查询与展示
+
+> 写路径定义了"活动数据怎么落"，读路径定义"前端怎么查、怎么渲染"。两者通过统一的 `ListByQuery` API 和 `Detail.Changes[]` 结构衔接，不需要每个业务域重复写查询逻辑。
+
+### 1.5.1 查询 API
+
+业务 controller 只需一行调用：
+
+```go
+result, total, err := activitySvc.ListByQuery(ctx, activity.Query{
+    ItemType: "metric",     // 必填
+    ItemID:   metricID,     // 必填
+    ActionType: nil,        // 可选过滤，空 = 不过滤
+    Page:     1,
+    PageSize: 20,
+})
+ginx.JSON(c, ginx.ListResult{Total: total, Data: result})
+```
+
+返回的 `Item` 结构（后端已自动将 `detail_payload` 反序列化为 `Detail`）：
+
+```json
+{
+    "id": 1001,
+    "item_type": "metric",
+    "item_id": 42,
+    "item_name": "DAU",
+    "action_type": "update",
+    "operator_id": 100,
+    "operator_name": "张三",
+    "source": "ui",
+    "occurred_at": "2026-07-01T10:00:00Z",
+    "detail": {
+        "changes": [
+            {"field": "aggregations", "action": "changed", "before": "avg", "after": "p90"},
+            {"field": "rollup", "action": "changed", "before": "daily", "after": "hourly"}
+        ]
+    }
+}
+```
+
+### 1.5.2 两层渲染模型
+
+前端把每条活动记录拆成两层展示：
+
+```text
+┌─ action_type: "update"        ← 标题层：做了什么
+│  operator: "张三"
+│  time: "2026-07-01 10:00"
+│
+├─ Changes[0]: aggregations     ← 详情层：什么变了
+│     avg → p90
+│
+├─ Changes[1]: rollup
+│     daily → hourly
+```
+
+**标题层由 `action_type` 驱动**，是活动记录的"一句话摘要"。前端维护一张 `action_type → 中文标签` 映射（和 AB 现有 `getOperationType()` 完全一致）：
+
+```typescript
+const actionTypeLabels: Record<string, string> = {
+    create:  "创建",
+    update:  "更新",
+    delete:  "删除",
+    copy:    "复制",
+    online:  "上线",
+    offline: "下线",
+    debug:   "调试",
+    release: "发布完成",
+    launch:  "启动",
+    pause:   "暂停",
+    resume:  "恢复",
+    finish:  "完成",
+    stop:    "停止",
+}
+
+// 渲染标题："张三 更新了指标"
+`${record.operator_name} ${actionTypeLabels[record.action_type]}了${record.item_name}`
+```
+
+**详情层由 `Changes[]` 驱动**，展示具体哪些字段发生了变化。前端维护一张可选的 `item_type + field → 中文标签` 映射。注意 field 名是投影函数 `toActivityProj()` 输出的 map key，不是数据库列名。
+
+```typescript
+// 按 item_type 分组的字段标签映射（非必须，没有映射时直接显示 field 名）
+const fieldLabels: Record<string, Record<string, string>> = {
+    metric: {
+        name:          "指标名称",
+        aggregations:  "聚合方式",
+        rollup:        "汇总周期",
+        define:        "口径定义",
+    },
+    campaign: {
+        status:        "状态",
+        name:          "活动名称",
+        schedule_type: "调度类型",
+    },
+}
+
+function renderChanges(itemType: string, changes: Change[]): string[] {
+    const labels = fieldLabels[itemType] ?? {}
+    return changes.map(c => {
+        const label = labels[c.field] ?? c.field
+        const actionMap: Record<string, string> = {
+            created: "设为",
+            changed: "→",
+            deleted: "删除",
+        }
+        return `${label}: ${c.before ?? ""} ${actionMap[c.action] ?? c.action} ${c.after ?? ""}`
+    })
+}
+
+// 输出：["聚合方式: avg → p90", "汇总周期: daily → hourly"]
+```
+
+### 1.5.3 四种常见展示形态
+
+| 形态 | 何时出现 | 示例 | 渲染方式 |
+| --- | --- | --- | --- |
+| **纯标题** | Changes 为空，action_type 本身已表达语义 | `action_type = "launch"` | "启动" + item_name |
+| **标题 + 变更列表** | 最常见的 Update 场景 | `action_type = "update"` + Changes 有 1-N 条 | 标题 + 字段 diff 列表 |
+| **标题 + 展开面板** | 涉及配置类字段，变化项多 | `action_type = "update"` + Changes 多条长文本 | 标题 + 可展开的 diff 详情 |
+| **删除快照** | Delete 场景捕获快照 | `action_type = "delete"` + Snapshot 非空 | "删除" + 可展开的删除前快照 |
+
+删除快照渲染示例：
+
+```json
+// 后端返回
+{
+    "action_type": "delete",
+    "detail": {
+        "snapshot": {"name": "DAU", "aggregations": "p90"}
+    }
+}
+```
+
+前端：显示"张三 删除了指标 DAU"，提供"查看删除前快照"展开按钮展示 Snapshot 内容。不能展示为 changes[]，因为对象已不存在。
+
+### 1.5.4 示例：Metric 活动历史
+
+**后端 controller 层**——3 行代码：
+
+```go
+// GET /api/projects/:pid/metrics/:id/activity
+func (c *MetricController) ListActivity(ctx *gin.Context) {
+    result, total, err := c.activitySvc.ListByQuery(ctx, activity.Query{
+        ItemType: "metric",
+        ItemID:   param.ID,
+    })
+    ginx.JSON(c, ginx.ListResult{Total: total, Data: result})
+}
+```
+
+**前端渲染效果**（Timeline 展示）：
+
+```text
+┌─────────────────────────────────────────────────────┐
+│ 今天 14:30                                           │
+│   ● 张三 更新了指标 DAU                               │
+│     ┌────────────────────────────────────────┐       │
+│     │ 聚合方式  avg → p90                     │       │
+│     │ 汇总周期  daily → hourly                │       │
+│     └────────────────────────────────────────┘       │
+│                                                      │
+│ 今天 10:00                                           │
+│   ● 张三 创建了指标 DAU                               │
+└─────────────────────────────────────────────────────┘
+```
+
+### 1.5.5 示例：MA Campaign 活动历史
+
+**后端 controller 层**——同样 3 行代码：
+
+```go
+// GET /api/projects/:pid/campaigns/:id/activity
+func (c *CampaignController) ListActivity(ctx *gin.Context) {
+    result, total, err := c.activitySvc.ListByQuery(ctx, activity.Query{
+        ItemType: "campaign",
+        ItemID:   param.ID,
+    })
+    ginx.JSON(c, ginx.ListResult{Total: total, Data: result})
+}
+```
+
+**前端渲染效果：**
+
+```text
+┌─────────────────────────────────────────────────────┐
+│ 2026-07-01 15:00                                     │
+│   ● 李四 启动了营销活动 双十一大促                      │
+│     ┌────────────────────────────────────────┐       │
+│     │ 状态  draft → running                   │       │
+│     └────────────────────────────────────────┘       │
+│                                                      │
+│ 2026-07-01 14:00                                     │
+│   ● 李四 创建了营销活动 双十一大促                      │
+└─────────────────────────────────────────────────────┘
+```
+
+### 1.5.6 字段标签映射维护原则
+
+前端有两张映射表，维护成本不同：
+
+| 映射表 | 必须？ | 维护方式 |
+| --- | --- | --- |
+| `action_type → 中文标签` | **必须** | 活动模块统一定义，所有业务域共用。新增 extension action_type 时同步补充 |
+| `item_type + field → 中文标签` | **可选** | 各业务域按需维护。没有映射时直接显示 field 名 |
+
+**为什么 field 标签映射是可选的？**
+
+因为 Changes[] 的结构化设计已经保证了数据的基本可读性。`{"field":"aggregations","action":"changed","before":"avg","after":"p90"}` 即使前端不知道"aggregations"的中文，也能直接展示为 `aggregations: avg → p90`。排障场景下完全可接受。产品化场景下按需补充标签映射即可。
+
+### 1.5.7 关键规则
+
+1. **API 不承担展示逻辑**。`ListByQuery` 返回原始 Changes[]，不做字段名翻译、不做展示文案拼接。展示逻辑全部在前端。
+2. **Changes[] 既是存储格式也是展示格式**。不需要后端再做一次转换。
+3. **field 名 = 投影函数输出的 map key**。不是数据库列名。`toActivityProj()` 输出的 key 决定了 Changes[].field 的值。
+4. **前端不需要知道 Detail 内部结构**。后端已反序列化 `detail_payload`，前端直接消费即可。
 
 ## 2. 代码模板
 

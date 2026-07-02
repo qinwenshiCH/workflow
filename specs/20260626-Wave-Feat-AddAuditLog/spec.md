@@ -3,7 +3,8 @@
 **目录**: `20260626-Wave-Feat-AddAuditLog`
 **创建日期**: 2026-06-26
 **状态**: 评审中 — 基础能力规划中
-**技术方案**: [plan.md](./plan.md)
+**技术方案**: [plan-activity-log.md](./plan-activity-log.md)
+**备选方案**: [plan-postgre-trigger.md](./plan-postgre-trigger.md)、[plan-pg-audit.md](./plan-pg-audit.md)
 **评审入口**: [README.md](./README.md)
 **输入**: "Wave 需要一个项目级的操作记录，存储到 PG，所有项目内对象的关键操作（创建/改/删）都要记录，方便追溯"
 
@@ -70,14 +71,14 @@
 
 | 优先级 | 场景 | 验收焦点 | 对应方案 |
 |--------|------|---------|----------|
-| P0 | 项目内对象关键变更自动记录 | create/update/delete/copy 产生统一活动；detail 可解释字段差异 | [plan.md](./plan.md) §8 |
-| P0 | 内部排障按对象还原变更链路 | `item_type + item_id` 分页查询，返回 `total` 和可读 detail | [plan.md](./plan.md) §7 |
-| P1 | 多人协作责任链路 | 操作人、来源、事件时间、展示快照完整 | [plan.md](./plan.md) §3 |
-| P1 | AB / Metric / Pipeline 历史债务收口 | 旧历史复制，新操作只写新活动表 | [plan.md](./plan.md) §11 |
-| P1 | Global item 活动 | 组织/项目/成员/Account API Token 进入 `global.activity_log` | [plan.md](./plan.md) §9 |
-| P1 | 账号最近登录/登出/活跃字段 | 三个时间字段落 `global.account` | [plan.md](./plan.md) §10 |
-| P1 | 活动失败策略明确化 | 业务接入点通过 PolicyKey 声明 required/core/best-effort | [plan.md](./plan.md) §5.3 |
-| P2 | 企业信任与安全问询 | V1 先提供可追溯基础，不承诺治理平台能力 | [plan.md](./plan.md) §4.4 |
+| P0 | 项目内对象关键变更自动记录 | create/update/delete/copy 产生统一活动；detail 可解释字段差异 | [plan-activity-log.md](./plan-activity-log.md) §8 |
+| P0 | 内部排障按对象还原变更链路 | `item_type + item_id` 分页查询，返回 `total` 和可读 detail | [plan-activity-log.md](./plan-activity-log.md) §7 |
+| P1 | 多人协作责任链路 | 操作人、来源、事件时间、展示快照完整 | [plan-activity-log.md](./plan-activity-log.md) §3 |
+| P1 | AB / Metric / Pipeline 历史债务收口 | 旧历史复制，新操作只写新活动表 | [plan-activity-log.md](./plan-activity-log.md) §11 |
+| P1 | Global item 活动 | 组织/项目/成员/Account API Token 进入 `global.activity_log` | [plan-activity-log.md](./plan-activity-log.md) §9 |
+| P1 | 账号最近登录/登出/活跃字段 | 三个时间字段落 `global.account` | [plan-activity-log.md](./plan-activity-log.md) §10 |
+| P1 | 活动失败策略明确化 | 业务接入点通过 PolicyKey 声明 required/core/best-effort | [plan-activity-log.md](./plan-activity-log.md) §5.3 |
+| P2 | 企业信任与安全问询 | V1 先提供可追溯基础，不承诺治理平台能力 | [plan-activity-log.md](./plan-activity-log.md) §4.4 |
 
 <details>
 <summary>完整用户故事和验收场景（点击展开）</summary>
@@ -230,4 +231,4 @@
 
 ## 技术方案
 
-所有技术设计（数据模型、枚举规范、detail schema、Detail helper、写入模型、查询接口、场景目录、接入指南、交付阶段、验证方案）详见 [plan.md](./plan.md)。
+所有技术设计（数据模型、枚举规范、detail schema、Detail helper、写入模型、查询接口、场景目录、接入指南、交付阶段、验证方案）详见 [plan-activity-log.md](./plan-activity-log.md)。
