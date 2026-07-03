@@ -30,7 +30,7 @@ flowchart LR
 |------|----------------------------|---------------------|
 | 写入方式 | GORM 插件自动拦截 | 显式 `audit.Log()` 调用 |
 | 写入策略 | 同步 blocking | 异步 channel + ticker 攒批 |
-| Detail | changes diff（字段级变更） | 仅存 `name` + 可选 `comment` |
+| Detail | changes diff（字段级变更） | 嵌套分组：account/target/comment/changes/extra |
 | 存储 | PostgreSQL `global.audit_log` | Doris `sw_dw_global.audit_log` |
 | 分区 | V1 不做 | AUTO PARTITION BY RANGE 按月 |
 | 压缩 | 无（~360GB/年） | 5-10x 列存压缩（~50GB/年） |
@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS sw_dw_global.audit_log (
     `target_id`   VARCHAR(72) NOT NULL DEFAULT ''  COMMENT '资源 ID，登录事件为空字符串',
     `source`      VARCHAR(16) NOT NULL             COMMENT 'ui / api_token',
     `ip_address`  VARCHAR(64) NOT NULL             COMMENT '操作者 IP',
-    `detail`      JSON        NULL                 COMMENT '{"name":"...","comment":"..."}'
+    `detail`      JSON        NULL                 COMMENT '{"account":{"name":"..."},"target":{"name":"...","type":"..."},"comment":"...","changes":[...],"extra":{}}'
 ) ENGINE=OLAP
 DUPLICATE KEY(`created_at`, `org_id`, `project_id`, `account_id`)
 AUTO PARTITION BY RANGE (date_trunc(`created_at`, 'month')) ()
@@ -75,7 +75,7 @@ PROPERTIES (
 | **DUPLICATE KEY**（非 UNIQUE） | 审计日志 append-only，无更新，DUPLICATE 模型写入最快 |
 | **AUTO PARTITION BY RANGE 按月** | 自动创建/删除分区，无需运维脚本 |
 | **DISTRIBUTED BY HASH(account_id)** | 按人查询是最常见过滤维度 |
-| **detail 用 JSON 类型** | Doris 支持 JSON 列，比 TEXT 查询更方便（`json_extract`） |
+| **detail 用 JSON 类型** | 嵌套分组（account/target/changes/extra），Doris `json_extract` 可按 key 查询 |
 | **org_id/project_id DEFAULT 0** | Doris 不支持 NULL，用 0 表示"无归属" |
 | **ZSTD 压缩** | 列存在 5-10x 压缩比 |
 | **独立数据库 sw_dw_global** | 审计日志跨项目，不放入项目数据库 |
@@ -132,10 +132,10 @@ const (
     FeatureAuth           = "auth"
     FeatureToken          = "token"
     FeatureOrg            = "org"
-    FeatureOrgMember      = "member"
+    FeatureOrgMember      = "org_member"
     FeatureOrgInvite      = "invite"
     FeatureProject        = "project"
-    FeatureProjectMember  = "member"   // domain=project 时
+    FeatureProjectMember  = "project_member"
     FeatureChart          = "chart"
     FeatureDashboard      = "dashboard"
     FeatureCohort         = "cohort"
@@ -177,12 +177,33 @@ type Entry struct {
     Detail    *Detail   `json:"detail"`
 }
 
-// Detail 变更详情
+// Detail 审计详情。顶层 key 为语义分组，未来按需扩展。
 type Detail struct {
-    Name         string `json:"name"`                    // 资源展示名快照
-    Comment      string `json:"comment,omitempty"`       // 可选备注
-    AccountName  string `json:"account_name,omitempty"`  // 操作人名称快照
-    ResourceName string `json:"resource_name,omitempty"` // 被操作资源名称快照（当 name 存的是操作人名称时，此处存资源名称）
+    Account *DetailAccount  `json:"account,omitempty"` // 操作人快照
+    Target  *DetailTarget   `json:"target,omitempty"`  // 被操作资源快照
+    Comment string          `json:"comment,omitempty"` // 可选备注
+    Changes []ChangeEntry   `json:"changes,omitempty"` // V2：字段级变更
+    Extra   json.RawMessage `json:"extra,omitempty"`   // 事件专属扩展
+}
+
+// DetailAccount 操作人快照
+type DetailAccount struct {
+    Name  string `json:"name,omitempty"`
+    Email string `json:"email,omitempty"`
+}
+
+// DetailTarget 被操作资源快照
+type DetailTarget struct {
+    Name string `json:"name,omitempty"`
+    Type string `json:"type,omitempty"` // domain 常量值："chart" / "dashboard" / "experiment" ...
+}
+
+// ChangeEntry 单字段变更（V2 预留）
+type ChangeEntry struct {
+    Field  string `json:"field"`
+    Action string `json:"action"` // "created" / "changed" / "deleted"
+    Before any    `json:"before,omitempty"`
+    After  any    `json:"after,omitempty"`
 }
 ```
 
@@ -200,15 +221,15 @@ func Log(c *gin.Context, domain, feature, action, targetID string, detail *Detai
 ```go
 // Handler 中一行调用
 audit.Log(c, audit.DomainAsset, audit.FeatureChart, audit.ActionCreated,
-    fmt.Sprint(chart.ID), &audit.Detail{ResourceName: chart.Name})
+    fmt.Sprint(chart.ID), &audit.Detail{Target: &audit.DetailTarget{Name: chart.Name, Type: "chart"}})
 
 // 登录事件（在认证 filter 中）
 audit.Log(c, audit.DomainAccount, audit.FeatureAuth, audit.ActionLoggedIn,
-    "", &audit.Detail{Name: accountName, AccountName: accountName})
+    "", &audit.Detail{Account: &audit.DetailAccount{Name: accountName}})
 
 // 删除事件
 audit.Log(c, audit.DomainAsset, audit.FeatureDashboard, audit.ActionDeleted,
-    fmt.Sprint(dashboard.ID), &audit.Detail{ResourceName: dashboard.Name})
+    fmt.Sprint(dashboard.ID), &audit.Detail{Target: &audit.DetailTarget{Name: dashboard.Name, Type: "dashboard"}})
 
 // 无额外信息
 audit.Log(c, audit.DomainOrganization, audit.FeatureOrgMember, audit.ActionCreated,
@@ -450,21 +471,21 @@ func (h *ChartHandler) Create(c *gin.Context) {
         return err
     }
     audit.Log(c, audit.DomainAsset, audit.FeatureChart, audit.ActionCreated,
-        fmt.Sprint(chart.ID), &audit.Detail{ResourceName: chart.Name})
+        fmt.Sprint(chart.ID), &audit.Detail{Target: &audit.DetailTarget{Name: chart.Name, Type: "chart"}})
     return chart
 }
 
 // 模式 2：Update
 audit.Log(c, audit.DomainAsset, audit.FeatureChart, audit.ActionUpdated,
-    fmt.Sprint(chart.ID), &audit.Detail{ResourceName: chart.Name})
+    fmt.Sprint(chart.ID), &audit.Detail{Target: &audit.DetailTarget{Name: chart.Name, Type: "chart"}})
 
 // 模式 3：Delete（在删除前调用，保留资源名称）
 audit.Log(c, audit.DomainAsset, audit.FeatureChart, audit.ActionDeleted,
-    fmt.Sprint(chart.ID), &audit.Detail{ResourceName: chart.Name})
+    fmt.Sprint(chart.ID), &audit.Detail{Target: &audit.DetailTarget{Name: chart.Name, Type: "chart"}})
 
 // 模式 4：登录（在认证 filter 中）
 audit.Log(c, audit.DomainAccount, audit.FeatureAuth, audit.ActionLoggedIn,
-    "", &audit.Detail{Name: accountName, AccountName: accountName})
+    "", &audit.Detail{Account: &audit.DetailAccount{Name: accountName}})
 ```
 
 ### 6.2 接入清单（按 Phase）
@@ -476,10 +497,10 @@ audit.Log(c, audit.DomainAccount, audit.FeatureAuth, audit.ActionLoggedIn,
 | Account 登录 | account | auth | logged_in/out | Session 认证 filter |
 | AccountAPIToken | account | token | created/updated/deleted | apitoken handler |
 | Organization | organization | org | created/updated/deleted | org handler |
-| OrganizationMember | organization | member | created/updated/deleted | org member handler |
+| OrganizationMember | organization | org_member | created/updated/deleted | org member handler |
 | OrganizationInvite | organization | invite | created/deleted | org invite handler |
 | Project | project | project | created/updated/deleted | project handler |
-| ProjectMember | project | member | created/updated/deleted | project member handler |
+| ProjectMember | project | project_member | created/updated/deleted | project member handler |
 | Chart | asset | chart | created/updated/deleted | chart handler |
 | Dashboard | asset | dashboard | created/updated/deleted | dashboard handler |
 | Cohort | asset | cohort | created/updated/deleted | cohort handler |
@@ -509,7 +530,7 @@ audit.Log(c, audit.DomainAccount, audit.FeatureAuth, audit.ActionLoggedIn,
 
 1. **所有 CRUD 操作后调用**，在业务逻辑成功返回前
 2. `audit.Log()` 始终非阻塞，不影响主流程
-3. detail 只存 `name`，可选 `comment`
+3. detail 按语义分组存储：`account`（操作人快照）、`target`（资源快照）、`comment`、`changes`（V2 预留）、`extra`（事件专属扩展）
 4. 不需要 diff before/after——审计日志关注"谁做了什么事"，不是"改了什么字段"
 
 ---
