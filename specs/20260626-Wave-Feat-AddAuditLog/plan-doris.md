@@ -282,15 +282,15 @@ var (
 
 func getWriter() *writer {
     writerOnce.Do(func() {
-        // NOTE: streamLoader URL 和凭据从 dorisx 配置中获取
+        dorisCfg := config.Inf.GetDoris()
         w := &writer{
             ch:     make(chan *Entry, channelBuffer),
             stopCh: make(chan struct{}),
             doneCh: make(chan struct{}),
             streamLoader: &dorisx.StreamLoader{
-                Url:           dorisConfig.HTTPHost + "/api/sw_dw_global/audit_log/_stream_load",
-                DorisUsername: dorisConfig.User,
-                DorisPassword: dorisConfig.Password,
+                Url:           dorisCfg.HttpHost + "/api/sw_dw_global/audit_log/_stream_load",
+                DorisUsername: dorisCfg.User,
+                DorisPassword: dorisCfg.Password,
             },
         }
         go w.backgroundFlush()
@@ -746,14 +746,88 @@ V1 不迁移历史数据。旧系统保持不变：
 
 ---
 
-## 十一、交付计划
+## 十一、Doris 集成适配要点
+
+### 11.1 StreamLoader 通路
+
+`dorisx.StreamLoader` 已实现完整（HTTP PUT + Bearer token + JSON），但在 Wave 全量代码中**零生产调用者**——当前数据入 Doris 走 Kafka Routine Load，非 HTTP Stream Load。部署前需验证：
+
+```bash
+# 手动验证 Stream Load 通路（从 web server 所在机器执行）
+curl -X PUT "http://{doris_http_host}/api/sw_dw_global/audit_log/_stream_load" \
+  -H "Authorization: Bearer $(echo -n 'user:password' | base64)" \
+  -H "format: json" \
+  -H "strip_outer_array: true" \
+  -d '[{"created_at":"2026-07-03 12:00:00","org_id":0,"project_id":0,"account_id":1,"action":"logged_in","domain":"account","feature":"session","target_id":"","source":"ui","ip_address":"127.0.0.1"}]'
+```
+
+### 11.2 数据库命名
+
+`sw_dw_global` 不遵循现有 `{prefix}{projectID}` 模式（如 `sw_dw_3208`）。因为审计日志跨项目，独立库是合理选择。适配要点：
+
+- **DDL 初始化**：在 `server.go` 中 `dorisx.Init()` 之后执行建库建表，不使用 `dorisx.DB.Database()` helper
+- **查询前缀**：每次查询前手动 `USE sw_dw_global`，不走 `dorisx.DB.UseDB()`
+
+```go
+// server.go 中添加
+func initAuditLogDatabase() {
+    ctx := context.Background()
+    conn := dorisx.DB.GetGlobalDB()
+    // 建库
+    conn.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS sw_dw_global")
+    // 建表（嵌入 SQL 文件或字符串常量）
+    conn.ExecContext(ctx, AuditLogDDL)
+}
+```
+
+### 11.3 查询路径
+
+```go
+// query.go
+func List(ctx context.Context, params QueryParams) ([]Entry, string, error) {
+    conn := dorisx.DB.GetGlobalDB()
+    conn.ExecContext(ctx, "USE sw_dw_global") // ponytail: global DB，不走 UseDB helper
+    
+    rows, err := conn.QueryContext(ctx, `
+        SELECT created_at, org_id, project_id, account_id, action, domain, feature,
+               target_id, source, ip_address, detail
+        FROM audit_log
+        WHERE account_id = ? AND created_at < ?
+        ORDER BY created_at DESC
+        LIMIT ?
+    `, params.AccountID, params.Cursor, params.PageSize+1)
+    // ...
+}
+```
+
+### 11.4 `sw_dw_global` 数据库是否会被拦截
+
+不会被拦截。现有 `dorisx.DB.GetGlobalDB()` 返回 admin 级连接（无 database 限定），可以 `CREATE DATABASE` 和跨库操作。`sw_dw_global` 与项目数据库 `sw_dw_{id}` 平级，Doris 集群无命名限制。
+
+### 11.5 监控上报
+
+Stream Load 写入结果通过 `StreamLoader.Load()` 返回值上报。建议在 `backgroundFlush` 中增加 metrics：
+
+```go
+// ponytail: counter 计数即可，add when 需要 dashboard/告警
+// metrics.Counter("audit_stream_load_total", len(batch))
+// metrics.Counter("audit_stream_load_failed", 1) // on error
+// metrics.Histogram("audit_stream_load_latency_ms", elapsed)
+```
+
+Wave 现有监控体系（Prometheus metrics + Grafana）已有 metric 注册机制，在 flush 中加 3 行 counter 即可。
+
+---
+
+## 十二、交付计划
 
 ### Phase 0：底座（1-2 天）
 
-- [ ] 创建 `script/sql/doris/audit_log.sql` DDL
+- [ ] ~~创建~~ DDL 已内置在 `auditLogDDL` Go 常量中（`CREATE DATABASE IF NOT EXISTS` + `CREATE TABLE IF NOT EXISTS`）
 - [ ] 创建 `apps/web/audit/` 包（audit.go + writer.go + query.go）
-- [ ] 在 `server.go` 中调用 `audit.InitWriter()` 和 `audit.CloseWriter()`
-- [ ] 测试：Doris Stream Load 连通性验证
+- [ ] 在 `server.go` 中 `dorisx.Init()` 后调用 `audit.Init(ctx)`（初始化 DB + 启动 writer）
+- [ ] 在 `server.go` 的 graceful shutdown 中调用 `audit.Close()`
+- [ ] 手动 Stream Load curl 验证网络通路（见 §11.1）
 - [ ] 测试：channel→攒批→Stream Load 端到端
 
 ### Phase 1：高价值对象接入（2-3 天）
@@ -783,7 +857,7 @@ V1 不迁移历史数据。旧系统保持不变：
 
 ---
 
-## 十二、风险与缓解
+## 十三、风险与缓解
 
 | 风险 | 概率 | 缓解 |
 |------|------|------|
@@ -795,7 +869,7 @@ V1 不迁移历史数据。旧系统保持不变：
 
 ---
 
-## 十三、后续演进
+## 十四、后续演进
 
 以下不在 V1 范围，但设计留有扩展空间：
 
@@ -823,6 +897,6 @@ V1 不迁移历史数据。旧系统保持不变：
 1. ✅ Disk fallback (§5.5) for Stream Load failures
 2. ✅ Feature constants renamed: `"org_member"` / `"project_member"`
 3. ✅ `created_at` upgraded to `DATETIME(6)` for reliable cursor pagination
-4. ⏳ Sync spec.md and decisions.md（待处理）
+4. ✅ Sync spec.md and decisions.md（2026-07-03 完成）
 
 NO UNRESOLVED DECISIONS
