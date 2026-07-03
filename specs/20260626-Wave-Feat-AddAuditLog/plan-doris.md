@@ -47,7 +47,7 @@ flowchart LR
 CREATE DATABASE IF NOT EXISTS sw_dw_global;
 
 CREATE TABLE IF NOT EXISTS sw_dw_global.audit_log (
-    `created_at`  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '记录时间',
+    `created_at`  DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '记录时间',
     `org_id`      BIGINT      NOT NULL DEFAULT 0   COMMENT '组织 ID，0=无组织归属',
     `project_id`  BIGINT      NOT NULL DEFAULT 0   COMMENT '项目 ID，0=无项目归属',
     `account_id`  BIGINT      NOT NULL             COMMENT '操作人 account_id',
@@ -80,16 +80,7 @@ PROPERTIES (
 | **ZSTD 压缩** | 列存在 5-10x 压缩比 |
 | **独立数据库 sw_dw_global** | 审计日志跨项目，不放入项目数据库 |
 
-### 2.3 与 Doris 现有模式对齐
-
-| 现有表 | 审计日志沿用 |
-|--------|------------|
-| ENGINE=OLAP | ✅ |
-| AUTO PARTITION BY RANGE | ✅ |
-| DISTRIBUTED BY HASH(...) BUCKETS AUTO | ✅ |
-| replication_allocation = 3 | ✅ |
-| PROPERTIES 中 compression=ZSTD | ✅ |
-| 全局连接 (dorisx.DB.GetGlobalDB()) | ✅ |
+全局连接复用 `dorisx.DB.GetGlobalDB()`，与现有 Doris 表（`raw_events` 等）共享同一集群。
 
 ---
 
@@ -195,7 +186,7 @@ type DetailAccount struct {
 // DetailTarget 被操作资源快照
 type DetailTarget struct {
     Name string `json:"name,omitempty"`
-    Type string `json:"type,omitempty"` // domain 常量值："chart" / "dashboard" / "experiment" ...
+    Type string `json:"type,omitempty"` // feature 常量值："chart" / "dashboard" / "experiment" ...
 }
 
 // ChangeEntry 单字段变更（V2 预留）
@@ -219,17 +210,13 @@ func Log(c *gin.Context, domain, feature, action, targetID string, detail *Detai
 **调用示例**：
 
 ```go
-// Handler 中一行调用
+// 资源操作：指定 Target
 audit.Log(c, audit.DomainAsset, audit.FeatureChart, audit.ActionCreated,
     fmt.Sprint(chart.ID), &audit.Detail{Target: &audit.DetailTarget{Name: chart.Name, Type: "chart"}})
 
-// 登录事件（在认证 filter 中）
+// 登录事件：指定 Account
 audit.Log(c, audit.DomainAccount, audit.FeatureAuth, audit.ActionLoggedIn,
     "", &audit.Detail{Account: &audit.DetailAccount{Name: accountName}})
-
-// 删除事件
-audit.Log(c, audit.DomainAsset, audit.FeatureDashboard, audit.ActionDeleted,
-    fmt.Sprint(dashboard.ID), &audit.Detail{Target: &audit.DetailTarget{Name: dashboard.Name, Type: "dashboard"}})
 
 // 无额外信息
 audit.Log(c, audit.DomainOrganization, audit.FeatureOrgMember, audit.ActionCreated,
@@ -442,7 +429,50 @@ func isRegistered(domain, feature string) bool {
 }
 ```
 
-### 5.4 生命周期
+### 5.5 磁盘 fallback
+
+当 Stream Load 持续失败时，单批次丢失可接受，但长时间 Doris 不可达将导致持续丢数据。磁盘 fallback 在写入失败时将批次持久化到本地文件，恢复后回放：
+
+```go
+// writer.go 中的 fallback 逻辑
+
+const (
+    fallbackFile = "/tmp/audit_fallback.jsonl"  // 磁盘 fallback 文件（JSON lines，每行一批）
+    fallbackMax  = 50 << 20                      // 上限 50MB，超出停止写入并告警
+)
+
+func (w *writer) fallbackWrite(data []byte) {
+    info, err := os.Stat(fallbackFile)
+    if err == nil && info.Size() >= fallbackMax {
+        ulog.Errorf("[audit] fallback file exceeded %dMB, dropping batch", fallbackMax>>20)
+        return
+    }
+    f, err := os.OpenFile(fallbackFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+    if err != nil {
+        ulog.Errorf("[audit] open fallback file failed: %v", err)
+        return
+    }
+    defer f.Close()
+    f.Write(append(data, '\n'))
+}
+
+func (w *writer) fallbackReplay() {
+    data, err := os.ReadFile(fallbackFile)
+    if err != nil || len(data) == 0 {
+        return
+    }
+    // 逐行回放，成功则清空文件
+    for _, line := range bytes.Split(data, []byte{'\n'}) {
+        if len(line) == 0 { continue }
+        if err := w.streamLoader.Load(context.Background(), line); err != nil {
+            return  // 仍然失败，保留文件下次重试
+        }
+    }
+    os.Truncate(fallbackFile, 0)
+}
+```
+
+在 `backgroundFlush` 的 `flush` 中：Stream Load 失败时调用 `fallbackWrite(data)`。后台每 30s 调用一次 `fallbackReplay()`。磁盘文件占用有界（50MB），超出后停止写入并告警。
 
 在 `apps/web/server.go` 的启动/退出流程中管理：
 
@@ -518,13 +548,13 @@ audit.Log(c, audit.DomainAccount, audit.FeatureAuth, audit.ActionLoggedIn,
 
 **Phase 3（元数据补齐）**：
 
-| 实体 | domain | feature |
-|------|--------|---------|
-| TrackedEvent | metadata | tracked_event |
-| VirtualEvent | metadata | virtual_event |
-| EventProperty | metadata | event_property |
-| UserProperty | metadata | user_property |
-| VirtualProperty | metadata | virtual_property |
+| 实体 | domain | feature | 操作 |
+|------|--------|---------|------|
+| TrackedEvent | metadata | tracked_event | created/updated/deleted |
+| VirtualEvent | metadata | virtual_event | created/updated/deleted |
+| EventProperty | metadata | event_property | created/updated/deleted |
+| UserProperty | metadata | user_property | created/updated/deleted |
+| VirtualProperty | metadata | virtual_property | created/updated/deleted |
 
 ### 6.3 接入原则
 
@@ -613,7 +643,7 @@ func Export(ctx context.Context, q *Query, format string) ([]byte, string, error
 
 ### 7.4 索引与查询性能
 
-Doris DUPLICATE KEY 的前缀列天然有序。按 (created_at, org_id, project_id, account_id) 的 DUPLICATE KEY 设计使以下查询走前缀索引：
+Doris DUPLICATE KEY 的前缀列天然有序，以下查询走前缀索引：
 
 | 查询模式 | 索引命中 |
 |---------|---------|
@@ -636,6 +666,7 @@ Doris DUPLICATE KEY 的前缀列天然有序。按 (created_at, org_id, project_
 | 未注册 domain/feature | warn log + skip | 防止 typo 污染数据 |
 | Doris 不可达 | Stream Load 超时后 error log | channel 继续缓冲直到满，之后 drop |
 | Graceful shutdown | 排空 channel 剩余数据再关闭 | 正常重启零丢失 |
+| Stream Load 持续失败 | 写入本地磁盘 fallback 文件，恢复后回放 | 防止长时间 Doris 不可达导致持续丢数据 |
 
 **与 blocking 方案的对比**：
 
@@ -644,7 +675,7 @@ Doris DUPLICATE KEY 的前缀列天然有序。按 (created_at, org_id, project_
 | PG blocking（原方案） | 低（事务保证） | 高（DB 故障 → 业务不可用） |
 | Doris async（本方案） | 极低（channel drop 概率 < 0.01%） | 零（channel 满时 drop，业务无感） |
 
-PostHog、CloudTrail、GitHub Audit Log 全部采用异步写入——这是业界标准做法。
+channel 满时的本地缓冲加磁盘 fallback（见 §5.5）确保数据不因瞬时尖峰丢失。
 
 ---
 
@@ -786,10 +817,10 @@ V1 不迁移历史数据。旧系统保持不变：
 
 **Eng Consensus (dual voices)**: 6/6 dimensions confirmed. Both Claude subagent and Codex independently identified query authorization missing, cursor pagination unreliability, and durability concerns.
 
-**VERDICT**: ENG CLEARED with taste decisions accepted. Plan approved for implementation with 4 post-review amendments:
-1. Add disk fallback (~50 loc) for Stream Load failures
-2. Rename feature constants: `"member"` → `"org_member"` / `"project_member"`
-3. Upgrade `created_at` to `DATETIME(6)` for reliable cursor pagination
-4. Sync spec.md and decisions.md to reflect plan-doris.md actual design
+**VERDICT**: ENG CLEARED with taste decisions accepted. Post-review amendments applied:
+1. ✅ Disk fallback (§5.5) for Stream Load failures
+2. ✅ Feature constants renamed: `"org_member"` / `"project_member"`
+3. ✅ `created_at` upgraded to `DATETIME(6)` for reliable cursor pagination
+4. ⏳ Sync spec.md and decisions.md（待处理）
 
 NO UNRESOLVED DECISIONS
