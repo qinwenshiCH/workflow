@@ -18,6 +18,7 @@
 | 文件 | 作用 |
 |------|------|
 | [wave-research.md](./wave-research.md) | 先看清 Wave 当前有哪些历史机制、债务和对象范围 |
+| [audit-log-standards-evidence.md](./audit-log-standards-evidence.md) | 审计日志的标准证据总表：哪些是标准硬要求，哪些是为了第三方审计可用性补的产品字段 |
 | [external-products/README.md](./external-products/README.md) | 再看外部产品被分成了哪几类 archetype，各自解决什么问题 |
 
 ### 第二层：看最像 Wave 的参考
@@ -62,6 +63,7 @@
 | 文件 | 内容 |
 |------|------|
 | [wave-research.md](./wave-research.md) | Wave 现有操作记录、历史债务、项目对象范围 |
+| [audit-log-standards-evidence.md](./audit-log-standards-evidence.md) | 标准要求、法规边界、P0 字段证据映射 |
 
 ---
 
