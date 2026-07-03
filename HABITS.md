@@ -6,6 +6,14 @@
 
 (空 — 等你说"以后都用…")
 
+## 已安装第三方技能集
+
+- [Matt Pocock /skills](https://github.com/mattpocock/skills)（2026-07-03）：38 个技能，包括 TDD、PRD 编写、代码审查、架构改进、调试等
+- [Ponytail](https://github.com/DietrichGebert/ponytail)（2026-07-03）：6 个技能，AI 代码精简懒人模式（/ponytail, /ponytail-review, /ponytail-audit 等）
+
+路径：`.agents/skills/`（Codex CLI / Claude Code 均可用）
+可用命令参见 `npx skills@latest list`
+
 ## 流程 & 方法
 
 - 确认(2026-06-26): simplify、review 等审查工作使用独立子上下文（sub-agent / background task）执行，当前会话不直接运行；待子任务完成后获取结果，在当前会话汇总呈现给用户
