@@ -51,9 +51,9 @@ CREATE TABLE IF NOT EXISTS sw_dw_global.audit_log (
     `org_id`      BIGINT      NOT NULL DEFAULT 0   COMMENT '组织 ID，0=无组织归属',
     `project_id`  BIGINT      NOT NULL DEFAULT 0   COMMENT '项目 ID，0=无项目归属',
     `account_id`  BIGINT      NOT NULL             COMMENT '操作人 account_id',
-    `action`      VARCHAR(32) NOT NULL             COMMENT 'created/updated/deleted/logged_in/logged_out',
+    `action`      VARCHAR(32) NOT NULL             COMMENT 'created/updated/deleted/logged_in/logged_out/login_failed',
     `domain`      VARCHAR(32) NOT NULL             COMMENT 'account/organization/project/asset/metadata',
-    `feature`     VARCHAR(32) NOT NULL             COMMENT 'auth/token/chart/experiment/...',
+    `feature`     VARCHAR(32) NOT NULL             COMMENT 'session/account_profile/token/chart/experiment/...',
     `target_id`   VARCHAR(72) NOT NULL DEFAULT ''  COMMENT '资源 ID，登录事件为空字符串',
     `source`      VARCHAR(16) NOT NULL             COMMENT 'ui / api_token',
     `ip_address`  VARCHAR(64) NOT NULL             COMMENT '操作者 IP',
@@ -107,6 +107,7 @@ const (
     ActionDeleted   = "deleted"
     ActionLoggedIn  = "logged_in"
     ActionLoggedOut = "logged_out"
+    ActionLoginFailed = "login_failed"
 )
 
 // Domain 领域
@@ -118,13 +119,14 @@ const (
     DomainMetadata     = "metadata"
 )
 
-// Feature 实体类型（21 个）
+// Feature 实体类型（22 个）
 const (
-    FeatureAuth           = "auth"
+    FeatureSession        = "session"
+    FeatureAccountProfile = "account_profile"
     FeatureToken          = "token"
     FeatureOrg            = "org"
     FeatureOrgMember      = "org_member"
-    FeatureOrgInvite      = "invite"
+    FeatureOrgMemberInvite = "org_member_invite"
     FeatureProject        = "project"
     FeatureProjectMember  = "project_member"
     FeatureChart          = "chart"
@@ -215,7 +217,7 @@ audit.Log(c, audit.DomainAsset, audit.FeatureChart, audit.ActionCreated,
     fmt.Sprint(chart.ID), &audit.Detail{Target: &audit.DetailTarget{Name: chart.Name, Type: "chart"}})
 
 // 登录事件：指定 Account
-audit.Log(c, audit.DomainAccount, audit.FeatureAuth, audit.ActionLoggedIn,
+audit.Log(c, audit.DomainAccount, audit.FeatureSession, audit.ActionLoggedIn,
     "", &audit.Detail{Account: &audit.DetailAccount{Name: accountName}})
 
 // 无额外信息
@@ -409,8 +411,8 @@ func Log(c *gin.Context, domain, feature, action, targetID string, detail *Detai
 
 ```go
 var registered = map[string]map[string]bool{
-    DomainAccount:      {FeatureAuth: true, FeatureToken: true},
-    DomainOrganization: {FeatureOrg: true, FeatureOrgMember: true, FeatureOrgInvite: true},
+    DomainAccount:      {FeatureSession: true, FeatureAccountProfile: true, FeatureToken: true},
+    DomainOrganization: {FeatureOrg: true, FeatureOrgMember: true, FeatureOrgMemberInvite: true},
     DomainProject:      {FeatureProject: true, FeatureProjectMember: true},
     DomainAsset: {
         FeatureChart: true, FeatureDashboard: true, FeatureCohort: true,
@@ -514,7 +516,7 @@ audit.Log(c, audit.DomainAsset, audit.FeatureChart, audit.ActionDeleted,
     fmt.Sprint(chart.ID), &audit.Detail{Target: &audit.DetailTarget{Name: chart.Name, Type: "chart"}})
 
 // 模式 4：登录（在认证 filter 中）
-audit.Log(c, audit.DomainAccount, audit.FeatureAuth, audit.ActionLoggedIn,
+audit.Log(c, audit.DomainAccount, audit.FeatureSession, audit.ActionLoggedIn,
     "", &audit.Detail{Account: &audit.DetailAccount{Name: accountName}})
 ```
 
@@ -524,11 +526,11 @@ audit.Log(c, audit.DomainAccount, audit.FeatureAuth, audit.ActionLoggedIn,
 
 | 实体 | domain | feature | 操作 | 接入位置 |
 |------|--------|---------|------|---------|
-| Account 登录 | account | auth | logged_in/out | Session 认证 filter |
+| Account 登录 | account | session | logged_in/out/login_failed | Session 认证 filter |
 | AccountAPIToken | account | token | created/updated/deleted | apitoken handler |
 | Organization | organization | org | created/updated/deleted | org handler |
 | OrganizationMember | organization | org_member | created/updated/deleted | org member handler |
-| OrganizationInvite | organization | invite | created/deleted | org invite handler |
+| OrganizationInvite | organization | org_member_invite | created/deleted | org invite handler |
 | Project | project | project | created/updated/deleted | project handler |
 | ProjectMember | project | project_member | created/updated/deleted | project member handler |
 | Chart | asset | chart | created/updated/deleted | chart handler |

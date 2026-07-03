@@ -4,7 +4,7 @@
 **创建日期**: 2026-06-26
 **最后更新**: 2026-07-02（方向变更：活动日志 → 审计日志）
 **状态**: 评审中
-**技术方案**: [plan-audit-log.md](./plan-audit-log.md)
+**技术方案**: [plan-doris.md](./plan-doris.md)（Doris 异步攒批，替代原 PG 方案 plan-audit-log.md）
 **评审入口**: [README.md](./README.md)
 
 ---
@@ -100,9 +100,9 @@ CREATE TABLE global.audit_log (
     org_id          INT,                -- NULL = 账号层事件
     project_id      INT,                -- NULL = 组织/账号层事件
     account_id      INT NOT NULL,       -- 操作人，查询时 JOIN global.account
-    action          VARCHAR(64) NOT NULL,  -- created/updated/deleted/logged_in/logged_out
+    action          VARCHAR(64) NOT NULL,  -- created/updated/deleted/logged_in/logged_out/login_failed
     domain          VARCHAR(64) NOT NULL,  -- 粗粒度领域：account/organization/project/asset/metadata
-    feature         VARCHAR(64) NOT NULL,  -- 细粒度实体类型：auth/token/chart/experiment/...
+    feature         VARCHAR(64) NOT NULL,  -- 细粒度实体类型：session/account_profile/token/chart/experiment/...
     target_id       VARCHAR(72),        -- NULL = 登录事件等无资源场景
     source          VARCHAR(16) NOT NULL DEFAULT 'ui',  -- ui / api_token
     ip_address      VARCHAR(64) NOT NULL, -- 操作者 IP（合规刚需）
@@ -117,28 +117,30 @@ CREATE TABLE global.audit_log (
 ### Action 枚举
 
 ```text
-created    创建对象
-updated    修改对象（含状态变更）
-deleted    删除对象
-logged_in  账号登录
-logged_out 账号登出
+created     创建对象
+updated     修改对象（含状态变更）
+deleted     删除对象
+logged_in   账号登录
+logged_out  账号登出
+login_failed 账号登录失败
 ```
 
 所有状态变更（如 launch/enable/pause 等）统一用 `updated` + changes 表达。
 
 ### Domain / Feature 清单
 
-使用 `domain + feature` 两列替代单一 `scope`，5 个 domain × 21 个 entity。domain 对齐 Wave 内部领域模型：
+使用 `domain + feature` 两列替代单一 `scope`，5 个 domain × 22 个 entity。domain 对齐 Wave 内部领域模型：
 
 | domain | feature | 对应实体 | 层级 | 操作 |
 | --- | --- | --- | --- | --- |
-| `account` | `auth` | Account | 账号层 | logged_in / logged_out |
+| `account` | `session` | Account | 账号层 | logged_in / logged_out / login_failed |
+| `account` | `account_profile` | Account | 账号层 | updated |
 | `account` | `token` | AccountAPIToken | 账号层 | created / updated / deleted |
 | `organization` | `org` | Organization | 组织层 | created / updated / deleted |
-| `organization` | `member` | OrganizationMember | 组织层 | created / updated / deleted |
-| `organization` | `invite` | OrganizationInvite | 组织层 | created / deleted |
+| `organization` | `org_member` | OrganizationMember | 组织层 | created / updated / deleted |
+| `organization` | `org_member_invite` | OrganizationInvite | 组织层 | created / deleted |
 | `project` | `project` | Project | 项目层 | created / updated / deleted |
-| `project` | `member` | ProjectMember | 项目层 | created / updated / deleted |
+| `project` | `project_member` | ProjectMember | 项目层 | created / updated / deleted |
 | `asset` | `chart` | Chart | 项目层 | created / updated / deleted |
 | `asset` | `dashboard` | Dashboard | 项目层 | created / updated / deleted |
 | `asset` | `cohort` | Cohort | 项目层 | created / updated / deleted |
@@ -244,7 +246,7 @@ CREATE INDEX idx_alog_account ON global.audit_log (account_id, created_at DESC);
 ### 功能需求
 
 - **FR-001**: 系统 MUST 提供 `global.audit_log` 作为全局统一审计表，按 `created_at` 范围分区
-- **FR-002**: 系统 MUST 记录所有 domain + feature 的管理面操作（created/updated/deleted + logged_in/logged_out），覆盖 5 个 domain × 21 个实体
+- **FR-002**: 系统 MUST 记录所有 domain + feature 的管理面操作（created/updated/deleted + logged_in/logged_out/login_failed），覆盖 5 个 domain × 22 个实体
 - **FR-003**: 系统 MUST 仅记录站外流量（source ∈ {ui, api_token}），内部流量不写入
 - **FR-004**: 审计日志 MUST 包含 `org_id`、`project_id`、`account_id`、`action`、`domain`、`feature`、`target_id`、`ip_address`、`detail`、`created_at`
 - **FR-005**: 系统 MUST 在写入入口校验 domain + feature 合法性，未注册组合拒绝写入
@@ -252,7 +254,7 @@ CREATE INDEX idx_alog_account ON global.audit_log (account_id, created_at DESC);
 - **FR-007**: 系统 MUST 支持通过 OpenAPI 导出 CSV / Excel 格式的审计日志
 - **FR-008**: 写入策略 MUST 为 blocking，审计日志写入失败返回 error
 - **FR-009**: 审计日志 MUST 为 append-only，不可修改、不可删除
-- **FR-010**: 登录/登出事件 MUST 写入审计日志，domain=`account`、feature=`auth`，action=`logged_in` / `logged_out`
+- **FR-010**: 登录/登出/登录失败事件 MUST 写入审计日志，domain=`account`、feature=`session`，action=`logged_in` / `logged_out` / `login_failed`
 
 ### 非功能需求
 
@@ -266,7 +268,7 @@ CREATE INDEX idx_alog_account ON global.audit_log (account_id, created_at DESC);
 
 ## 成功标准
 
-- **SC-001**: 审计日志覆盖 5 domain × 21 feature 的管理面操作（created/updated/deleted + logged_in/logged_out）
+- **SC-001**: 审计日志覆盖 5 domain × 22 feature 的管理面操作（created/updated/deleted + logged_in/logged_out/login_failed）
 - **SC-002**: 仅站外流量写入，内部流量验证不进表
 - **SC-003**: P99 写入延迟 < 50ms
 - **SC-004**: 按 `(project_id, domain, feature, target_id)` 单对象查询 < 1s（P99）
