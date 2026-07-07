@@ -18,7 +18,7 @@ AI 全权负责以下角色，用户只参与需求澄清（Spec 阶段）和最
 
 | 角色 | 职责 | 触发时机 |
 | --- | --- | --- |
-| 架构师 | 审查 spec.md + plan.md，确保架构方案合理 | spec 阶段（生成 plan 时） |
+| 架构师 | 审查 spec.md + plan.md + detail.md（如有），确保方案合理且可落地 | spec 阶段（生成 plan/detail 时） |
 | 开发者 | 按 tasks 实现功能 | dev 阶段 |
 | QA | 冒烟测试、边界测试、E2E 验证 | 每个 task 后 |
 | 代码审查者 | 代码质量、风格一致性 | dev 完成 |
@@ -52,18 +52,22 @@ flowchart LR
         A[提出需求] --> B[AI 澄清问题]
         B --> C[生成 spec]
         C --> D[你审核/迭代 spec]
-        D --> E[生成技术方案 plan]
+        D --> E[生成概要设计 plan]
         E --> F[你审核/迭代 plan]
+        F --> G{是否需要 detail}
+        G -->|复杂变更| H[生成详细设计 detail]
+        H --> I[你审核/迭代 detail]
     end
-    F -->|"你说 '开始开发'"| G[生成 tasks]
+    F -->|"简单变更，你说 '开始开发'"| J[生成 tasks]
+    I -->|"你说 '开始开发'"| J
     subgraph Dev[Dev 阶段 · AI 全自动]
-        G --> H[实现]
-        H --> I[简化+测试]
-        I --> J[代码+安全审查]
-        J --> K[归档+提交]
+        J --> K[实现]
+        K --> L[简化+测试]
+        L --> M[代码+安全审查]
+        M --> N[归档+提交]
     end
-    K --> L[√ 交付体验]
-    L -.->|进入下一 change| A
+    N --> O[√ 交付体验]
+    O -.->|进入下一 change| A
 ```
 
 ### 会话加载
@@ -71,7 +75,7 @@ flowchart LR
 每次新会话启动时，AI 自动执行：
 
 1. 读取 `HABITS.md` — 加载你的工作偏好
-2. 如有活跃 spec（`specs/` 下未归档目录），加载其 `decisions.md` 和 `spec.md`
+2. 如有活跃 spec（`specs/` 下未归档目录），加载其 `decisions.md`、`spec.md`，以及存在时的 `plan.md` / `detail.md`
 3. 检查 `STATUS.md` — 了解项目当前状态
 
 ### Spec 阶段（你控制）
@@ -88,18 +92,24 @@ flowchart LR
    - 关键实体
    - 成功标准
 4. 你审核 spec，可要求修改
-5. AI 生成技术方案 plan.md，覆盖以下维度：
-   - 整体架构（分层、模块划分）
-   - 数据流 / 状态管理方案
-   - 组件树 / 模块结构
-   - API/接口设计（输入输出）
-   - 关键逻辑流程
-   - 技术选型及理由
-6. 你审核技术方案，可要求修改
-7. 你说"开始开发" → 进入 Dev 阶段
+5. AI 生成概要设计 `plan.md`，让人先快速看懂：
+   - 背景与目标
+   - 现状与约束
+   - 顶层方案与取舍
+   - 核心模型 / 主流程
+   - 模块影响与 rollout
+6. 你审核概要设计，可要求修改
+7. 对中大改动，AI 再生成详细设计 `detail.md`，覆盖以下维度：
+   - 影响范围（文件 / 函数）
+   - 数据模型 / API / 配置字段
+   - 事务边界 / 错误处理 / 权限
+   - 关键流程图 / 时序图
+   - 测试策略 / 监控 / 风险补偿
+8. 你审核详细设计，可要求修改
+9. 你说"开始开发" → 进入 Dev 阶段
 ```
 
-**决策即时记录**：以上步骤 2/4/6 中每次与你达成共识的决策，AI 即时追加到 `specs/<目录>/decisions.md`（见「决策记录纪律」）。
+**决策即时记录**：以上步骤 2/4/6/8 中每次与你达成共识的决策，AI 即时追加到 `specs/<目录>/decisions.md`（见「决策记录纪律」）。
 
 **启动方式**：`/speckit.specify <你的需求描述>`
 
@@ -110,7 +120,7 @@ flowchart LR
 ```text
  步骤                   工具/方式                       说明
  ─────────────────────────────────────────────────────────────────
- 1. 生成任务             /speckit.tasks                  生成 tasks.md
+ 1. 生成任务             /speckit.tasks                  基于 plan.md + detail.md（如有）生成 tasks.md
  2. 按序实现             /speckit.implement              每 task 实现后自检
  3. 简化全量变更         simplify (Skill 工具调用)       消除重复、优化质量
  4. 运行测试             make test / npm test / go test  有测试文件时执行，按项目类型选命令
@@ -207,6 +217,8 @@ AI 通过 `HABITS.md` 自动记录你的偏好，你说一次就够了。
 specs/
 ├── YYYYMMDD-Project-TAG-Desc/  # 活跃 spec
 │   ├── spec.md
+│   ├── plan.md
+│   ├── detail.md              # 复杂变更时生成
 │   └── decisions.md
 ├── _archived/                   # 已归档
 └── _template/                   # spec 模板

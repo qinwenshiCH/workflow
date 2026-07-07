@@ -11,11 +11,11 @@ $ARGUMENTS
 
 ## Overview
 
-Create "unit tests for requirements" checklists. Each item tests whether the spec/plan/tasks are well-written, not whether the implementation works.
+Create "unit tests for requirements" checklists. Each item tests whether the spec/plan/detail/tasks are well-written, not whether the implementation works.
 
 ## Steps
 
-1. **Locate**: Detect feature directory from `specs/`. Read `spec.md`, `plan.md`, `tasks.md` for context.
+1. **Locate**: Detect feature directory from `specs/`. Read `spec.md`, `plan.md`, `detail.md` (if exists), `tasks.md` for context.
 
 2. **Clarify intent** (up to 3 questions): Determine domain focus (UX, security, API design, etc.), depth (lightweight vs. formal gate), and audience.
 

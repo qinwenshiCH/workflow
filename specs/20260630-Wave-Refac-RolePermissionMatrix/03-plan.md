@@ -1,7 +1,7 @@
 <!-- /autoplan restore point: /Users/wenshiqin/.gstack/projects/qinwenshiCH-workflow/spec-wave-2606-change_role-autoplan-restore-20260702-180040.md -->
 # 后端技术方案：角色权限底座矩阵更新
 
-**关联 spec**: [spec.md](spec.md)
+**关联 spec**: [01-spec.md](01-spec.md)
 **实施仓库**: `/Users/wenshiqin/wave-worktrees/change_role`
 **日期**: 2026-07-02
 

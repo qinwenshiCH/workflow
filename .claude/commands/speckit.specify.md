@@ -2,9 +2,9 @@
 name: speckit.specify
 description: Create or update a feature specification from a natural language feature description.
 handoffs:
-  - label: Build Technical Plan
+  - label: Build Overview Plan
     agent: speckit.plan
-    prompt: Create a plan for the spec. I am building with...
+    prompt: Create an overview design plan for the spec.
   - label: Clarify Spec Requirements
     agent: speckit.clarify
     prompt: Clarify specification requirements

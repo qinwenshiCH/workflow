@@ -1,6 +1,6 @@
 ---
 name: speckit.analyze
-description: Non-destructive cross-artifact consistency and quality analysis across spec.md, plan.md, and tasks.md.
+description: Non-destructive cross-artifact consistency and quality analysis across spec.md, plan.md, detail.md, and tasks.md.
 ---
 
 ## User Input
@@ -11,11 +11,11 @@ $ARGUMENTS
 
 ## Overview
 
-Identify inconsistencies, gaps, and quality issues across the three core artifacts. READ-ONLY — never modifies files.
+Identify inconsistencies, gaps, and quality issues across the core artifacts. READ-ONLY — never modifies files.
 
 ## Steps
 
-1. **Locate**: Detect feature directory from `specs/` (latest or by name). Read `spec.md`, `plan.md`, `tasks.md`. Also load `CLAUDE.md` for constitution rules.
+1. **Locate**: Detect feature directory from `specs/` (latest or by name). Read `spec.md`, `plan.md`, `detail.md` (if exists), `tasks.md`. Also load `CLAUDE.md` for constitution rules.
 
 2. **Build semantic models**:
    - Requirements inventory from spec (functional + non-functional)

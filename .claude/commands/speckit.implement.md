@@ -19,11 +19,12 @@ Read `CLAUDE.md` workflow section for quality gate requirements (make precheck, 
 
 ## Steps
 
-1. **Locate**: Detect feature directory. Read `tasks.md`, `plan.md`, `data-model.md` (if exists).
+1. **Locate**: Detect feature directory. Read `tasks.md`, `plan.md`, `detail.md` (if exists), `data-model.md` (if exists).
 
 2. **Analyze tasks**:
    - Extract phases, dependencies, parallel markers
    - Note sequential vs. parallel execution rules
+   - If `detail.md` exists, use it as the primary source for implementation specifics
 
 3. **For each phase, for each task**:
 

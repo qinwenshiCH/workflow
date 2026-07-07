@@ -2,9 +2,9 @@
 name: speckit.clarify
 description: Identify underspecified areas in the current feature spec by asking up to 5 targeted clarification questions and encoding answers back into the spec.
 handoffs:
-  - label: Build Technical Plan
+  - label: Build Overview Plan
     agent: speckit.plan
-    prompt: Create a plan for the spec. I am building with...
+    prompt: Create an overview design plan for the spec.
 ---
 
 ## User Input
