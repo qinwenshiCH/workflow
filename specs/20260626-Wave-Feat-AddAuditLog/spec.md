@@ -159,24 +159,29 @@ login_failed 账号登录失败
 
 ### Detail 结构
 
-V1 的 `detail` 固定为“版本化的最小对象摘要 envelope”，不是通用 diff 引擎：
+V1 的 `detail` 固定为统一版本化 envelope，两方案（PG / Doris）使用同一结构：
 
 ```json
 {
-    "schema_version": 1,
-    "snapshot": {"id": "34", "name": "增长看板", "visibility": "project"},
-    "comment": "dashboard charts updated",
-    "extra": {"chart_ids": [1, 2, 3]}
+    “schema_version”: 1,
+    “account”: {“id”: 123, “name”: “张三”},
+    “target”: {“id”: “34”, “name”: “增长看板”, “type”: “dashboard”, “visibility”: “project”},
+    “comment”: “dashboard charts updated”,
+    “extra”: {“chart_ids”: [1, 2, 3]}
 }
 ```
 
 - `schema_version`: 固定版本号，当前为 `1`，后续只做 add-only 扩展
-- `snapshot`: 过滤后的对象摘要；`update` 场景直接记录 after 摘要
-- `comment`: 可选的人类可读说明，不额外查库生成
+- `account`: 操作时的 actor 快照（`id` + `name`），由 audit.Log 传入时记录
+- `target`: 过滤后的被操作资源摘要；`update` 场景直接记录 after 摘要；至少保留 `id` + `name`
+- `comment`: 可选的人类可读说明，只放调用点天然已知的信息，不额外查库
 - `extra`: 批量对象列表或事件专属扩展
 - `detail` 是可选字段；不为了构造它额外查库
-- 敏感字段值替换为 `"masked"` 或直接删除
+- 敏感字段值替换为 `”masked”` 或直接删除
 - 如后续确有审计机构要求字段级变化，再按需追加 `changes[]` 或 `before_snapshot`
+- 单条 detail 大小预算 64KB，超限逐级裁剪（先丢 extra → 再缩短 comment → 最后截断 snapshot）
+
+**账号名说明**：detail.account.name 记录的是操作发生时的名字（审计证据），不是当前名。PG 读侧可通过 JOIN `global.account` 额外补充当前名作为辅助，但审计导出以 detail.account.name 为准。
 
 ### 索引设计
 
@@ -190,7 +195,8 @@ CREATE INDEX idx_alog_account_time ON global.audit_log (account_id, occurred_at 
 
 - 高频路径是 `org/project + time range` 的查询和导出
 - `target_id` 过滤在 scoped 时间范围内完成，V1 不为它单独建复合索引
-- 只有当“按对象查历史”成为真实高频流量时，再补 scoped target 索引
+- 只有当”按对象查历史”成为真实高频流量时，再补 scoped target 索引
+- PG V1 维持 3 个高频索引不动，不新增也不删减；Doris 使用 `(occurred_at, org_id, project_id, account_id)` 作为 DUPLICATE KEY 前缀列
 
 ---
 
@@ -232,12 +238,13 @@ CREATE INDEX idx_alog_account_time ON global.audit_log (account_id, occurred_at 
 
 ## 边界与异常处理
 
-- **单条 detail 大小预算**：64KB，超限截断并记录 warning
+- **单条 detail 大小预算**：64KB（JSON 序列化后），超限时逐级裁剪（先丢 extra → 缩短 comment → 截断 snapshot 为最小摘要），裁剪过程记录 warning metric，不允许因超限丢弃整条记录
 - **同对象高频操作**：每条独立记录，不合并去重
 - **缺少 IP 的请求**：审计写入视为非法，记录 critical 告警；不回滚已成功的业务操作
 - **未注册的 domain + feature 组合**：写入入口直接拒绝
 - **Append-only**：不可修改、不可删除
 - **批量写入**：上限 500 行/批；失败批次进入 spool / replay，不允许静默丢弃
+- **IP 地址获取**：依赖 gin 的 `c.ClientIP()` + `TrustedProxies` 配置；需在 `server.go` 中设置可信代理 CIDR 范围，确保经过反向代理时仍能获取真实客户端 IP
 - **分区管理**：超出保留期限的分区 DROP 或 detach 归档
 
 ---

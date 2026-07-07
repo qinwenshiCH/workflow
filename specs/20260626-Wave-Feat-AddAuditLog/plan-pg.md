@@ -20,7 +20,6 @@ PG 方案的 V1 范围收敛为四件事：
 V1 明确不做：
 
 - 通用 `changes[]` diff 引擎
-- actor 快照 / 邮箱快照
 - 前端审计页面
 - 事务内强一致同步写审计
 - 为 `target_id` 单独建高成本复合索引
@@ -55,7 +54,7 @@ V1 明确不做：
 | 登录 / 登出不在 auth middleware 内完成 | `apps/web/controller/account/account.go:70-114`、`pkg/ginx/middleware/session.go:19-127` | `logged_in / logged_out / login_failed` 应在 `controller/account` 写审计，不应写在认证 filter |
 | 服务启动 / 关闭有明确初始化点 | `apps/web/server.go:175-229`、`304-312`、`391-399`、`402-429` | 审计 writer 可以自然接入 `initService()` 与退出 drain 顺序 |
 | 现有异步 writer 满队列会丢数据 | `pkg/qm/async_batch_writer.go:87-110`、`113-136` | 可以借生命周期模式，但不能直接复用实现 |
-| 读侧已有批量补当前账号名模式 | `apps/web/service/account/account.go:390-408`、`apps/web/op/service/audit.go:128-158` | 审计导出不需要存 actor 快照，读侧补当前名就够 |
+| 读侧已有批量补当前账号名模式 | `apps/web/service/account/account.go:390-408`、`apps/web/op/service/audit.go:128-158` | detail.account 存当时名快照（审计证据）；读侧可额外 JOIN 补当前名作为辅助 |
 | MCP 已注入 `Aid / Token / IsAccountAPIToken / Pid` | `apps/web/mcp/server.go:221-281` | MCP 只要补 `client_ip` 即可复用同一套审计 writer |
 
 ---
@@ -92,14 +91,15 @@ V1 明确不做：
 - 事件：`event_id / domain / feature / target_id / action / source`
 - 证据：`ip_address / detail / occurred_at / created_at`
 
-`detail` 只保留版本化 envelope：
+`detail` 统一版本化 envelope（与 Doris 方案对齐）：
 
 - `schema_version`
-- `snapshot`
+- `account`（actor 快照：id + name）
+- `target`（资源摘要：id + name + type + 业务字段）
 - `comment`
 - `extra`
 
-这满足“能解释变更对象”，但不引入额外查库和 diff 计算。
+detail.account 记录操作时的名字（审计证据），不是当前名。读取时可通过 JOIN `global.account` 额外补当前名作为辅助，但导出默认以 detail.account.name 为准。
 
 ---
 

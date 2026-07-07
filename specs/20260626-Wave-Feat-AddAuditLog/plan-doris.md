@@ -47,7 +47,8 @@ flowchart LR
 CREATE DATABASE IF NOT EXISTS sw_dw_global;
 
 CREATE TABLE IF NOT EXISTS sw_dw_global.audit_log (
-    `created_at`  DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '记录时间',
+    `occurred_at` DATETIME(6) NOT NULL             COMMENT '事件实际发生时间',
+    `event_id`    VARCHAR(36) NOT NULL             COMMENT '稳定事件标识，用于对账与幂等',
     `org_id`      BIGINT      NOT NULL DEFAULT 0   COMMENT '组织 ID，0=无组织归属',
     `project_id`  BIGINT      NOT NULL DEFAULT 0   COMMENT '项目 ID，0=无项目归属',
     `account_id`  BIGINT      NOT NULL             COMMENT '操作人 account_id',
@@ -55,11 +56,12 @@ CREATE TABLE IF NOT EXISTS sw_dw_global.audit_log (
     `domain`      VARCHAR(32) NOT NULL             COMMENT 'account/organization/project/asset/metadata',
     `feature`     VARCHAR(32) NOT NULL             COMMENT 'session/account_profile/token/chart/experiment/...',
     `target_id`   VARCHAR(72) NOT NULL DEFAULT ''  COMMENT '资源 ID，登录事件为空字符串',
-    `source`      VARCHAR(16) NOT NULL             COMMENT 'ui / api_token',
+    `source`      VARCHAR(16) NOT NULL             COMMENT 'ui / api_token / mcp',
     `ip_address`  VARCHAR(64) NOT NULL             COMMENT '操作者 IP',
-    `detail`      JSON        NULL                 COMMENT '{"account":{"name":"..."},"target":{"name":"...","type":"..."},"comment":"...","changes":[...],"extra":{}}'
+    `created_at`  DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '入库时间',
+    `detail`      JSON        NULL                 COMMENT '{"schema_version":1,"account":{"id":"...","name":"..."},"target":{"id":"...","name":"...","type":"..."},"comment":"...","extra":{}}'
 ) ENGINE=OLAP
-DUPLICATE KEY(`created_at`, `org_id`, `project_id`, `account_id`)
+DUPLICATE KEY(`occurred_at`, `org_id`, `project_id`, `account_id`)
 AUTO PARTITION BY RANGE (date_trunc(`created_at`, 'month')) ()
 DISTRIBUTED BY HASH(`account_id`) BUCKETS AUTO
 PROPERTIES (
@@ -72,10 +74,12 @@ PROPERTIES (
 
 | 决策 | 理由 |
 |------|------|
-| **DUPLICATE KEY**（非 UNIQUE） | 审计日志 append-only，无更新，DUPLICATE 模型写入最快 |
+| **DUPLICATE KEY**（非 UNIQUE） | 审计日志 append-only，无更新，DUPLICATE 模型写入最快；`occurred_at` 作为前缀第一列匹配高频查询路径 |
 | **AUTO PARTITION BY RANGE 按月** | 自动创建/删除分区，无需运维脚本 |
 | **DISTRIBUTED BY HASH(account_id)** | 按人查询是最常见过滤维度 |
-| **detail 用 JSON 类型** | 嵌套分组（account/target/changes/extra），Doris `json_extract` 可按 key 查询 |
+| **occurred_at 入 DUPLICATE KEY** | 替代原 `created_at`，确保事件时间是有序前缀，查询和导出默认按 `occurred_at` 排序 |
+| **event_id NOT NULL** | 稳定事件标识，用于导出对账；配合 Stream Load Label 实现写入幂等 |
+| **detail 用 JSON 类型** | 统一版本化 envelope（schema_version/account/target/comment/extra）；Doris `json_extract` 可按 key 查询 |
 | **org_id/project_id DEFAULT 0** | Doris 不支持 NULL，用 0 表示"无归属" |
 | **ZSTD 压缩** | 列存在 5-10x 压缩比 |
 | **独立数据库 sw_dw_global** | 审计日志跨项目，不放入项目数据库 |
@@ -149,6 +153,7 @@ const (
 const (
     SourceUI       = "ui"
     SourceAPIToken = "api_token"
+    SourceMCP      = "mcp"
 )
 ```
 
@@ -157,46 +162,41 @@ const (
 ```go
 // Entry 一条审计日志
 type Entry struct {
-    CreatedAt time.Time `json:"created_at"`
-    OrgID     int64     `json:"org_id"`
-    ProjectID int64     `json:"project_id"`
-    AccountID int64     `json:"account_id"`
-    Action    string    `json:"action"`
-    Domain    string    `json:"domain"`
-    Feature   string    `json:"feature"`
-    TargetID  string    `json:"target_id"`
-    Source    string    `json:"source"`
-    IPAddress string    `json:"ip_address"`
-    Detail    *Detail   `json:"detail"`
+    OccurredAt time.Time `json:"occurred_at"`   // 事件实际发生时间
+    EventID    string    `json:"event_id"`       // 稳定事件标识（UUID），幂等与对账
+    OrgID      int64     `json:"org_id"`
+    ProjectID  int64     `json:"project_id"`
+    AccountID  int64     `json:"account_id"`
+    Action     string    `json:"action"`
+    Domain     string    `json:"domain"`
+    Feature    string    `json:"feature"`
+    TargetID   string    `json:"target_id"`
+    Source     string    `json:"source"`
+    IPAddress  string    `json:"ip_address"`
+    CreatedAt  time.Time `json:"created_at"`
+    Detail     *Detail   `json:"detail"`
 }
 
-// Detail 审计详情。顶层 key 为语义分组，未来按需扩展。
+// Detail 审计详情。统一版本化 envelope，满足 future extension。
 type Detail struct {
-    Account *DetailAccount  `json:"account,omitempty"` // 操作人快照
-    Target  *DetailTarget   `json:"target,omitempty"`  // 被操作资源快照
-    Comment string          `json:"comment,omitempty"` // 可选备注
-    Changes []ChangeEntry   `json:"changes,omitempty"` // V2：字段级变更
-    Extra   json.RawMessage `json:"extra,omitempty"`   // 事件专属扩展
+    SchemaVersion int            `json:"schema_version"`          // 当前固定为 1
+    Account       *DetailAccount `json:"account,omitempty"`       // 操作时 actor 快照
+    Target        *DetailTarget  `json:"target,omitempty"`        // 被操作资源快照
+    Comment       string         `json:"comment,omitempty"`       // 可选备注
+    Extra         json.RawMessage `json:"extra,omitempty"`        // 事件专属扩展
 }
 
-// DetailAccount 操作人快照
+// DetailAccount 操作人快照（当时名，审计证据）
 type DetailAccount struct {
-    Name  string `json:"name,omitempty"`
-    Email string `json:"email,omitempty"`
+    ID   string `json:"id"`
+    Name string `json:"name,omitempty"`
 }
 
 // DetailTarget 被操作资源快照
 type DetailTarget struct {
+    ID   string `json:"id"`
     Name string `json:"name,omitempty"`
     Type string `json:"type,omitempty"` // feature 常量值："chart" / "dashboard" / "experiment" ...
-}
-
-// ChangeEntry 单字段变更（V2 预留）
-type ChangeEntry struct {
-    Field  string `json:"field"`
-    Action string `json:"action"` // "created" / "changed" / "deleted"
-    Before any    `json:"before,omitempty"`
-    After  any    `json:"after,omitempty"`
 }
 ```
 
@@ -236,10 +236,11 @@ source 判断逻辑：
 | 场景 | source |
 |------|--------|
 | `pvctx.IsAccountAPIToken()` 返回 true | `"api_token"` |
-| Session 认证（Cookie / Bearer JWT） | `"ui"` |
+| Session 认证（Cookie / Bearer JWT）且请求来自 `apps/web/mcp/server.go` | `"mcp"` |
+| Session 认证（Cookie / Bearer JWT）且请求来自 gin 路由 | `"ui"` |
 | `pvctx.Aid()` 返回 0 | 不写审计（白名单路由 / 未认证） |
 
-后续如有 MCP 等新来源，在 `pvctx` 中新增通用 source 字段后，`Log()` 优先读取即可。
+MCP 入口（`apps/web/mcp/server.go`）鉴权完成后显式注入 `source = mcp` 标记，不与 gin middleware 共用。具体实现：在 MCP 的 `contextInjectionHandler` 中增加 `pvctx.WithAuditSource(ctx, "mcp")` 或直接在 `Log()` 中按入口识别。
 
 ---
 
@@ -249,113 +250,43 @@ source 判断逻辑：
 
 借鉴 `asset/behavior.go` 的攒批模式，简化为单一全局 batcher：
 
-```go
-// writer.go
-package audit
-
-import (
-    "context"
-    "encoding/json"
-    "sync"
-    "time"
-    "wave/pkg/dal/dorisx"
-    "wave/pkg/lib/ulog"
-)
-
-const (
-    defaultBatchSize     = 100
-    defaultFlushInterval = 5 * time.Second
-    channelBuffer        = 1000
-)
-
-type writer struct {
-    ch           chan *Entry
-    stopCh       chan struct{}
-    doneCh       chan struct{}
-    streamLoader *dorisx.StreamLoader
-}
-
-var (
-    writerInstance *writer
-    writerOnce     sync.Once
-)
-
-func getWriter() *writer {
-    writerOnce.Do(func() {
-        dorisCfg := config.Inf.GetDoris()
-        w := &writer{
-            ch:     make(chan *Entry, channelBuffer),
-            stopCh: make(chan struct{}),
-            doneCh: make(chan struct{}),
-            streamLoader: &dorisx.StreamLoader{
-                Url:           dorisCfg.HttpHost + "/api/sw_dw_global/audit_log/_stream_load",
-                DorisUsername: dorisCfg.User,
-                DorisPassword: dorisCfg.Password,
-            },
-        }
-        go w.backgroundFlush()
-        writerInstance = w
-    })
-    return writerInstance
-}
-
-func (w *writer) backgroundFlush() {
-    defer close(w.doneCh)
-    batch := make([]*Entry, 0, defaultBatchSize)
-    timer := time.NewTimer(defaultFlushInterval)
-    defer timer.Stop()
-
-    flush := func() {
-        if len(batch) == 0 {
-            return
-        }
-        data, err := json.Marshal(batch)
-        if err != nil {
-            ulog.Errorf("[audit] marshal batch failed: %v", err)
-            batch = batch[:0]
-            return
-        }
-        if err := w.streamLoader.Load(context.Background(), data); err != nil {
-            ulog.Errorf("[audit] stream load failed: %v", err)
-            // 失败不重试——单批次丢失可接受，合规审计关注的是长期覆盖率
-        }
-        batch = batch[:0]
-    }
-
-    for {
-        select {
-        case e := <-w.ch:
-            batch = append(batch, e)
-            if len(batch) >= defaultBatchSize {
-                flush()
-                timer.Reset(defaultFlushInterval)
-            }
-        case <-timer.C:
-            flush()
-            timer.Reset(defaultFlushInterval)
-        case <-w.stopCh:
-            // Graceful shutdown：排空 channel
-            for {
-                select {
-                case e := <-w.ch:
-                    batch = append(batch, e)
-                    if len(batch) >= defaultBatchSize {
-                        flush()
-                    }
-                default:
-                    flush()
-                    return
-                }
-            }
-        }
-    }
-}
-
-func (w *writer) Close() {
-    close(w.stopCh)
-    <-w.doneCh
-}
+```text
+                 ┌──────────────────────┐
+Log(ctx) ──►     │   channel            │
+  enqueue        │   buffer=1000        │
+  ├─ channel OK  │                      │
+  └─ full→spool  └──────┬───────────────┘
+                         │
+               ┌────────▼────────┐
+               │ backgroundFlush │ ── ticker 5s / batch=100
+               │ goroutine       │
+               └────────┬────────┘
+                        │
+               ┌────────▼────────┐
+               │ StreamLoader    │ ── Label(label) + HTTP PUT JSON
+               │ 幂等保证        │ ── Label Already Exists → skip
+               └─────────────────┘
 ```
+
+实现要点：
+
+- `Log()` enqueue 到 channel；channel 满时直接写 spool（见 §5.5），不静默丢弃
+- `backgroundFlush` 定时器触发（5s）或攒满 100 条时，序列化 batch 为 JSON
+- 每次 flush 前生成稳定 label：`audit_log_{date}_{hash[:8]}`，保证幂等
+- Doris 返回 `Label Already Exists` 视为成功（重试场景），仅 info log
+- Stream Load 真实失败时，整批写 spool（`fallbackWrite`），由 `fallbackReplay` 周期回放
+- 需要在 `dorisx.StreamLoader` 中补 `WithLabel(label)` 方法
+- `Close()` 排空 channel 后结束 goroutine
+
+配置项：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `channelBuffer` | 1000 | channel 容量，满时降级到 spool |
+| `defaultBatchSize` | 100 | 单批最大行数 |
+| `defaultFlushInterval` | 5s | 定时 flush 间隔 |
+| `spoolMaxBytes` | 50MB | spool 文件上限 |
+| `replayInterval` | 30s | spool 回放间隔 |
 
 ### 5.2 Log 函数实现
 
@@ -380,29 +311,44 @@ func Log(c *gin.Context, domain, feature, action, targetID string, detail *Detai
     }
 
     source := SourceUI
-    if pvctx.IsAccountAPIToken(ctx) {
+    switch {
+    case pvctx.IsAccountAPIToken(ctx):
         source = SourceAPIToken
+    case isMCPRequest(ctx):    // MCP 入口显式注入标记
+        source = SourceMCP
     }
+
+    // 64KB 裁剪
+    detail = clipDetail(detail)
 
     entry := &Entry{
-        CreatedAt: time.Now(),
-        OrgID:     pvctx.OrgID(ctx),
-        ProjectID: pvctx.Pid(ctx),
-        AccountID: aid,
-        Action:    action,
-        Domain:    domain,
-        Feature:   feature,
-        TargetID:  targetID,
-        Source:    source,
-        IPAddress: ip,
-        Detail:    detail,
+        OccurredAt: time.Now(),
+        EventID:    uuid.New().String(),
+        OrgID:      pvctx.OrgID(ctx),
+        ProjectID:  pvctx.Pid(ctx),
+        AccountID:  aid,
+        Action:     action,
+        Domain:     domain,
+        Feature:    feature,
+        TargetID:   targetID,
+        Source:     source,
+        IPAddress:  ip,
+        CreatedAt:  time.Now(),
+        Detail:     detail,
     }
 
+    // 先尝试入 channel，失败则立即写 spool（不静默丢弃）
     select {
     case getWriter().ch <- entry:
         // 写入成功
     default:
-        ulog.Warnf("[audit] channel full, entry dropped. account=%d action=%s", aid, action)
+        // channel 满 → 直接写 spool
+        if err := spoolWrite(entry); err != nil {
+            ulog.Errorf("[audit] channel full and spool write failed, entry dropped. account=%d action=%s err=%v", aid, action, err)
+            metrics.Counter("audit_spool_overflow_total", 1)
+        } else {
+            ulog.Warnf("[audit] channel full, entry written to spool. account=%d action=%s", aid, action)
+        }
     }
 }
 ```
@@ -503,30 +449,51 @@ func (h *ChartHandler) Create(c *gin.Context) {
         return err
     }
     audit.Log(c, audit.DomainAsset, audit.FeatureChart, audit.ActionCreated,
-        fmt.Sprint(chart.ID), &audit.Detail{Target: &audit.DetailTarget{Name: chart.Name, Type: "chart"}})
+        fmt.Sprint(chart.ID), &audit.Detail{
+            SchemaVersion: 1,
+            Account: &audit.DetailAccount{ID: fmt.Sprint(pvctx.Aid(ctx)), Name: pvctx.Aname(ctx)},
+            Target: &audit.DetailTarget{ID: fmt.Sprint(chart.ID), Name: chart.Name, Type: "chart"},
+        })
     return chart
 }
 
 // 模式 2：Update
 audit.Log(c, audit.DomainAsset, audit.FeatureChart, audit.ActionUpdated,
-    fmt.Sprint(chart.ID), &audit.Detail{Target: &audit.DetailTarget{Name: chart.Name, Type: "chart"}})
+    fmt.Sprint(chart.ID), &audit.Detail{
+        SchemaVersion: 1,
+        Account: &audit.DetailAccount{ID: fmt.Sprint(aid), Name: aname},
+        Target: &audit.DetailTarget{ID: fmt.Sprint(chart.ID), Name: chart.Name, Type: "chart"},
+    })
 
 // 模式 3：Delete（在删除前调用，保留资源名称）
 audit.Log(c, audit.DomainAsset, audit.FeatureChart, audit.ActionDeleted,
-    fmt.Sprint(chart.ID), &audit.Detail{Target: &audit.DetailTarget{Name: chart.Name, Type: "chart"}})
+    fmt.Sprint(chart.ID), &audit.Detail{
+        SchemaVersion: 1,
+        Account: &audit.DetailAccount{ID: fmt.Sprint(aid), Name: aname},
+        Target: &audit.DetailTarget{ID: fmt.Sprint(chart.ID), Name: chart.Name, Type: "chart"},
+    })
 
-// 模式 4：登录（在认证 filter 中）
+// 模式 4：登录（在 controller/account 中，不在 session filter）
+// LoginAccount 成功返回前：
 audit.Log(c, audit.DomainAccount, audit.FeatureSession, audit.ActionLoggedIn,
-    "", &audit.Detail{Account: &audit.DetailAccount{Name: accountName}})
+    "", &audit.Detail{
+        SchemaVersion: 1,
+        Account: &audit.DetailAccount{ID: fmt.Sprint(accountInfo.ID), Name: accountInfo.Name},
+    })
+
+// 模式 5：login_failed（LoginValidate 错误路径）
+audit.Log(c, audit.DomainAccount, audit.FeatureSession, audit.ActionLoginFailed,
+    "", &audit.Detail{SchemaVersion: 1})
 ```
 
-### 6.2 接入清单（按 Phase）
+### 6.2 接入清单（一期全部接入，22 feature）
 
-**Phase 1（高价值对象）**：
+一期一次性接入全部 5 domain × 22 feature 的管理面操作：
 
 | 实体 | domain | feature | 操作 | 接入位置 |
 |------|--------|---------|------|---------|
-| Account 登录 | account | session | logged_in/out/login_failed | Session 认证 filter |
+| Account 登录 | account | session | logged_in/out/login_failed | controller/account（不在 session filter） |
+| Account 信息 | account | account_profile | updated | controller/account |
 | AccountAPIToken | account | token | created/updated/deleted | apitoken handler |
 | Organization | organization | org | created/updated/deleted | org handler |
 | OrganizationMember | organization | org_member | created/updated/deleted | org member handler |
@@ -536,27 +503,17 @@ audit.Log(c, audit.DomainAccount, audit.FeatureSession, audit.ActionLoggedIn,
 | Chart | asset | chart | created/updated/deleted | chart handler |
 | Dashboard | asset | dashboard | created/updated/deleted | dashboard handler |
 | Cohort | asset | cohort | created/updated/deleted | cohort handler |
-
-**Phase 2（长尾对象）**：
-
-| 实体 | domain | feature | 操作 |
-|------|--------|---------|------|
-| Pipeline | asset | pipeline | created/updated/deleted |
-| Campaign | asset | campaign | created/updated |
-| Experiment | asset | experiment | created/updated/deleted |
-| FeatureGate | asset | feature_gate | created/updated/deleted |
-| FeatureConfig | asset | feature_config | created/updated/deleted |
-| Metric | metadata | metric | created/updated/deleted |
-
-**Phase 3（元数据补齐）**：
-
-| 实体 | domain | feature | 操作 |
-|------|--------|---------|------|
-| TrackedEvent | metadata | tracked_event | created/updated/deleted |
-| VirtualEvent | metadata | virtual_event | created/updated/deleted |
-| EventProperty | metadata | event_property | created/updated/deleted |
-| UserProperty | metadata | user_property | created/updated/deleted |
-| VirtualProperty | metadata | virtual_property | created/updated/deleted |
+| Pipeline | asset | pipeline | created/updated/deleted | pipeline handler |
+| Campaign | asset | campaign | created/updated | campaign handler |
+| Experiment | asset | experiment | created/updated/deleted | experiment handler |
+| FeatureGate | asset | feature_gate | created/updated/deleted | experiment handler |
+| FeatureConfig | asset | feature_config | created/updated/deleted | experiment handler |
+| Metric | metadata | metric | created/updated/deleted | metadata handler |
+| TrackedEvent | metadata | tracked_event | created/updated/deleted | metadata handler |
+| VirtualEvent | metadata | virtual_event | created/updated/deleted | metadata handler |
+| EventProperty | metadata | event_property | created/updated/deleted | metadata handler |
+| UserProperty | metadata | user_property | created/updated/deleted | metadata handler |
+| VirtualProperty | metadata | virtual_property | created/updated/deleted | metadata handler |
 
 ### 6.3 接入原则
 
@@ -615,7 +572,7 @@ func List(ctx context.Context, q *Query) (*QueryResult, error) {
 
 ```sql
 SELECT
-    a.created_at,
+    a.occurred_at, a.event_id,
     a.org_id, a.project_id, a.account_id,
     a.action, a.domain, a.feature, a.target_id,
     a.source, a.ip_address, a.detail,
@@ -624,12 +581,12 @@ FROM sw_dw_global.audit_log a
 LEFT JOIN sw_dw_global.account acc ON a.account_id = acc.id
 WHERE a.project_id = ?
   AND a.domain = ?
-  AND a.created_at < ?
-ORDER BY a.created_at DESC
+  AND a.occurred_at < ?
+ORDER BY a.occurred_at DESC
 LIMIT ?;
 ```
 
-> **注意**：`sw_dw_global.account` 需要通过 Doris 的 External Catalog 或定时同步从 PostgreSQL 同步 account 表。V1 阶段 account_name 可以从 detail.name 中提取（登录事件已记录），或在查询时通过应用层 JOIN。
+> **注意**：Doris 方案默认以 detail.account.name 作为 account_name（审计证据，当时名），不需要额外 JOIN。如需要当前名（辅助），可通过 Doris External Catalog 挂载 PG `global.account` 表，或应用层按 `account_id` 批量补齐。
 
 ### 7.3 导出接口
 
@@ -645,11 +602,12 @@ func Export(ctx context.Context, q *Query, format string) ([]byte, string, error
 
 ### 7.4 索引与查询性能
 
-Doris DUPLICATE KEY 的前缀列天然有序，以下查询走前缀索引：
+DUPLICATE KEY `(occurred_at, org_id, project_id, account_id)` 的前缀列天然有序，以下查询走前缀索引：
 
 | 查询模式 | 索引命中 |
 |---------|---------|
-| 按时间范围查询 | 前缀第 1 列 ✅ |
+| 按时间范围查询 | 前缀第 1 列（occurred_at）✅ |
+| 按时间+组织查询 | 前缀第 1-2 列 ✅ |
 | 按时间+项目查询 | 前缀第 1-3 列 ✅ |
 | 按时间+账号查询 | 前缀第 1+4 列（跳 project_id，需 Bloom Filter 辅助） |
 
@@ -661,14 +619,15 @@ Doris DUPLICATE KEY 的前缀列天然有序，以下查询走前缀索引：
 
 | 场景 | 策略 | 理由 |
 |------|------|------|
-| channel 满 | drop + warn | 审计日志非关键路径，不影响业务 |
-| Stream Load 失败 | log error，不重试 | 单批次丢失可接受；SOC 2 要求"合理保证"，非"绝对保证" |
+| channel 满 | 直接写入 spool 文件（不静默丢弃） | 审计不允许静默丢失；spool 有界，超限告警 |
+| Stream Load 失败（首次） | 整批写入本地 spool + error log + retry | fallbackWrite 持久化到磁盘，replay 重试 |
+| Stream Load Label Already Exists | info log + skip | 幂等机制正常触发，数据已到达 |
 | 未认证 (aid==0) | debug log + skip | 白名单路由 / 内部流量不应写审计 |
-| 无 IP | warn log + skip | 不完整的审计记录没有价值 |
-| 未注册 domain/feature | warn log + skip | 防止 typo 污染数据 |
-| Doris 不可达 | Stream Load 超时后 error log | channel 继续缓冲直到满，之后 drop |
+| 无 IP | critical warn + skip（不回滚业务） | 不合规的审计输入，必须告警 |
+| 未注册 domain/feature | warn + skip | 防止 typo 污染数据 |
+| Doris 不可达 | Stream Load 超时 + spool write | channel 继续缓冲直到满，之后写 spool |
 | Graceful shutdown | 排空 channel 剩余数据再关闭 | 正常重启零丢失 |
-| Stream Load 持续失败 | 写入本地磁盘 fallback 文件，恢复后回放 | 防止长时间 Doris 不可达导致持续丢数据 |
+| Spool 超限（50MB） | 停止写入 + 高优告警 | 运维保护，不是第二数据库 |
 
 **与 blocking 方案的对比**：
 
@@ -758,7 +717,8 @@ curl -X PUT "http://{doris_http_host}/api/sw_dw_global/audit_log/_stream_load" \
   -H "Authorization: Bearer $(echo -n 'user:password' | base64)" \
   -H "format: json" \
   -H "strip_outer_array: true" \
-  -d '[{"created_at":"2026-07-03 12:00:00","org_id":0,"project_id":0,"account_id":1,"action":"logged_in","domain":"account","feature":"session","target_id":"","source":"ui","ip_address":"127.0.0.1"}]'
+  -H "label: audit_log_manual_verify_001" \
+  -d '[{"occurred_at":"2026-07-03 12:00:00","event_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","org_id":0,"project_id":0,"account_id":1,"action":"logged_in","domain":"account","feature":"session","target_id":"","source":"ui","ip_address":"127.0.0.1","detail":{"schema_version":1,"account":{"id":"1","name":"测试用户"}}}]'
 ```
 
 ### 11.2 数据库命名
@@ -786,14 +746,14 @@ func initAuditLogDatabase() {
 // query.go
 func List(ctx context.Context, params QueryParams) ([]Entry, string, error) {
     conn := dorisx.DB.GetGlobalDB()
-    conn.ExecContext(ctx, "USE sw_dw_global") // ponytail: global DB，不走 UseDB helper
-    
+    conn.ExecContext(ctx, "USE sw_dw_global")
+
     rows, err := conn.QueryContext(ctx, `
-        SELECT created_at, org_id, project_id, account_id, action, domain, feature,
-               target_id, source, ip_address, detail
+        SELECT occurred_at, event_id, org_id, project_id, account_id, action,
+               domain, feature, target_id, source, ip_address, detail
         FROM audit_log
-        WHERE account_id = ? AND created_at < ?
-        ORDER BY created_at DESC
+        WHERE account_id = ? AND occurred_at < ?
+        ORDER BY occurred_at DESC
         LIMIT ?
     `, params.AccountID, params.Cursor, params.PageSize+1)
     // ...
@@ -817,6 +777,14 @@ Stream Load 写入结果通过 `StreamLoader.Load()` 返回值上报。建议在
 
 Wave 现有监控体系（Prometheus metrics + Grafana）已有 metric 注册机制，在 flush 中加 3 行 counter 即可。
 
+### 11.6 Client IP 与反向代理
+
+详见 [detail-pg.md §3.8](./detail-pg.md)。两方案共享同一配置。
+
+### 11.7 Detail 大小裁剪
+
+单条 detail（JSON 序列化后）上限 64KB，逐级裁剪规则与 PG 方案一致。详见 [detail-pg.md §3.7](./detail-pg.md)。
+
 ---
 
 ## 十二、交付计划
@@ -825,35 +793,30 @@ Wave 现有监控体系（Prometheus metrics + Grafana）已有 metric 注册机
 
 - [ ] ~~创建~~ DDL 已内置在 `auditLogDDL` Go 常量中（`CREATE DATABASE IF NOT EXISTS` + `CREATE TABLE IF NOT EXISTS`）
 - [ ] 创建 `apps/web/audit/` 包（audit.go + writer.go + query.go）
+- [ ] 补充 `dorisx.StreamLoader.WithLabel(label)` 方法（幂等需要）
 - [ ] 在 `server.go` 中 `dorisx.Init()` 后调用 `audit.Init(ctx)`（初始化 DB + 启动 writer）
 - [ ] 在 `server.go` 的 graceful shutdown 中调用 `audit.Close()`
 - [ ] 手动 Stream Load curl 验证网络通路（见 §11.1）
-- [ ] 测试：channel→攒批→Stream Load 端到端
+- [ ] 测试：channel→攒批→Stream Load Label 幂等端到端
 
-### Phase 1：高价值对象接入（2-3 天）
+### Phase 1：一期全部接入（3-4 天）
 
-- [ ] Account 登录/登出（session filter 中）
-- [ ] AccountAPIToken CRUD
+一期一次性接入全部 5 domain × 22 feature 的管理面操作，不分批：
+
+- [ ] Account 登录/登出/登录失败（在 `controller/account` 中，**不在** session filter）
+- [ ] AccountProfile / Token CRUD
 - [ ] Organization CRUD + 成员管理 + 邀请
 - [ ] Project CRUD + 成员管理
-- [ ] Chart/Dashboard/Cohort CRUD
+- [ ] Chart/Dashboard/Cohort/Pipeline/Campaign CRUD
+- [ ] AB 对象（Experiment/FeatureGate/FeatureConfig）CRUD
+- [ ] Metadata（Metric/TrackedEvent/VirtualEvent/EventProperty/UserProperty/VirtualProperty）CRUD
 - [ ] 每个实体接入后验证：一条 Doris SQL 确认数据可见
 
-### Phase 2：长尾对象接入（1-2 天）
-
-- [ ] Pipeline/Campaign CRUD
-- [ ] AB 对象（Experiment/FeatureGate/FeatureConfig）CRUD
-- [ ] Metric CRUD
-
-### Phase 3：元数据补齐（1 天）
-
-- [ ] TrackedEvent/VirtualEvent/EventProperty/UserProperty/VirtualProperty CRUD
-
-### Phase 4：查询导出（1-2 天）
+### Phase 2：查询导出（1-2 天）
 
 - [ ] `audit.List()` 查询接口 + OpenAPI handler
 - [ ] `audit.Export()` CSV/Excel 导出 + OpenAPI handler
-- [ ] account_name/email 获取方式确认（Doris External Catalog vs 应用层 JOIN）
+- [ ] account_name 默认从 detail.account.name 提取（无需外部 JOIN）
 
 ---
 
@@ -861,10 +824,11 @@ Wave 现有监控体系（Prometheus metrics + Grafana）已有 metric 注册机
 
 | 风险 | 概率 | 缓解 |
 |------|------|------|
-| Doris Stream Load 持续失败导致数据丢失 | 低 | 监控 Stream Load 错误率；单批次丢失不影响合规（SOC 2 = "合理保证"） |
-| channel 满频繁 drop | 极低 | buffer 1000 = 100 批次的缓冲；若频繁 drop 说明 Doris 写入性能不足，扩容或调大批次 |
-| `sw_dw_global` 数据库与现有 project 数据库模式不一致 | 低 | Doris 支持跨库查询；全局连接已存在（`GetGlobalDB()`） |
-| account 信息在查询时拿不到 | 中 | V1 登录事件已经有 account name 在 detail；后续可通过 External Catalog 读 PG account 表 |
+| Doris Stream Load 持续失败导致数据丢失 | 低 | spool + replay 兜底；Stream Load Label 保证幂等，恢复后自动重放 |
+| channel 满导致数据丢失 | 极低 | buffer 1000 = 100 批次缓冲；满时直接写 spool 文件不静默 drop |
+| Stream Load Label 重复导致写入失败 | 低 | `Label Already Exists` 视为成功，info log 后跳过 |
+| `sw_dw_global` 数据库与现有 project 库模式不一致 | 低 | Doris 支持跨库查询；全局连接已存在（`GetGlobalDB()`） |
+| account 信息在查询时拿不到 | 低 | detail.account.name 已有当时名快照；无需额外 JOIN |
 | Doris AUTO PARTITION 在某些版本有 bug | 低 | 现有表（raw_events）已使用，经过验证 |
 
 ---

@@ -250,3 +250,52 @@ V1 不再以通用 diff 引擎为前提，Detail 构造遵循以下规则：
 - **Phase 0（底座）**：补齐 `plan-pg.md` / `plan-doris.md`，统一异步 writer / spool / replay 约束
 - **Phase 1（全部接入）**：一期一次性接入全部 5 domain × 22 feature 的管理面操作，覆盖 account(session/account_profile/token)、organization(org/org_member/org_member_invite)、project(project/project_member)、asset(chart/dashboard/cohort/pipeline/campaign/experiment/feature_gate/feature_config)、metadata(metric/tracked_event/virtual_event/event_property/user_property/virtual_property)
 - **Phase 2（导出）**：OpenAPI 导出接口（CSV / Excel），可作为独立二期上线
+
+## Detail 结构统一（2026-07-07）
+
+**确认采用 Doris 方案带 actor 快照的 detail 结构，两方案统一该模型。**
+
+- detail 顶层统一为 `schema_version / account / target / comment / extra`（无 `changes`）
+- `account`：操作时的 actor 快照（`id` + `name`），不是当前名
+- `target`：被操作资源的过滤后摘要（`id` + `name` + `type` + 其他业务字段）
+- `comment`：可选，只放调用点天然已知的信息
+- `extra`：批量对象列表或事件专属扩展
+- `schema_version` 当前固定为 `1`，后续 add-only 扩展
+- V1 不做 `changes[]` 字段级 diff 引擎
+- 两方案的 detail JSON key 对齐，确保 PG ↔ Doris 之间数据天然可迁移
+- 裁剪策略和脱敏规则见 [detail-pg.md](./detail-pg.md)
+
+## 账号名补齐策略（2026-07-07）
+
+**两方案统一：detail 中的 account snapshot 是审计证据（当时名），PG 读侧额外补当前名作为辅助信息。**
+
+- Doris 方案：detail 自带 account snapshot，直接使用，不需要外部补齐
+- PG 方案：写入时 detail 存 account snapshot（当时名）；读取时可额外通过 JOIN `global.account` 补充当前名，但这只是辅助信息，审计导出默认以 detail.account.name 为准
+
+## Client IP 与反向代理（2026-07-07）
+
+- 审计的 `ip_address` 来源为 `c.ClientIP()`，依赖 gin 的 `TrustedProxies` 配置
+- 在 `apps/web/server.go` 中补配置 `r.SetTrustedProxies(...)`，按 Wave 部署拓扑指定可信代理 CIDR
+- 新写入审计日志的代码依赖此配置，而非 `c.ClientIP()` 的默认行为
+- 配置细节见 [detail-pg.md §3.8](./detail-pg.md)
+
+## 裁剪策略（2026-07-07）
+
+- 单条 detail (JSON 序列化后) 大小上限：64KB
+- 超出 64KB 时逐级裁剪（先 extra → comment → target → account）
+- 每级裁剪记一次 warning metric
+- 裁剪后的 detail 正常写入，不因超限丢弃整条
+- 裁剪在 enqueue 时完成，不阻塞主流程
+- 完整裁剪规则和表格见 [detail-pg.md §3.7](./detail-pg.md)
+
+## Doris 方案补充决策（2026-07-07）
+
+针对第三方审核发现的缺口，以下决策立即生效：
+
+- **`occurred_at` 字段**：Doris 表结构加 `occurred_at` 列，DUPLICATE KEY 第一列改为 `occurred_at`
+- **`event_id` 字段**：Doris 表结构加 `event_id` 列；Stream Load 使用稳定 label（`audit_log_{date}_{hash}`）实现幂等
+- **登录审计写入位置**：确认在 `controller/account`（LoginAccount/LogoutAccount 成功返回前、LoginValidate 错误路径），不在 session 认证 filter
+- **source 补充 mcp**：枚举值新增 `mcp`；MCP 入口鉴权完成后显式赋值 `source = mcp`
+- **一期全量接入**：不拆 Phase 1/2/3，一期一次性接入全部 22 feature
+- **PG 索引维持 3 个**：`(project_id, occurred_at)`, `(org_id, occurred_at)`, `(account_id, occurred_at WHERE account_id IS NOT NULL)`，暂不增减
+- **Doris 索引前缀键调整**：DUPLICATE KEY 改为 `(occurred_at, org_id, project_id, account_id)` 以对齐高频查询路径
