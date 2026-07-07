@@ -8,7 +8,7 @@
 
 - 目标从内部排障变为**第三方审计合规**，支持导出审计日志
 - 全局单表 `audit_log` 作为统一逻辑模型，废弃 `meta.activity_log` / `global.activity_log` 分表方案
-- 只记录**站外流量**（source ∈ {ui, api_token}），internal/scheduler/backfill 不写入
+- 只记录**站外流量**（source ∈ {ui, api_token, mcp}），internal/scheduler/backfill 不写入
 - 记录所有实体的**管理面操作（created/updated/deleted）** + 登录/登出/登录失败事件
 - **不干涉各业务内部状态流转**（AB 状态变更、Metric 口径变更、MA Campaign 启动/暂停等属于产品功能）
 - 账号活跃字段方案废弃，登录/登出/登录失败事件直接走审计日志
@@ -16,12 +16,12 @@
 ## 方案并行（2026-07-06）
 
 - 为适配 Wave 当前代码与运维现状，**同时保留 PostgreSQL 与 Doris 两套候选技术方案**
-- 文档拆分为**概要设计 + 详细设计**两层：`plan-pg.md / detail-pg.md` 与 `plan-doris.md / detail-doris.md`
-- `plan-pg.md`：PG 异步批量落库，优先满足第三方审计导出与查询解释性
-- `plan-doris.md`：Doris 异步攒批落库，优先满足长期存储成本与压缩比
+- 文档拆分为**概要设计 + 详细设计**两层：`03-plan-pg.md / 04-detail-pg.md` 与 `03-plan-doris.md / 04-detail-doris.md`
+- `03-plan-pg.md`：PG 异步批量落库，优先满足第三方审计导出与查询解释性
+- `03-plan-doris.md`：Doris 异步攒批落库，优先满足长期存储成本与压缩比
 - 在明确真实数据量、导出频率、运维约束前，spec 阶段**暂不锁定最终存储引擎**
 - 两套方案共享同一条产品约束：**主流程必须异步，不因审计阻塞日常操作**
-- 但“异步”不等于“可静默丢失”：失败必须进入 spool / replay 路径
+- 但”异步”不等于”可静默丢失”：channel 满时必须非阻塞丢弃 + error 日志 + drop counter
 - 当前评审偏向：**先上 PG**；Doris 保留为规模化 / 成本优化备选
 - Doris 若要作为主存落地，至少需要给 `pkg/dal/dorisx/stream_loader.go` 补稳定 `label` 能力
 - 如果未来确有长期保留成本压力，优先考虑 **PG 主存 + Doris 镜像**，而不是 day-1 直接 Doris 单写
@@ -58,9 +58,9 @@
 - ZSTD 列存压缩，预计存储量仅为 PG 的 1/7（~50GB/年 vs ~360GB/年）
 - Stream Load HTTP PUT JSON 异步攒批写入，不阻塞主流程
 - 去掉了 GORM 插件（~450 行）和 changes diff 引擎，改为 ~150 行显式 `audit.Log()` 调用
-- Detail 收敛为版本化的 `schema_version / snapshot / comment / extra` JSON envelope，不记录 field-level changes
+- Detail 收敛为版本化的 `schema_version / account / target / comment / extra` JSON envelope，不记录 field-level changes
 - 写入策略统一为 async enqueue + background batch flush，主流程不等待最终落库
-- 详见 [plan-doris.md](./plan-doris.md) 与 [detail-doris.md](./detail-doris.md)
+- 详见 [03-plan-doris.md](./03-plan-doris.md) 与 [04-detail-doris.md](./04-detail-doris.md)
 
 ## 架构（新 — 审计日志）
 
@@ -88,27 +88,30 @@
 
 - 实体分类使用 `domain + feature` 两列替代单一 `scope`：
   - `domain`：粗粒度领域（`account` / `organization` / `project` / `asset` / `metadata`，共 5 个）
-  - `feature`：细粒度实体类型（共 22 个，每个 domain 下 1:1 或 1:N 映射）
-- 完整 domain/feature 清单（22 个 entity），对齐 Wave 内部领域模型：
+  - `feature`：细粒度实体类型（共 25 个，每个 domain 下 1:1 或 1:N 映射）
+- 完整 domain/feature 清单（25 个 entity），对齐 Wave 内部领域模型：
 
   | domain | feature | 对应实体 |
   | --- | --- | --- |
   | `account` | `session` | Account（登录/登出/登录失败） |
-  | `account` | `account_profile` | Account（密码/个人信息修改） |
-  | `account` | `token` | AccountAPIToken |
-  | `organization` | `org` | Organization |
+  | `account` | `account_setting` | Account（密码/邮箱变更） |
+  | `account` | `api_token` | AccountAPIToken |
+  | `organization` | `org_setting` | Organization |
   | `organization` | `org_member` | OrganizationMember |
-  | `organization` | `org_member_invite` | OrganizationInvite |
-  | `project` | `project` | Project |
+  | `organization` | `org_member_invitation` | OrganizationInvite |
+  | `project` | `project_setting` | Project |
   | `project` | `project_member` | ProjectMember |
   | `asset` | `chart` | Chart |
   | `asset` | `dashboard` | Dashboard |
   | `asset` | `cohort` | Cohort |
   | `asset` | `pipeline` | Pipeline |
-  | `asset` | `campaign` | Campaign |
+  | `asset` | `tracking_plan` | TrackingPlan |
   | `asset` | `experiment` | Experiment |
   | `asset` | `feature_gate` | FeatureGate |
   | `asset` | `feature_config` | FeatureConfig |
+  | `asset` | `layer` | Layer |
+  | `asset` | `holdout` | Holdout |
+  | `asset` | `target` | Target |
   | `metadata` | `metric` | Metric |
   | `metadata` | `tracked_event` | TrackedEvent |
   | `metadata` | `virtual_event` | VirtualEvent |
@@ -117,19 +120,19 @@
   | `metadata` | `virtual_property` | VirtualProperty |
 
 - `domain` 使用 `VARCHAR(64)`，5 个 domain 名最长 12（organization），64 留足余量
-- `feature` 使用 `VARCHAR(64)`，22 个 feature 名最长 15（org_member_invite）
+- `feature` 使用 `VARCHAR(64)`，25 个 feature 名最长 18（org_member_invitation）
 - `action` 使用 `VARCHAR(64)`，基础动作集锁定为 `created / updated / deleted / logged_in / logged_out / login_failed`
   - 不含 read / view 等读操作
   - 不含 copy（V1 不做，后续按需接入）
   - 不含各业务专用 action（状态流转等属于产品功能，不走审计日志）
 - `source` 存储于审计日志表（`VARCHAR(16)`），区分 `ui` / `api_token` / `mcp`
 - 逻辑表名定稿为 `audit_log`；PG 物理表为 `global.audit_log`，Doris 物理表为 `sw_dw_global.audit_log`
-- `account_id` 不设外键；默认只存 ID，不存 actor 快照；`login_failed` 在无法解析账号时允许为空（Doris 可用 `0` 表示未知账号）
+- `account_id` 不设外键；`login_failed` 在无法解析账号时允许为空（Doris 可用 `0` 表示未知账号）
 - `target_id` 使用 `VARCHAR(64)`，不限制格式（支持 UUID / 自增 ID / 字符串标识）；BIGSERIAL 最大 19 位、UUID 固定 36 位，64 足够
 - `ip_address` 使用 `VARCHAR(64)`，NOT NULL（合规刚需）
 - `event_id` 作为稳定事件标识保留，用于导出对账与回放去重
 - `detail` 统一存储过滤后的 JSON 字符串；PG 用 `TEXT`，Doris 用 `STRING`
-- `detail` 固定为版本化 envelope：`schema_version / snapshot / comment / extra`；不存 actor 快照，不存邮箱；`changes[]` 仅作为未来扩展保留，不是 P0 必选
+- `detail` 固定为版本化 envelope：`schema_version / account / target / comment / extra`；`account.name` 为 best effort，不存邮箱；`changes[]` 仅作为未来扩展保留，不是 P0 必选
 - PG V1 只保留 `project_time / org_time / account_time` 三类高频索引；`target_id` 的 scoped 复合索引后置到真实高频对象回查场景
 
 ## Data Model（新 — 审计日志）
@@ -148,8 +151,8 @@
   | `target_id` | VARCHAR(64) | NULL | 资源 ID（登录事件为 NULL） |
   | `source` | VARCHAR(16) | NOT NULL, DEFAULT 'ui' | 来源：ui / api_token / mcp |
   | `ip_address` | VARCHAR(64) | NOT NULL | 操作者 IP |
-  | `event_id` | VARCHAR(36) | NOT NULL | 稳定事件标识，用于对账与去重 |
-  | `detail` | TEXT / STRING | NULL | 结构化审计详情（schema_version / snapshot / comment / extra） |
+  | `event_id` | VARCHAR(64) | NOT NULL | 稳定事件标识，用于对账与去重 |
+  | `detail` | TEXT / STRING | NULL | 结构化审计详情（schema_version / account / target / comment / extra） |
   | `occurred_at` | TIMESTAMPTZ | NOT NULL | 事件发生时间，由调用方传入 |
   | `created_at` | TIMESTAMPTZ | NOT NULL, default now() | 入库时间，异步场景下可能晚于 `occurred_at` |
 
@@ -174,15 +177,13 @@
 
 - 写入策略统一为 **async enqueue + background flush**，主流程不等待最终落库
 - 不设 blocking 模式；性能优先是硬约束
-- 不接受内存 channel 满后静默 drop；必须有 **spool / replay** 兜底
+- channel 满时非阻塞 enqueue，满则丢弃并记 +1 drop counter + error 日志；不设本地 spool
 - 批量写入上限 500 行/批
 - 同一批操作共享信息在写入层组装，不强制调用方传 correlation_id
-- `source` 不新增独立上下文字段；统一由 `pvctx.IsAccountAPIToken(ctx)` 派生 `ui / api_token`
-- **MCP 入口**：MCP 协议不走标准 gin middleware，但现有鉴权已注入 `Aid / Token / IsAccountAPIToken / Pid`；V1 只需补 `client_ip`
-- spool 上限是运维保护，不是第二数据库；超限后必须告警并人工处理
+- `source` 表达的是**接入通道**，不是认证方式：gin 默认 `ui`，Account API Token 覆盖为 `api_token`，MCP 固定为 `mcp`
+- 为了稳定表达 `mcp`，需要新增独立 `audit_source` 上下文字段；不能只靠 `pvctx.IsAccountAPIToken(ctx)` 推导
+- **MCP 入口**：MCP 协议不走标准 gin middleware，除鉴权字段外还需显式注入 `client_ip` 与 `audit_source = mcp`
 - 优雅重启时必须先停流量、再 drain audit writer、最后关闭数据库连接；异常崩溃仍存在有限内存丢失窗口
-- `audit_log_spool_dir` 默认可挂在 `log_dir` 下，但生产必须落到持久盘；如果仍在临时盘，要在文档中明确其只能提供有限重启兜底
-- 必须暴露 `queue_depth / flush_failed / replay_failed / spool_bytes / oldest_pending_seconds` 指标并配置告警
 
 ### 写入分工（新 — 显式调用 + 异步 writer）
 
@@ -203,14 +204,21 @@
 
 V1 不再以通用 diff 引擎为前提，Detail 构造遵循以下规则：
 
-- `detail` 顶层固定为 `schema_version / snapshot / comment / extra`
+- `detail` 顶层固定为 `schema_version / account / target / comment / extra`
 - `create`：记录过滤后的当前对象 `snapshot`
 - `update`：记录过滤后的 after `snapshot`，不额外查询 before/after 做全量 diff
 - `delete`：记录删除前最小 `snapshot`，至少保留 `id / name`
 - `batch` 操作：受影响对象列表写入 `detail.extra`
 - 不为导出可读性在写入时冗余 actor 摘要；默认在读侧按 `account_id` 补当前名称
-- 敏感字段掩盖保留，序列化前替换为 `"masked"`
+- 若采用 `detail.account`，则 `id` 优先、`name` best effort；不为补 `name` 额外查库，也不写邮箱
+- **调用方不传敏感字段**：入口层不设脱敏过滤，不依赖运行时脱敏
 - 如后续确有第三方审计需求要求字段级变化，可在 `detail.changes[]` 中追加，不改主表结构
+
+## PG 落地约束（2026-07-07）
+
+- PG 方案的现网 rollout 以 `script/migration/scripts/global_v*.sql` 为准，不能只改 `script/sql/pgsql/global.sql`
+- `global.sql` 仍需同步更新，但它只作为全新环境 bootstrap 快照，不承担现网增量变更职责
+- Wave 当前 SQL migration 运行在事务中，因此新增 `audit_log` 时使用普通 `CREATE INDEX IF NOT EXISTS`，不使用 `CREATE INDEX CONCURRENTLY`
 
 ## 旧值与 Detail 构造（旧 — 已废弃）
 
@@ -247,8 +255,8 @@ V1 不再以通用 diff 引擎为前提，Detail 构造遵循以下规则：
 
 ## 交付顺序（新 — 审计日志）
 
-- **Phase 0（底座）**：补齐 `plan-pg.md` / `plan-doris.md`，统一异步 writer / spool / replay 约束
-- **Phase 1（全部接入）**：一期一次性接入全部 5 domain × 22 feature 的管理面操作，覆盖 account(session/account_profile/token)、organization(org/org_member/org_member_invite)、project(project/project_member)、asset(chart/dashboard/cohort/pipeline/campaign/experiment/feature_gate/feature_config)、metadata(metric/tracked_event/virtual_event/event_property/user_property/virtual_property)
+- **Phase 0（底座）**：补齐 `03-plan-pg.md` / `03-plan-doris.md`，统一异步 writer 约束
+- **Phase 1（全部接入）**：一期一次性接入全部 5 domain × 25 feature 的管理面操作，覆盖 account(session/account_setting/api_token)、organization(org_setting/org_member/org_member_invitation)、project(project_setting/project_member)、asset(chart/dashboard/cohort/pipeline/tracking_plan/experiment/feature_gate/feature_config/layer/holdout/target)、metadata(metric/tracked_event/virtual_event/event_property/user_property/virtual_property)
 - **Phase 2（导出）**：OpenAPI 导出接口（CSV / Excel），可作为独立二期上线
 
 ## Detail 结构统一（2026-07-07）
@@ -263,30 +271,31 @@ V1 不再以通用 diff 引擎为前提，Detail 构造遵循以下规则：
 - `schema_version` 当前固定为 `1`，后续 add-only 扩展
 - V1 不做 `changes[]` 字段级 diff 引擎
 - 两方案的 detail JSON key 对齐，确保 PG ↔ Doris 之间数据天然可迁移
-- 裁剪策略和脱敏规则见 [detail-pg.md](./detail-pg.md)
+- 裁剪策略和调用方不传敏感字段约定见 [04-detail-pg.md](./04-detail-pg.md)
 
 ## 账号名补齐策略（2026-07-07）
 
-**两方案统一：detail 中的 account snapshot 是审计证据（当时名），PG 读侧额外补当前名作为辅助信息。**
+**两方案统一：`account_id` 是主审计证据，detail 中的 `account.name` 只是 best effort 的当时名快照；PG 读侧额外补当前名作为辅助信息。**
 
-- Doris 方案：detail 自带 account snapshot，直接使用，不需要外部补齐
-- PG 方案：写入时 detail 存 account snapshot（当时名）；读取时可额外通过 JOIN `global.account` 补充当前名，但这只是辅助信息，审计导出默认以 detail.account.name 为准
+- Doris 方案：detail 自带 `account.id`，`account.name` 拿得到就写，不需要为补名额外查库
+- PG 方案：写入时 detail 存 `account.id` + best effort `account.name`；读取时可额外通过 JOIN `global.account` 补充当前名，但这只是辅助信息，不能当成历史快照
 
 ## Client IP 与反向代理（2026-07-07）
 
-- 审计的 `ip_address` 来源为 `c.ClientIP()`，依赖 gin 的 `TrustedProxies` 配置
-- 在 `apps/web/server.go` 中补配置 `r.SetTrustedProxies(...)`，按 Wave 部署拓扑指定可信代理 CIDR
-- 新写入审计日志的代码依赖此配置，而非 `c.ClientIP()` 的默认行为
-- 配置细节见 [detail-pg.md §3.8](./detail-pg.md)
+- gin 审计请求的 `ip_address` 来源为 APISIX 透传的 `X-Real-IP`
+- MCP 审计请求的 `ip_address` 也在 net/http 入口读取 `X-Real-IP`（APISIX 透传），降级读 `RemoteAddr`
+- V1 **不配置全局 `TrustedProxies`**（影响所有 gin 路由，超出审计范围）
+- 文档说明此限制：无 TrustedProxies 时 IP 在某些场景下可能为容器 IP，V2 按需引入
+- 配置细节见 [04-detail-pg.md §4.5](./04-detail-pg.md)
 
 ## 裁剪策略（2026-07-07）
 
 - 单条 detail (JSON 序列化后) 大小上限：64KB
-- 超出 64KB 时逐级裁剪（先 extra → comment → target → account）
-- 每级裁剪记一次 warning metric
-- 裁剪后的 detail 正常写入，不因超限丢弃整条
+- 超出 64KB 时直接丢弃整个 detail（`detail_payload = NULL`），comment 设为 `"detail exceeds 64KB, discarded"`，打 warn 日志
+- 审计行本身正常写入，不因 detail 超限丢失整条
 - 裁剪在 enqueue 时完成，不阻塞主流程
-- 完整裁剪规则和表格见 [detail-pg.md §3.7](./detail-pg.md)
+- **决策理由**：V1 简单性优先于 detail 完整性。合规审计只需要"谁在何时做了什么"，detail 为空不影响行级追溯。后续如有细化需求可补充逐级裁剪。
+- 详细说明见 [04-detail-pg.md §5.4](./04-detail-pg.md)
 
 ## Doris 方案补充决策（2026-07-07）
 
@@ -296,6 +305,13 @@ V1 不再以通用 diff 引擎为前提，Detail 构造遵循以下规则：
 - **`event_id` 字段**：Doris 表结构加 `event_id` 列；Stream Load 使用稳定 label（`audit_log_{date}_{hash}`）实现幂等
 - **登录审计写入位置**：确认在 `controller/account`（LoginAccount/LogoutAccount 成功返回前、LoginValidate 错误路径），不在 session 认证 filter
 - **source 补充 mcp**：枚举值新增 `mcp`；MCP 入口鉴权完成后显式赋值 `source = mcp`
-- **一期全量接入**：不拆 Phase 1/2/3，一期一次性接入全部 22 feature
+- **一期全量接入**：不拆 Phase 1/2/3，一期一次性接入全部 25 feature
 - **PG 索引维持 3 个**：`(project_id, occurred_at)`, `(org_id, occurred_at)`, `(account_id, occurred_at WHERE account_id IS NOT NULL)`，暂不增减
 - **Doris 索引前缀键调整**：DUPLICATE KEY 改为 `(occurred_at, org_id, project_id, account_id)` 以对齐高频查询路径
+
+## OrgID 传递方案（2026-07-07）
+
+- `audit.Log()` 签名不加 `org_id` / `project_id` 参数，保持 `(ctx, domain, feature, action, targetID, detail)`
+- `org_id` 和 `project_id` 在 `audit.Log()` 内部从 `pvctx` 提取，拿不到时写入 NULL
+- 调用方在调用 `audit.Log()` 前确保 `pvctx` 中已注入 org_id（详见 [04-detail-pg.md §4.4](./04-detail-pg.md)）
+- pvctx 扩展见 [04-detail-pg.md §5.3](./04-detail-pg.md)：新增 `ClientIP()` / `WithClientIP()` / `AuditSource()` / `WithAuditSource()`；`BackGroundCtx` 补充复制 `client_ip` / `audit_source` / `org_id`

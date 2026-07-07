@@ -77,6 +77,7 @@ flowchart LR
 1. 读取 `HABITS.md` — 加载你的工作偏好
 2. 如有活跃 spec（`specs/` 下未归档目录），加载其 `decisions.md`、`spec.md`，以及存在时的 `plan.md` / `detail.md`
 3. 检查 `STATUS.md` — 了解项目当前状态
+4. 读取 `WAVE_KB.md` — 加载 Wave 项目已知事实
 
 ### Spec 阶段（你控制）
 

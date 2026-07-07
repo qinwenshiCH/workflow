@@ -2,9 +2,9 @@
 
 **目录**: `20260626-Wave-Feat-AddAuditLog`
 **创建日期**: 2026-06-26
-**最后更新**: 2026-07-06（拆分 PG / Doris 的概要设计与详细设计，并按 Wave 真实代码校正落点）
+**最后更新**: 2026-07-07（对齐 5 domain × 25 feature 枚举，更新范围与计数）
 **状态**: 评审中
-**技术方案**: [plan-pg.md](./plan-pg.md) + [detail-pg.md](./detail-pg.md)（当前推荐） / [plan-doris.md](./plan-doris.md) + [detail-doris.md](./detail-doris.md)（备选）
+**技术方案**: [03-plan-pg.md](./03-plan-pg.md) + [04-detail-pg.md](./04-detail-pg.md)（当前推荐） / [03-plan-doris.md](./03-plan-doris.md) + [04-detail-doris.md](./04-detail-doris.md)（备选）
 
 ---
 
@@ -28,7 +28,7 @@
 
 ### 方向变更
 
-本规格最初定位为**活动日志**（内部排障），2026-07-02 重构为**审计日志**（第三方合规审计），完全替代原方案。详细决策见 [decisions.md](./decisions.md)。
+本规格最初定位为**活动日志**（内部排障），2026-07-02 重构为**审计日志**（第三方合规审计），完全替代原方案。详细决策见 [02-decisions.md](./02-decisions.md)。
 
 ---
 
@@ -42,10 +42,10 @@
 ### 设计原则
 
 1. **Append-only**：审计日志不可修改、不可删除
-2. **仅站外流量**：只记录客户主动发起的操作（ui / api_token），内部流量不记
+2. **仅站外流量**：只记录客户主动发起的操作（ui / api_token / mcp），内部流量不记
 3. **管理面聚焦**：记录所有实体的管理面操作（CUD），不追踪内部状态流转
 4. **全局单表**：统一逻辑模型，不再分散落在各业务表
-5. **结构化 detail**：使用 `schema_version / snapshot / comment / extra` 版本化 envelope；拿不到就允许为空
+5. **结构化 detail**：使用 `schema_version / account / target / comment / extra` 版本化 envelope；拿不到就允许为空
 
 ---
 
@@ -56,23 +56,22 @@
 **账号层**（无组织/项目归属）：
 
 - 登录/登出事件
+- 账号设置变更（密码修改、邮箱变更等）
 - Account API Token created/updated/deleted
 
 **组织层**（组织级管理）：
 
-- 组织信息变更、归档
+- 组织设置变更、删除
 - 组织成员添加/角色变更/移除
 - 成员邀请创建/撤销
 
 **项目层**（项目内对象管理）：
 
-- 项目创建/配置/归档
+- 项目创建/配置/删除
 - 项目成员管理
-- Chart / Dashboard created/updated/deleted
-- Cohort / Pipeline created/updated/deleted
-- AB 对象（Experiment / FeatureGate / FeatureConfig）created/updated/deleted
-- Campaign created/updated（无 Delete）
-- 元数据对象（TrackedEvent / VirtualEvent / EventProperty / UserProperty / VirtualProperty）created/updated/deleted
+- Chart / Dashboard / Cohort / Pipeline / TrackingPlan created/updated/deleted
+- AB 对象（Experiment / FeatureGate / FeatureConfig / Layer / Holdout / Target）created/updated/deleted
+- 元数据对象（Metric / TrackedEvent / VirtualEvent / EventProperty / UserProperty / VirtualProperty）created/updated/deleted
 
 ### 不纳入审计日志
 
@@ -84,7 +83,6 @@
 | Pipeline 内部回调/执行记录 | 系统运行日志 |
 | 定时任务/cron 调度 | 系统自动化 |
 | 资产基础设施表（asset_behavior/reference/metrics 等） | 非管理面操作 |
-| AB Layer / Holdout | Experiment 的内部子概念 |
 | 读取/查看操作 | 仅记录状态变更 |
 
 ---
@@ -96,17 +94,17 @@
 ```sql
 CREATE TABLE global.audit_log (
     id              BIGSERIAL,
-    event_id        VARCHAR(36) NOT NULL,
+    event_id        VARCHAR(64) NOT NULL,
     org_id          BIGINT,             -- NULL = 账号层事件
     project_id      BIGINT,             -- NULL = 组织/账号层事件
     account_id      BIGINT,             -- 操作人；无法解析时可为空
     action          VARCHAR(64) NOT NULL,  -- created/updated/deleted/logged_in/logged_out/login_failed
     domain          VARCHAR(64) NOT NULL,  -- 粗粒度领域：account/organization/project/asset/metadata
-    feature         VARCHAR(64) NOT NULL,  -- 细粒度实体类型：session/account_profile/token/chart/experiment/...
+    feature         VARCHAR(64) NOT NULL,  -- 细粒度实体类型：session/account_setting/api_token/chart/experiment/... 共 25 个
     target_id       VARCHAR(64),        -- NULL = 登录事件等无资源场景
     source          VARCHAR(16) NOT NULL DEFAULT 'ui',  -- ui / api_token / mcp
     ip_address      VARCHAR(64) NOT NULL, -- 操作者 IP（合规刚需）
-    detail          TEXT,               -- JSON 字符串：{schema_version, snapshot, comment, extra}
+    detail          TEXT,               -- JSON 字符串：{schema_version, account, target, comment, extra}
     occurred_at     TIMESTAMPTZ NOT NULL, -- 事件发生时间
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(), -- 入库时间
     PRIMARY KEY (id)
@@ -130,26 +128,29 @@ login_failed 账号登录失败
 
 ### Domain / Feature 清单
 
-使用 `domain + feature` 两列替代单一 `scope`，5 个 domain × 22 个 entity。domain 对齐 Wave 内部领域模型：
+使用 `domain + feature` 两列替代单一 `scope`，5 个 domain × 25 个 entity。domain 对齐 Wave 内部领域模型：
 
 | domain | feature | 对应实体 | 层级 | 操作 |
 | --- | --- | --- | --- | --- |
 | `account` | `session` | Account | 账号层 | logged_in / logged_out / login_failed |
-| `account` | `account_profile` | Account | 账号层 | updated |
-| `account` | `token` | AccountAPIToken | 账号层 | created / updated / deleted |
-| `organization` | `org` | Organization | 组织层 | created / updated / deleted |
+| `account` | `account_setting` | Account（密码/邮箱变更） | 账号层 | updated |
+| `account` | `api_token` | AccountAPIToken | 账号层 | created / updated / deleted |
+| `organization` | `org_setting` | Organization | 组织层 | updated |
 | `organization` | `org_member` | OrganizationMember | 组织层 | created / updated / deleted |
-| `organization` | `org_member_invite` | OrganizationInvite | 组织层 | created / deleted |
-| `project` | `project` | Project | 项目层 | created / updated / deleted |
+| `organization` | `org_member_invitation` | OrganizationInvite | 组织层 | created / deleted |
+| `project` | `project_setting` | Project | 项目层 | created / updated / deleted |
 | `project` | `project_member` | ProjectMember | 项目层 | created / updated / deleted |
 | `asset` | `chart` | Chart | 项目层 | created / updated / deleted |
 | `asset` | `dashboard` | Dashboard | 项目层 | created / updated / deleted |
 | `asset` | `cohort` | Cohort | 项目层 | created / updated / deleted |
 | `asset` | `pipeline` | Pipeline | 项目层 | created / updated / deleted |
-| `asset` | `campaign` | Campaign | 项目层 | created / updated |
+| `asset` | `tracking_plan` | TrackingPlan | 项目层 | created / updated / deleted |
 | `asset` | `experiment` | Experiment | 项目层 | created / updated / deleted |
 | `asset` | `feature_gate` | FeatureGate | 项目层 | created / updated / deleted |
 | `asset` | `feature_config` | FeatureConfig | 项目层 | created / updated / deleted |
+| `asset` | `layer` | Layer | 项目层 | created / updated / deleted |
+| `asset` | `holdout` | Holdout | 项目层 | created / updated / deleted |
+| `asset` | `target` | Target | 项目层 | created / updated / deleted |
 | `metadata` | `metric` | Metric | 项目层 | created / updated / deleted |
 | `metadata` | `tracked_event` | TrackedEvent | 项目层 | created / updated / deleted |
 | `metadata` | `virtual_event` | VirtualEvent | 项目层 | created / updated / deleted |
@@ -172,16 +173,16 @@ V1 的 `detail` 固定为统一版本化 envelope，两方案（PG / Doris）使
 ```
 
 - `schema_version`: 固定版本号，当前为 `1`，后续只做 add-only 扩展
-- `account`: 操作时的 actor 快照（`id` + `name`），由 audit.Log 传入时记录
+- `account`: 操作时的 actor 快照（`id` 必填，`name` best effort），由 audit.Log 传入时记录；不包含邮箱
 - `target`: 过滤后的被操作资源摘要；`update` 场景直接记录 after 摘要；至少保留 `id` + `name`
 - `comment`: 可选的人类可读说明，只放调用点天然已知的信息，不额外查库
 - `extra`: 批量对象列表或事件专属扩展
 - `detail` 是可选字段；不为了构造它额外查库
-- 敏感字段值替换为 `”masked”` 或直接删除
+- **调用方不传敏感字段**：构造 detail 时自行排除密码、token 等敏感内容，入口层不设脱敏过滤
 - 如后续确有审计机构要求字段级变化，再按需追加 `changes[]` 或 `before_snapshot`
-- 单条 detail 大小预算 64KB，超限逐级裁剪（先丢 extra → 再缩短 comment → 最后截断 snapshot）
+- 单条 detail 大小预算 64KB，超限直接丢弃 detail（`detail = NULL`，comment 设为 `”detail exceeds 64KB, discarded”`）
 
-**账号名说明**：detail.account.name 记录的是操作发生时的名字（审计证据），不是当前名。PG 读侧可通过 JOIN `global.account` 额外补充当前名作为辅助，但审计导出以 detail.account.name 为准。
+**账号名说明**：detail.account.name 是 best effort 的当时名快照，不是当前名，也不会为此额外查库；拿得到就写，拿不到就只保留 `account_id`。PG 读侧可通过 JOIN `global.account` 额外补充当前名作为辅助，但不能把它当成历史快照。
 
 ### 索引设计
 
@@ -211,7 +212,7 @@ CREATE INDEX idx_alog_account_time ON global.audit_log (account_id, occurred_at 
 5. 后台批量 flush 到目标存储（PG 或 Doris）
 6. flush 失败进入可回放队列并告警，不允许静默 drop
 
-**MCP 入口说明**：MCP 协议不走标准 gin middleware，但现有鉴权已注入 `Aid / Token / IsAccountAPIToken / Pid`；V1 只需补 `client_ip`，下游根据 `IsAccountAPIToken` 派生 `source = api_token`。
+**MCP 入口说明**：MCP 协议不走标准 gin middleware，但现有鉴权已注入 `Aid / Token / IsAccountAPIToken / Pid`；V1 需额外补 `client_ip` 与独立 `audit_source`，并在 MCP 入口显式写入 `source = mcp`。
 
 ### 写入入口拦截
 
@@ -238,13 +239,14 @@ CREATE INDEX idx_alog_account_time ON global.audit_log (account_id, occurred_at 
 
 ## 边界与异常处理
 
-- **单条 detail 大小预算**：64KB（JSON 序列化后），超限时逐级裁剪（先丢 extra → 缩短 comment → 截断 snapshot 为最小摘要），裁剪过程记录 warning metric，不允许因超限丢弃整条记录
+- **单条 detail 大小预算**：64KB（JSON 序列化后），超限时直接丢弃 detail（`detail_payload = NULL`，comment 设为 `"detail exceeds 64KB, discarded"`），打 warn 日志。审计行本身正常写入
 - **同对象高频操作**：每条独立记录，不合并去重
 - **缺少 IP 的请求**：审计写入视为非法，记录 critical 告警；不回滚已成功的业务操作
+- **不传敏感字段**：调用方构造 detail 时自行排除敏感内容，入口层不设脱敏过滤，不依赖运行时脱敏
 - **未注册的 domain + feature 组合**：写入入口直接拒绝
 - **Append-only**：不可修改、不可删除
-- **批量写入**：上限 500 行/批；失败批次进入 spool / replay，不允许静默丢弃
-- **IP 地址获取**：依赖 gin 的 `c.ClientIP()` + `TrustedProxies` 配置；需在 `server.go` 中设置可信代理 CIDR 范围，确保经过反向代理时仍能获取真实客户端 IP
+- **批量写入**：上限 500 行/批；channel 满时非阻塞 enqueue，满则丢弃并记 drop counter + error 日志，不设本地 spool
+- **IP 地址获取**：gin 路由依赖 APISIX 透传的 `X-Real-IP`（`c.ClientIP()`）；MCP 路由在 `net/http` 入口读取 `X-Real-IP`。V1 不配置全局 `TrustedProxies`，文档说明 IP 可能不准确
 - **分区管理**：超出保留期限的分区 DROP 或 detach 归档
 
 ---
@@ -254,8 +256,8 @@ CREATE INDEX idx_alog_account_time ON global.audit_log (account_id, occurred_at 
 ### 功能需求
 
 - **FR-001**: 系统 MUST 提供统一审计日志存储；PG 方案为 `global.audit_log`，Doris 方案为 `sw_dw_global.audit_log`
-- **FR-002**: 系统 MUST 记录所有 domain + feature 的管理面操作（created/updated/deleted + logged_in/logged_out/login_failed），覆盖 5 个 domain × 22 个实体
-- **FR-003**: 系统 MUST 仅记录站外流量（source ∈ {ui, api_token}），内部流量不写入
+- **FR-002**: 系统 MUST 记录所有 domain + feature 的管理面操作（created/updated/deleted + logged_in/logged_out/login_failed），覆盖 5 个 domain × 25 个实体
+- **FR-003**: 系统 MUST 仅记录站外流量（source ∈ {ui, api_token, mcp}），内部流量不写入
 - **FR-004**: 审计日志 MUST 包含 `event_id`、`org_id`、`project_id`、`account_id`、`action`、`domain`、`feature`、`target_id`、`ip_address`、`detail`、`created_at`
 - **FR-005**: 系统 MUST 在写入入口校验 domain + feature 合法性，未注册组合拒绝写入
 - **FR-006**: 系统 MUST 提供按时间范围、组织、项目、domain、feature、target_id、操作人、action 过滤的查询接口
@@ -271,15 +273,14 @@ CREATE INDEX idx_alog_account_time ON global.audit_log (account_id, occurred_at 
 - **NFR-003**: 单条 detail 大小预算 64KB
 - **NFR-004**: 必须有明确保留策略；Doris 可用自动月分区，PG 在数据规模证明需要前可保持单表
 - **NFR-005**: 导出默认包含 `account_id`；如需可读名称，只补当前 `account_name`，不导出邮箱
-- **NFR-006**: channel 满或存储暂时不可达时 MUST 进入本地 spool / replay 队列，不允许静默丢弃
-- **NFR-007**: MUST 暴露 `queue_depth / flush_failed / replay_failed / spool_bytes / oldest_pending_seconds` 等监控指标，并配置告警
-- **NFR-008**: 生产环境的 `audit_log_spool_dir` MUST 位于持久盘；若部署在临时盘，必须在方案中明确其只能提供有限重启兜底
+- **NFR-006**: channel 满时 MUST 非阻塞 enqueue，满则丢弃并记 +1 drop counter + error 日志；不设本地 spool
+- **NFR-007**: MUST 暴露 `audit_channel_drop_total` 一个 counter 指标，用于监控丢弃事件
 
 ---
 
 ## 成功标准
 
-- **SC-001**: 审计日志覆盖 5 domain × 22 feature 的管理面操作（created/updated/deleted + logged_in/logged_out/login_failed）
+- **SC-001**: 审计日志覆盖 5 domain × 25 feature 的管理面操作（created/updated/deleted + logged_in/logged_out/login_failed）
 - **SC-002**: 仅站外流量写入，内部流量验证不进表
 - **SC-003**: 主流程审计附加开销 P99 < 5ms；最终落库异步完成
 - **SC-004**: 按 `org/project + time range` 的常规审计查询与导出分页 P99 < 1s；单对象历史查询在该范围内可完成筛选
@@ -290,4 +291,4 @@ CREATE INDEX idx_alog_account_time ON global.audit_log (account_id, occurred_at 
 
 ## 技术方案
 
-所有技术设计详见 [plan-pg.md](./plan-pg.md)、[detail-pg.md](./detail-pg.md)、[plan-doris.md](./plan-doris.md)、[detail-doris.md](./detail-doris.md)。当前评审偏向是：先落 PG，再根据真实规模决定是否引入 Doris。
+所有技术设计详见 [03-plan-pg.md](./03-plan-pg.md)、[04-detail-pg.md](./04-detail-pg.md)、[03-plan-doris.md](./03-plan-doris.md)、[04-detail-doris.md](./04-detail-doris.md)。当前评审偏向是：先落 PG，再根据真实规模决定是否引入 Doris。
