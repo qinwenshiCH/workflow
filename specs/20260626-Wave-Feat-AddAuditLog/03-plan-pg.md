@@ -293,7 +293,7 @@ sequenceDiagram
 | `script/migration/scripts/global_v20260707_audit_log.sql` | 新增 | 🟢低 | 审计表与索引的现网增量 migration | 低 |
 | `script/sql/pgsql/global.sql` | 修改 | 🟢低 | 同步 bootstrap 快照，保证全新环境初始化后也有 `audit_log` | 低 |
 | `pkg/lib/pvctx/pvctx.go` | 修改 | 🟢低 | 新增 `ClientIP()` / `WithClientIP()` / `AuditSource()` / `WithAuditSource()`；`BackGroundCtx` 补充复制 | 低 |
-| `pkg/config/app_cfg.go` | 修改 | 🟢低 | 新增审计相关配置项（batch size / flush interval / queue size 等） | 低 |
+| `apps/web/config/web_cfg.go` | 修改 | 🟢低 | 新增审计相关配置项（batch size / flush interval / queue size 等） | 低 |
 | `apps/web/server.go` | 修改 | 🟢低 | `initService()` 中初始化 writer，Shutdown 中 drain writer | 低 |
 | `apps/web/dao/global/audit_log.go` | 新增 | 🟢低 | DAO 层：BatchInsert / List / Export | 低 |
 | `apps/web/service/auditlog/*` | 新增 | 🟡中 | audit.Log 函数、registry、writer 核心逻辑 | 可控 |
@@ -410,7 +410,7 @@ func Export(ctx context.Context, q Query, format string, w io.Writer) error
 |---|---|---|---|---|
 | 性能 | PG 单表写放大影响业务查询 | 低 | 中 | V1 只保留 3 个高频索引，不提前做写放大 |
 | 可靠性 | 进程崩溃导致内存队列数据丢失 | 中 | 低 | 优雅重启 drain 保护；`kill -9` 有限丢失窗口；不设 spool |
-| 安全 | IP 获取依赖 APISIX 透传的 `X-Real-IP`，无 `TrustedProxies` 配置 | 低 | 低 | V1 文档说明 IP 可能不准确，V2 按需引入 TrustedProxies |
+| 安全 | IP 获取依赖反向代理透传的 `X-Real-IP`，无 `TrustedProxies` 配置 | 低 | 低 | V1 文档说明 IP 可能不准确，V2 按需引入 TrustedProxies |
 | 复杂度 | 13 个 controller 的接入点维护成本 | 中 | 低 | 接入策略不做统一框架，每处显式调用；接入后在 review 中验证 |
 | 数据增长 | PG 存储成本随时间线性增长 | 中 | 低 | 先观察真实量级，需要时加月分区；长期成本压力走 Doris 镜像 |
 

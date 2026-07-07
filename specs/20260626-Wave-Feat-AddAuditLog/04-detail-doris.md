@@ -21,7 +21,7 @@
 
 - 单表：`sw_dw_global.audit_log`
 - 单写链路：业务成功后显式 `audit.Log()`，后台异步攒批 Stream Load
-- 单兜底模型：批次级 spool / replay，复用 stable label
+- 单兜底模型：失败时非阻塞丢弃 + drop counter + error 日志（同 PG 方案）
 - 最小补丁：只在 `pkg/dal/dorisx/stream_loader.go` 上补足 Doris 审计写入真正需要的能力
 
 整体设计目标不是“让 Doris 看起来更强”，而是做出一套**真的能按 Wave 现状落地**、同时又不会为了审计把代码写重的方案。
@@ -44,8 +44,8 @@
 |---|---|---|
 | P0 用户故事与方案目标 | ✅ 匹配 | 第三方审计导出、安全追溯、组织治理都被覆盖 |
 | “主流程必须异步” | ✅ 匹配 | 仍然是 enqueue + 后台 flush |
-| 失败不能静默丢 | ✅ 匹配 | Doris 方案保留 spool / replay |
-| `source` 与 detail 文案 | ⚠️ 需按实现修正 | 当前 `01-spec.md` 中仍残留 `mcp` 作为独立 `source`、以及 actor 快照文案；本详细设计按当前评审收敛为 `ui / api_token` 与 `snapshot/comment/extra` |
+| 失败不能静默丢 | ✅ 匹配 | Doris 方案同 PG 方案：非阻塞丢弃 + drop counter + error 日志 |
+| `source` 与 detail 文案 | ✅ 已同步 | 与 PG 方案一致：`ui / api_token / mcp`、`Account + Target` 结构 |
 
 ### 2.2 Plan vs 代码现实
 
@@ -56,12 +56,12 @@
 | `UseDB(ctx, query)` 可直接服务审计全局表 | ❌ 不成立 | 它会拼接 `sw_dw_{pid}`，不适用于 `sw_dw_global` |
 | `StreamLoader` 已能解析 Stream Load 状态 | ✅ 已确认 | 已有 `Status`、`Label`、`ExistingJobStatus` 字段 |
 | `StreamLoader` 可直接用于审计写入 | ⚠️ 部分成立 | 还缺 `Label()`；认证头和项目里其他 Doris HTTP 调用不一致 |
-| `sw_dw_global` DDL 可通过迁移框架执行 | ❌ 不成立 | `DBTypeDoris` 只支持逐项目遍历（`sw_dw_{pid}`），`DBTypeGlobal` 指向全局 PG。必须新增 `DBTypeDorisGlobal` 类型 |
+| `sw_dw_global` DDL 可通过迁移框架执行 | ❌ 不成立 | `DBTypeDoris` 只支持逐项目遍历（`sw_dw_{pid}`），`DBTypeGlobal` 指向全局 PG。改为 `initDatabase()` 在 `dorisx.Init()` 后 bootstrap 执行 |
 | Doris 写入一定要用哨兵值代替 NULL | ❌ 不成立 | Wave 现有 Doris 表与 Doris 官方能力都允许非 key 列为 NULL，本方案移除全量哨兵转换假设 |
 
 ### 2.3 修正记录
 
-- **修正 1：`source` 不再存 `mcp`**
+- **修正 1：`source` 新增 `mcp` 枚举值**
   - MCP 是入口协议，不是独立认证来源
   - 统一规则：`pvctx.IsAccountAPIToken(ctx) == true` → `api_token`，否则 `ui`
 
@@ -76,10 +76,10 @@
 - **修正 4：不新增 Doris 审计专用连接配置**
   - Doris 连接与 HTTP Host 全部复用 `config.Inf.GetDoris()`
 
-- **修正 5：`sw_dw_global` DDL 不走 `DBTypeDoris` 迁移，新增 `DBTypeDorisGlobal`**
+- **修正 5：`sw_dw_global` DDL 不走迁移框架，改为 `initDatabase()` bootstrap**
   - 迁移框架现在只能对逐项目 Doris 库（`sw_dw_{pid}`）执行 DDL，不支持全局库
-  - `script/migration/service.go:executeMigration()` 新增 `DBTypeDorisGlobal` case，调用 `runDorisGlobalMigration()` 独立执行
-  - `sw_dw_global` 的 DDL（建库+建表）通过该迁移类型执行，不走项目循环
+  - 在 `server.go` 的 `initDatabase()` 中，于 `dorisx.Init()` 成功后调用 `dorisx.DB.GetGlobalDB().ExecContext(ctx, doris_global_sql)`
+  - 使用 `CREATE DATABASE IF NOT EXISTS` + `CREATE TABLE IF NOT EXISTS` 保证幂等
 
 ---
 
@@ -102,18 +102,18 @@ Doris 方案与 PG 方案共享的部分不重复造轮子：
 
 | 文件 | 变更类型 | 改动内容 | 改动的理由 |
 |---|---|---|---|
-| `script/migration/migration.go` | 修改 | 新增 `DBTypeDorisGlobal` 常量 | 迁移框架需要支持全局 Doris DDL 执行 |
-| `script/migration/service.go` | 修改 | 新增 `runDorisGlobalMigration()` 方法和 `executeMigration` 对应 case | `sw_dw_global` 不在项目循环内，需要独立执行路径 |
+| `script/migration/migration.go` | — | — | Doris 全局 DDL 不走迁移框架，通过 `initDatabase()` bootstrap |
+| `script/migration/service.go` | — | — | Doris 全局 DDL 不走迁移框架，通过 `initDatabase()` bootstrap |
 | `script/sql/doris/audit_log.sql` | 新增 | 建库建表 DDL（与现有 `doris.sql` 风格一致） | Doris 审计表独立于 PG，需要单独 DDL |
 | `pkg/dal/dorisx/stream_loader.go` | 修改 | 新增 `Label()`；认证头 `Bearer` → `Basic`；`IsSuccess()` 追加 `Label Already Exists + FINISHED` 判定 | 这是 Doris 审计链路最小且必要的底层补丁 |
 | `pkg/lib/pvctx/pvctx.go` | 修改 | 新增 `ClientIP()` / `WithClientIP()`，并在 `BackGroundCtx()` 复制 | 审计必须记录 IP，异步 goroutine 也要拿到 |
-| `pkg/config/app_cfg.go` | 修改 | 增加 audit writer / spool / replay 配置项 | 审计写入参数需要可配置，但 Doris 连接本身复用现有配置 |
+| `pkg/config/app_cfg.go` | 修改 | 增加 audit writer 配置项 | 审计写入参数需要可配置，但 Doris 连接本身复用现有配置 |
 | `apps/web/server.go` | 修改 | 在 Doris 初始化后启动 audit writer，并在 shutdown 时 drain | writer 生命周期应挂在 Web 服务主生命周期上 |
 | `apps/web/metrics/metrics.go` | 修改 | 增加 audit 指标 factory | 监控必须独立，不混进现有 Doris query 指标 |
 | `apps/web/service/auditlog/audit.go` | 新增 | `Log()` 入口、枚举校验、source 派生 | 统一入口最适合收口业务层接入 |
 | `apps/web/service/auditlog/detail.go` | 新增 | detail 脱敏、裁剪、序列化 | detail 是合规边界，应该集中处理 |
-| `apps/web/service/auditlog/writer_doris.go` | 新增 | batch、label、flush、queue overflow、replay 调度 | Doris 专用复杂度应该深埋在 writer 中 |
-| `apps/web/service/auditlog/spool_doris.go` | 新增 | 批次文件落盘、重试、DLQ | 失败恢复逻辑独立，避免塞满 writer |
+| `apps/web/service/auditlog/writer_doris.go` | 新增 | batch、label、flush、queue overflow 处理 | Doris 专用复杂度深埋在 writer 中 |
+| `apps/web/service/auditlog/spool_doris.go` | — | — | Doris 方案不设本地 spool（同 PG 方案），此文件不需要 |
 | `apps/web/service/auditlog/query_doris.go` | 新增 | 查询、游标、PG 补当前名称 | Doris 查询与 PG 补名天然是这一层职责 |
 | `apps/web/controller/auditlog/audit.go` | 新增 | OpenAPI 查询与导出 handler | 审计产品出口在 controller 层 |
 | 13 个 controller 文件 | 修改 | 在成功路径显式调用 `audit.Log()` | 它们是具体业务动作的唯一入口 |
@@ -131,7 +131,7 @@ CREATE DATABASE IF NOT EXISTS sw_dw_global;
 
 CREATE TABLE IF NOT EXISTS sw_dw_global.audit_log (
     `occurred_at` DATETIME(6)  NOT NULL COMMENT '事件实际发生时间',
-    `event_id`    VARCHAR(64)  NOT NULL COMMENT '稳定事件标识，用于导出对账与 replay 幂等',
+    `event_id`    VARCHAR(64)  NOT NULL COMMENT '稳定事件标识，用于导出对账与 Stream Load 幂等',
     `org_id`      BIGINT       NULL     COMMENT '组织 ID，账号层事件为空',
     `project_id`  BIGINT       NULL     COMMENT '项目 ID，组织层/账号层事件为空',
     `account_id`  BIGINT       NULL     COMMENT '操作人账号 ID，登录失败等无法确认时为空',
@@ -139,9 +139,9 @@ CREATE TABLE IF NOT EXISTS sw_dw_global.audit_log (
     `feature`     VARCHAR(64)  NOT NULL COMMENT '细粒度实体类型：session/chart/experiment/...',
     `target_id`   VARCHAR(64)  NULL     COMMENT '资源 ID，登录类事件为空',
     `action`      VARCHAR(64)  NOT NULL COMMENT 'created/updated/deleted/logged_in/logged_out/login_failed',
-    `source`      VARCHAR(16)  NOT NULL COMMENT '认证来源：ui / api_token',
+    `source`      VARCHAR(16)  NOT NULL COMMENT '认证来源：ui / api_token / mcp',
     `ip_address`  VARCHAR(64)  NOT NULL COMMENT '操作者 IP',
-    `detail`      TEXT         NULL     COMMENT 'JSON: {schema_version,snapshot,comment,extra}',
+    `detail`      TEXT         NULL     COMMENT 'JSON: {schema_version,account,target,comment,extra}',
     `created_at`  DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '入库时间'
 ) ENGINE=OLAP
 DUPLICATE KEY(`occurred_at`, `event_id`)
@@ -165,7 +165,7 @@ PROPERTIES (
 | `feature` | `VARCHAR(64)` | NOT NULL | 共 25 个，完整列表见 §10 接入清单
 | `target_id` | `VARCHAR(64)` | NULL | 登录类事件为空 |
 | `action` | `VARCHAR(64)` | NOT NULL | 6 个基础动作 |
-| `source` | `VARCHAR(16)` | NOT NULL | 只允许 `ui / api_token` |
+| `source` | `VARCHAR(16)` | NOT NULL | 允许 `ui / api_token / mcp` |
 | `ip_address` | `VARCHAR(64)` | NOT NULL | 合规必填 |
 | `detail` | `TEXT` | NULL | 过滤后的 JSON 文本 |
 | `created_at` | `DATETIME(6)` | NOT NULL | Doris 入库时间 |
@@ -188,7 +188,8 @@ V1 明确不做：
 ```go
 type Detail struct {
     SchemaVersion int            `json:"schema_version"`
-    Snapshot      map[string]any `json:"snapshot,omitempty"`
+    Account       map[string]any `json:"account,omitempty"`
+    Target        map[string]any `json:"target,omitempty"`
     Comment       string         `json:"comment,omitempty"`
     Extra         map[string]any `json:"extra,omitempty"`
 }
@@ -266,14 +267,10 @@ type Query struct {
 
 | 配置键 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `audit_log_batch_size` | `int` | `100` | 单批最大条数 |
+| `audit_log_batch_size` | `int` | `500` | 单批最大条数；Doris Stream Load 适合较大批次，默认 500 优于 PG 的 100 |
 | `audit_log_flush_interval` | `duration` | `5s` | 定时 flush 间隔 |
 | `audit_log_flush_timeout` | `duration` | `30s` | 单批 Stream Load 超时 |
-| `audit_log_queue_size` | `int` | `4096` | 内存队列容量，满时非阻塞丢弃 + error 日志 |
-| `audit_log_replay_interval` | `duration` | `30s` | spool 扫描间隔 |
-| `audit_log_spool_dir` | `string` | `${log_dir}/audit-spool` | spool 根目录，生产必须是持久盘 |
-| `audit_log_spool_max_bytes` | `int64` | `1073741824` | spool 总上限，默认 1GiB |
-| `audit_log_spool_max_retries` | `int` | `5` | 单批最大重试次数 |
+| `audit_log_queue_size` | `int` | `4096` | 内存队列容量 / channel buffer 大小，满时非阻塞丢弃 + error 日志 |
 | `audit_log_detail_max_bytes` | `int` | `65536` | detail 最大字节数，默认 64KB |
 
 ### 4.4 Detail 定义
@@ -318,11 +315,11 @@ type Query struct {
 
 | 外部系统/模块 | 依赖类型 | 提供能力 | 集成方式 | 故障影响 |
 |---|---|---|---|---|
-| 迁移框架 | 基础设施 | 执行 `sw_dw_global.audit_log` DDL（建库+建表） | 新增 `DBTypeDorisGlobal` 迁移类型，`service.go` 中独立执行 | DDL 未执行则表不存在，写入/查询均失败 |
-| Doris FE HTTP | 基础设施 | Stream Load | `PUT /api/sw_dw_global/audit_log/_stream_load` | 写入失败，批次进入 spool |
+| 迁移框架 | 基础设施 | 执行 `sw_dw_global.audit_log` DDL（建库+建表） | 通过 `initDatabase()` 在 `dorisx.Init()` 后 bootstrap 执行 | DDL 未执行则表不存在，写入/查询均失败 |
+| Doris FE HTTP | 基础设施 | Stream Load | `PUT /api/sw_dw_global/audit_log/_stream_load` | 写入失败，非阻塞丢弃 + drop counter |
 | Doris MySQL 协议 | 基础设施 | 查询 / DDL | `GetGlobalDB().QueryxContext / ExecContext` | 查询导出失败 |
 | PostgreSQL account service | 内部模块 | `GetAccountNamesMapByIds` | 读侧 best-effort 补名 | 名称为空，但不影响审计主证据 |
-| 本地磁盘 | 基础设施 | spool / dlq 文件持久化 | 原子写文件 + rename | 失败时只能报警，不能保证兜底 |
+| 本地磁盘 | 基础设施 | 无 | Doris 方案不设本地 spool，等价 PG 方案的 drop counter | 异常崩溃存在有限内存丢失窗口 |
 
 参考依据：
 
@@ -339,7 +336,7 @@ type Query struct {
 
 #### 职责
 
-把 `client_ip` 放进 `context.Context`，并确保异步 flush / replay 等后台链路拿得到。
+把 `client_ip` 放进 `context.Context`，并确保异步 flush 等后台链路拿得到。
 
 #### 新增函数
 
@@ -445,7 +442,7 @@ s.headers["Authorization"] = "Basic " + auth
 
 | 场景 | 处理方式 |
 |---|---|
-| HTTP 连接失败/超时 | 返回 error，由 writer 落 spool |
+| HTTP 连接失败/超时 | 返回 error，非阻塞丢弃 + drop counter（同 PG 方案） |
 | `Status = Success / Publish Timeout` | 返回 nil |
 | `Status = Label Already Exists` 且 `ExistingJobStatus = FINISHED` | 返回 nil |
 | `Status = Label Already Exists` 且 `ExistingJobStatus != FINISHED` | 返回 error，由 writer 稍后重试 |
@@ -466,7 +463,7 @@ s.headers["Authorization"] = "Basic " + auth
 
 #### 职责
 
-消费内存队列中的审计条目，按批次生成 stable label，调用 Stream Load 写入 Doris；失败时转交 spool。
+消费内存队列中的审计条目，按批次生成 stable label，调用 Stream Load 写入 Doris；写入失败时非阻塞丢弃并记 drop counter。
 
 #### 关键结构与函数
 
@@ -474,7 +471,6 @@ s.headers["Authorization"] = "Basic " + auth
 type DorisWriter struct {
     ch      chan *Entry
     loader  *dorisx.StreamLoader
-    spool   *DorisSpool
     metrics *Metrics
     cfg     WriterConfig
 
@@ -503,7 +499,9 @@ loader := &dorisx.StreamLoader{
 }
 ```
 
-#### `Enqueue()` 规则
+#### `Enqueue()` 规则（同 PG 方案）
+
+channel 满时非阻塞丢弃，不 spill 到磁盘：
 
 ```go
 func (w *DorisWriter) Enqueue(ctx context.Context, e *Entry) error {
@@ -511,15 +509,9 @@ func (w *DorisWriter) Enqueue(ctx context.Context, e *Entry) error {
     case w.ch <- e:
         return nil
     default:
-        // 不能阻塞主流程，也不能静默丢
-        batch := []*Entry{e}
-        label := w.generateLabel(batch)
-        w.metrics.QueueOverflowTotal.Inc()
-        return w.spool.Append(ctx, SpoolBatch{
-            Label:      label,
-            RetryCount: 0,
-            Entries:    batch,
-        })
+        w.metrics.DropTotal.Inc()
+        log.CtxError(ctx, "audit channel full, drop entry")
+        return nil
     }
 }
 ```
@@ -535,7 +527,7 @@ flushLoop:
   payload = marshal(batch)
   loader.Label(label).Load(ctx, payload)
   if success -> done
-  if error -> spool.Append(batch with same label)
+  if error -> drop +1 DropTotal + error log
 ```
 
 #### label 规则
@@ -551,7 +543,7 @@ func (w *DorisWriter) generateLabel(batch []*Entry) string {
 规则：
 
 - 长度必须小于 128
-- 同一批次初次 flush 与 replay 必须复用同一 label
+- 同一批次初次 flush 与重试必须复用同一 label
 - label 的来源只依赖 batch 内容，不依赖当前时间
 
 #### 事务边界
@@ -569,120 +561,31 @@ func (w *DorisWriter) generateLabel(batch []*Entry) string {
 
 | 失败场景 | 处理方式 | 最终一致性 |
 |---|---|---|
-| Doris HTTP 不可达 | 批次落 spool，后续 replay | 通过同 label 重试保证 |
+| Doris HTTP 不可达 | 非阻塞丢弃 + drop counter + error 日志 | Doris 恢复后正常写入新数据，已丢数据不补偿 |
 | Doris 返回 `Label Already Exists` + `FINISHED` | 当作成功 | 自然幂等 |
 | Doris 返回 `Label Already Exists` + `RUNNING` | 当作失败，稍后重试 | 避免误判成功 |
-| JSON 编码失败 | 记 error metric，批次进 DLQ | 需要人工排查 |
-| queue 满 | 单条直接溢出到 spool | 不阻塞主流程，也不丢数据 |
+| JSON 编码失败 | 记 error metric，丢弃 | 需要人工排查采集数据链路 |
+| queue 满 | 非阻塞丢弃 + drop counter + error 日志（同 PG 方案） | 不阻塞主流程 |
 
 #### 接口深度评估
 
 | 维度 | 结果 | 说明 |
 |---|---|---|
 | Interface 大小 | 少量方法 | 入口只有 `Enqueue / Start / Stop` |
-| 隐藏复杂度 | 大量实现 | batch、label、spool、replay、metrics 全藏内部 |
+| 隐藏复杂度 | 中等 | batch、label、metrics 全藏内部（同 PG 方案） |
 | 可测试性 | 中 | 需要 mock Stream Load 与文件系统 |
 | 评价 | Deep ✅ | 复杂度集中收口，调用方最轻 |
 
 ---
 
-### 5.4 Spool / Replay 模块（spool_doris）
+### 5.4 失败处理
 
-#### 职责
+**Doris 方案不设本地 spool**（与 PG 方案一致）。
 
-以**批次文件**为单位持久化失败数据，并在后台重试。
-
-#### 为什么不用 JSONL
-
-旧稿里用的是“一个文件多行 JSONL”。这里改成“一个批次一个文件”，原因很简单：
-
-- 删除已成功回放的批次更简单
-- 不需要做行级重写
-- Doris 审计失败量预期很低，文件数量可控
-
-#### 文件结构
-
-目录：
-
-```text
-{audit_log_spool_dir}/doris/
-├── pending/
-│   └── 20260707T120102Z-audit_log_01JAAAAB_01JAAACD_100.json
-└── dlq/
-    └── 20260707T120102Z-audit_log_01JAAAAB_01JAAACD_100.json
-```
-
-文件内容：
-
-```json
-{
-  "label": "audit_log_01JAAAAB_01JAAACD_100",
-  "retry_count": 2,
-  "entries": [
-    {
-      "event_id": "01JAAAAB...",
-      "org_id": 12,
-      "project_id": 34,
-      "account_id": 56,
-      "domain": "asset",
-      "feature": "dashboard",
-      "action": "updated",
-      "source": "ui",
-      "ip_address": "10.0.0.1",
-      "detail": "{\"schema_version\":1}",
-      "occurred_at": "2026-07-07T12:00:00Z"
-    }
-  ]
-}
-```
-
-#### 关键函数
-
-```go
-type SpoolBatch struct {
-    Label      string   `json:"label"`
-    RetryCount int      `json:"retry_count"`
-    Entries    []*Entry `json:"entries"`
-}
-
-func (s *DorisSpool) Append(ctx context.Context, batch SpoolBatch) error
-func (s *DorisSpool) Replay(ctx context.Context, loader *dorisx.StreamLoader) error
-func (s *DorisSpool) MoveToDLQ(ctx context.Context, path string) error
-```
-
-#### `Append()` 规则
-
-- 写入临时文件 `${name}.tmp`
-- `Close()` 后 `Rename()` 到 `pending/`
-- 失败时立即上报 `web_audit_spool_write_failed_total`
-- 单批失败不影响主业务，只影响审计最终一致性
-
-#### Replay 规则
-
-1. 扫描 `pending/`，按文件名升序回放
-2. 读取一个批次文件
-3. `loader.Label(batch.Label).Load(...)`
-4. 成功则删除文件
-5. 失败则 `retry_count++`
-6. 若 `retry_count >= max_retries`，移动到 `dlq/`
-
-#### 事务边界
-
-```
-🟢 ── Spool Append ──────────────────────────────
-    │ 1. 写临时文件
-    │ 2. fsync / close
-    │ 3. rename 到 pending 目录
-🔴 ── Append Done / Error ───────────────────────
-```
-
-#### 接口深度评估
-
-| 维度 | 结果 | 说明 |
-|---|---|---|
-| Interface 大小 | 少量方法 | `Append / Replay / MoveToDLQ` 即可 |
-| 隐藏复杂度 | 中 | 文件原子写、重试、DLQ 全封装 |
-| 可测试性 | 好 | `t.TempDir()` 即可覆盖 |
+- channel 满：非阻塞丢弃 + `DropTotal` counter + error 日志
+- Stream Load 失败（HTTP 错误、超时、Doris 不可达）：非阻塞丢弃 + `DropTotal` counter + error 日志
+- 服务优雅退出时由 `Stop()` drain 剩余批次，异常崩溃存在有限内存丢失窗口
+- 无磁盘持久化，无 replay 机制。审计数据最终一致性由业务容忍度决定，与 PG 方案等价。
 | 评价 | Deep ✅ | 文件模型简单，职责边界清楚 |
 
 ---
@@ -777,30 +680,19 @@ flowchart TD
     Validate --> Detail[脱敏 + 64KB 裁剪]
     Detail --> Enqueue{队列有空位?}
     Enqueue -->|是| Queue[进入内存队列]
-    Enqueue -->|否| Spill[单条批次直接写 spool]
+    Enqueue -->|否| Drop[非阻塞丢弃 +1 drop counter]
+    Drop --> Done([完成])
     Queue --> Flush[Flush Worker 攒批]
     Flush --> Label[生成 stable label]
     Label --> Load[StreamLoader.Label(label).Load]
-    Load -->|成功| Done([完成])
-    Load -->|失败| Spool[整批写 spool]
-    Spill --> Done
-    Spool --> Done
+    Load -->|成功| Done
+    Load -->|失败| DropErr[非阻塞丢弃 +1 drop counter + error日志]
+    DropErr --> Done
 ```
 
 ### 6.2 失败流程
 
-```mermaid
-flowchart TD
-    Fail[flush/replay 失败] --> Pending[批次保留在 pending]
-    Pending --> Replay[Replay Worker 定时扫描]
-    Replay --> Load[使用原 label 再次 Stream Load]
-    Load --> Result{成功?}
-    Result -->|是| Remove[删除 pending 文件]
-    Result -->|否| Retry[retry_count + 1]
-    Retry --> Limit{>= max_retries?}
-    Limit -->|否| Pending
-    Limit -->|是| DLQ[移动到 dlq]
-    DLQ --> Alert[报警]
+不再需要单独的失败流程图。Doris 方案与 PG 方案一致：写入失败 = 非阻塞丢弃 + drop counter + error 日志。无 spool / replay / DLQ。
 ```
 
 ---
@@ -853,18 +745,15 @@ sequenceDiagram
 | 单元测试 | detail 脱敏 / 裁剪 | 邮箱脱敏、超 64KB 裁剪、空 detail | Go testing |
 | 单元测试 | Query 校验 | 缺时间范围、缺 scope、limit 越界 | Go testing |
 | 集成测试 | Writer + mock Doris FE | HTTP 200 成功、超时、重复 label、500 错误 | `httptest.Server` |
-| 集成测试 | Spool | append、replay 成功、replay 失败、进入 DLQ | `t.TempDir()` |
 | 集成测试 | Query + PG 补名 | Doris 成功 / PG 补名失败降级 | mock DAO/service |
-| 边界测试 | queue 满 | `Enqueue()` 溢出到 spool | 参数化测试 |
-| 边界测试 | replay 文件损坏 | 文件无法解析时进入 DLQ | 文件级测试 |
+| 边界测试 | queue 满 | `Enqueue()` 非阻塞丢弃 | 参数化测试 |
 
 ### 8.2 必测用例清单
 
-- `source` 派生：UI session → `ui`；API Token → `api_token`
+- `source` 派生：UI session → `ui`；API Token → `api_token`；MCP → `mcp`
 - `client_ip` 丢失时不写审计、但业务不回滚
-- `Label Already Exists + ExistingJobStatus=FINISHED` 不重复落 spool
-- `Label Already Exists + ExistingJobStatus=RUNNING` 会保留重试
-- spool 目录放在临时盘时指标能正确暴露积压风险
+- `Label Already Exists + ExistingJobStatus=FINISHED` 视为成功，不记 drop
+- `Label Already Exists + ExistingJobStatus=RUNNING` 视为失败，计 drop counter
 - 查询没有 scope 时必须被拒绝
 - 导出时绝不输出邮箱字段
 
@@ -875,20 +764,18 @@ sequenceDiagram
 | 风险点 | 概率 | 影响 | 预防 | 补救 |
 |---|---|---|---|---|
 | Stream Load HTTP 通路不通 | 中 | 高 | Phase 0 先 curl 验证 | 方案回退 PG，不硬上 Doris |
-| `Label Already Exists` 误判成功 | 低 | 高 | 必须检查 `ExistingJobStatus == FINISHED` | 修正 `IsSuccess()` 并重放 DLQ |
-| queue 长期满导致大量直写 spool | 低 | 中 | 暴露 `web_audit_queue_depth` 与 `web_audit_queue_overflow_total` | 扩容 queue / 降低 flush interval |
-| spool 落在非持久盘 | 中 | 中 | 配置文档明确要求持久盘 | 运维整改，必要时暂停 Doris 方案 |
+| `Label Already Exists` 误判成功 | 低 | 高 | 必须检查 `ExistingJobStatus == FINISHED` | 修正 `IsSuccess()` 确保正确判定 |
+| queue 长期满导致写入丢弃 | 低 | 中 | 暴露 `audit_channel_drop_total` 与 `web_audit_queue_depth` | 扩容 queue / 降低 flush interval |
 | 无 actor 快照导致导出显示名缺失 | 中 | 低 | 读侧 best-effort 补名 | 明确 `account_id` 才是主证据 |
 
 ### 9.1 补偿策略总表
 
 | 场景 | 可重试 | 策略 | 最终一致性 |
 |---|---|---|---|
-| Stream Load 超时 / 网络错误 | ✅ | spool + replay | 同 label 重试 |
+| Stream Load 超时 / 网络错误 | ❌ | 非阻塞丢弃 + drop counter | 审计数据不补偿，Doris 恢复后正常写入新数据 |
 | 重复 label 且已完成 | 不需要 | 视为成功 | 自然幂等 |
-| 重复 label 但原任务未完成 | ✅ | 稍后重试 | 避免假成功 |
+| 重复 label 但原任务未完成 | ❌ | 视为失败，计 drop counter | 等待下次 flush 写入新批次 |
 | PG 补名失败 | ❌ | 只降级展示 | 不影响审计主数据 |
-| spool 文件损坏 | ❌ | 进 DLQ + 告警 | 需要人工排查 |
 
 ---
 
@@ -901,29 +788,29 @@ sequenceDiagram
 | Domain | 涉及的 Controller 文件 | Feature |
 |---|---|---|
 | account | `controller/account/account.go` | `session`, `account_setting` |
-| account | `controller/account/api_token.go` | `api_token` |
-| organization | `controller/org/org.go` | `org_setting` |
-| organization | `controller/org/member.go` | `org_member` |
-| organization | `controller/org/invitation.go` | `org_member_invitation` |
+| account | `controller/account/account_api_token.go` | `api_token` |
+| organization | `controller/organization/organization.go` | `org_setting` |
+| organization | `controller/organization/member.go` | `org_member` |
+| organization | `controller/organization/member.go` | `org_member_invitation` |
 | project | `controller/project/project.go` | `project_setting` |
 | project | `controller/project/member.go` | `project_member` |
 | asset | `controller/chart/chart.go` | `chart` |
 | asset | `controller/dashboard/dashboard.go` | `dashboard` |
-| asset | `controller/cohort/cohort.go` | `cohort` |
-| asset | `controller/experiment/experiment.go` | `experiment` |
-| asset | `controller/feature/feature_gate.go` | `feature_gate` |
-| asset | `controller/feature/feature_config.go` | `feature_config` |
+| asset | `controller/analysis/cohort.go` | `cohort` |
+| asset | `controller/ab/ab.go` | `experiment` |
+| asset | `controller/ab/ab.go` | `feature_gate` |
+| asset | `controller/ab/ab.go` | `feature_config` |
 | asset | `controller/pipeline/pipeline.go` | `pipeline` |
-| asset | `controller/tracking_plan/tracking_plan.go` | `tracking_plan` |
-| asset | `controller/ab/layer.go` | `layer` |
-| asset | `controller/ab/holdout.go` | `holdout` |
-| asset | `controller/ab/target.go` | `target` |
-| metadata | `controller/metric/metric.go` | `metric` |
-| metadata | `controller/event/tracked_event.go` | `tracked_event` |
-| metadata | `controller/event/virtual_event.go` | `virtual_event` |
-| metadata | `controller/property/event_property.go` | `event_property` |
-| metadata | `controller/property/user_property.go` | `user_property` |
-| metadata | `controller/property/virtual_property.go` | `virtual_property` |
+| asset | `trackingplan/controller/tracking_plan.go` | `tracking_plan` |
+| asset | `controller/ab/ab.go` | `layer` |
+| asset | `controller/ab/ab.go` | `holdout` |
+| asset | `controller/ab/ab.go` | `target` |
+| metadata | `controller/metadata/metric.go` | `metric` |
+| metadata | `controller/metadata/tracked_event.go` | `tracked_event` |
+| metadata | `controller/metadata/virtual_event.go` | `virtual_event` |
+| metadata | `controller/metadata/event_property.go` | `event_property` |
+| metadata | `controller/metadata/user_property.go` | `user_property` |
+| metadata | `controller/metadata/virtual_property.go` | `virtual_property` |
 
 ---
 
@@ -933,31 +820,28 @@ sequenceDiagram
 
 | 步骤 | 操作 | 预期影响 | 回滚方式 |
 |---|---|---|---|
-| 1 | 合并迁移框架修改（`DBTypeDorisGlobal` + `runDorisGlobalMigration()`） | 仅代码变更，无数据影响 | 回滚代码 |
-| 2 | 运行 `doris_v20260707_audit_log_global` 迁移（Create `sw_dw_global.audit_log`） | 新增表，无线上读写影响 | `DROP TABLE sw_dw_global.audit_log`（未接入前） |
+| 1 | 在 `initDatabase()` 中新增 `doris_global.sql` DDL（`sw_dw_global.audit_log` 建表），在 `dorisx.Init()` 后执行 bootstrap | 仅代码变更，无数据影响 | 回滚代码 |
+| 2 | 上线第 1 版（此版本中 Doris 建表逻辑生效，writer 尚未接入 controller） | 新增表，无线上读写影响 | `DROP TABLE sw_dw_global.audit_log`（未接入前） |
 | 3 | dev 环境 curl 验证 Stream Load | 无业务影响 | 不需要 |
-| 4 | 发布带 `StreamLoader` 补丁与 audit writer 的服务 | 开始具备 Doris 审计能力 | 回滚服务版本 |
+| 4 | 发布带 `StreamLoader` 补丁、audit writer、`initDatabase()` bootstrap 全部就绪的服务 | 开始具备 Doris 审计能力 | 回滚服务版本 |
 | 5 | 接入业务 controller | 审计开始写入 | 回滚服务版本或移除调用点 |
 | 6 | 开启查询导出接口 | 审计能力对外可用 | 回滚服务版本 |
 
 ### 11.2 回滚检查清单
 
 - [x] Doris DDL 是新增型，不影响既有业务表
-- [x] `DBTypeDorisGlobal` 迁移只对 `sw_dw_global` 执行，不影响每项目 Doris 迁移流程
+- [x] `initDatabase()` bootstrap 只对 `sw_dw_global` 执行，不影响每项目 Doris 迁移流程
 - [x] 回滚服务版本不会破坏已写入的审计数据
-- [x] Doris 写入失败会落 spool，不需要额外补业务数据
-- [x] 迁移回滚只需标记迁移为失败，删除 DDL 回滚语句
+- [x] 迁移回滚只需删除 `doris_global.sql` 中的 DDL 并回退代码
 
 ### 11.3 上线观测
 
 | 指标 | 正常范围 | 告警阈值 | 说明 |
 |---|---|---|---|
 | `web_audit_queue_depth` | < 800 | > 800 持续 5 分钟 | 队列积压 |
-| `web_audit_queue_overflow_total` | 0 | 持续增长 | 主流程开始直接 spill 到磁盘 |
+| `audit_channel_drop_total` | 0 | > 0（需确认是否短暂峰值） | 主流程开始丢弃（channel 满或 flush 失败） |
+| `web_audit_queue_depth` | < 800 | > 800 持续 5 分钟 | 队列积压 |
 | `web_audit_flush_failed_total` | 0 | 持续增长 | Doris 写入失败 |
-| `web_audit_replay_failed_total` | 0 | 持续增长 | replay 无法清空 |
-| `web_audit_spool_bytes` | 0 或小幅波动 | > 512MiB | 磁盘积压 |
-| `web_audit_oldest_pending_seconds` | < 60 | > 300 | 有旧批次长时间未清理 |
 
 ---
 
@@ -969,8 +853,8 @@ sequenceDiagram
 - [x] 查询必须带时间范围和 scope，避免无界扫描
 
 ### QG-2 Data Integrity
-- [x] queue 满不丢数据，直接 spill 到 spool
-- [x] replay 复用同一 label
+- [x] queue 满时非阻塞丢弃 + drop counter + error 日志（同 PG 方案）
+- [x] Doris Stream Load 幂等通过 stable label + ExistingJobStatus 判断保证
 - [x] `Label Already Exists` 只在 `FINISHED` 时视为成功
 
 ### QG-3 Security
@@ -980,9 +864,8 @@ sequenceDiagram
 
 ### QG-4 Simplicity
 
-- [ ] ~~无新增框架~~ — `DBTypeDorisGlobal` 是迁移框架的新枚举值，不是新框架，是现有模式的扩展
+- [ ] ~~无新增框架~~ — Doris 全局 DDL 不走迁移框架，通过 `initDatabase()` bootstrap，不是新框架
 - [x] Doris 连接配置完全复用现有 infra
-- [x] spool 采用”一批一个文件”的最小模型
 
 ### QG-5 Completeness
 - [x] 文件清单完整
@@ -1006,7 +889,7 @@ sequenceDiagram
 
 ### QG-10 外部依赖
 
-- [x] Doris HTTP / MySQL 协议、PG 补名、磁盘 spool、迁移框架的契约都已记录
+- [x] Doris HTTP / MySQL 协议、PG 补名、迁移框架的契约都已记录
 - [x] 每个外部依赖的故障影响已评估
 
 ### QG-11 上线回滚

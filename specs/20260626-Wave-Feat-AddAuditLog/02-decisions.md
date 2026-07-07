@@ -282,11 +282,37 @@ V1 不再以通用 diff 引擎为前提，Detail 构造遵循以下规则：
 
 ## Client IP 与反向代理（2026-07-07）
 
-- gin 审计请求的 `ip_address` 来源为 APISIX 透传的 `X-Real-IP`
-- MCP 审计请求的 `ip_address` 也在 net/http 入口读取 `X-Real-IP`（APISIX 透传），降级读 `RemoteAddr`
+- gin 审计请求的 `ip_address` 来源为反向代理透传的 `X-Real-IP`，通过 `c.ClientIP()` 获取
+- MCP 审计请求的 `ip_address` 在 net/http 入口读取 `X-Real-IP`（反向代理透传），降级读 `RemoteAddr`
 - V1 **不配置全局 `TrustedProxies`**（影响所有 gin 路由，超出审计范围）
 - 文档说明此限制：无 TrustedProxies 时 IP 在某些场景下可能为容器 IP，V2 按需引入
 - 配置细节见 [04-detail-pg.md §4.5](./04-detail-pg.md)
+
+## Client IP 修正（2026-07-07）← 替代旧版 APISIX 描述
+
+- Wave 项目不存在 APISIX 组件；所有 docker-compose 使用 host 网络
+- IP 获取就是简单的 `c.ClientIP()`，反向代理透传 `X-Real-IP`
+- 文档中删去所有 "APISIX" 字样，统一为"反向代理透传"
+
+## OrganizationFilter 扩大注入 org_id（2026-07-07）
+
+- 移除 ``if !IsAccountAPIToken`` guard，OrganizationFilter 对所有接口执行 org_id 提取
+- 已确认现有代码中：组织级接口从 body/query 提取，项目级接口可通过 `GetOrgIDByProjectCached`（有缓存）获取，账号/OP 接口自然跳过
+- 具体实现见 [04-detail-pg.md §4.4](./04-detail-pg.md)
+
+## Doris DDL bootstrap 方案（2026-07-07）
+
+- `sw_dw_global.audit_log` DDL 不通过 `DBTypeDorisGlobal` 迁移框架执行
+- 改用 `initDatabase()` 中新增 `doris_global.sql` embed，在 `dorisx.Init()` 后执行 bootstrap
+- 原因：现有 `DBTypeDoris` 迁移是每项目循环（per-project），对全局数据库无相关基础设施
+- 详见 [04-detail-doris.md §2.3](./04-detail-doris.md)
+
+## Handler 命名规则（2026-07-07）
+
+- 文档中的 controller/handler 名称以真实 OpenAPI 生成的代码为准，不使用简写或虚构名
+- 例如：使用 `LoginAccount` / `AddNewChart` / `PostAbCreate`，而非 `CreateChart` / `UpdateExperiment`
+- Metadata 域 controller 位于 `controller/metadata/`，非 `controller/event/` 或 `controller/property/`
+- 完整映射表见 [04-detail-pg.md §10](./04-detail-pg.md)
 
 ## 裁剪策略（2026-07-07）
 
@@ -297,7 +323,7 @@ V1 不再以通用 diff 引擎为前提，Detail 构造遵循以下规则：
 - **决策理由**：V1 简单性优先于 detail 完整性。合规审计只需要"谁在何时做了什么"，detail 为空不影响行级追溯。后续如有细化需求可补充逐级裁剪。
 - 详细说明见 [04-detail-pg.md §5.4](./04-detail-pg.md)
 
-## Doris 方案补充决策（2026-07-07）
+## Doris 方案补充决策（2026-07-07，修正 2026-07-07）
 
 针对第三方审核发现的缺口，以下决策立即生效：
 
@@ -308,6 +334,8 @@ V1 不再以通用 diff 引擎为前提，Detail 构造遵循以下规则：
 - **一期全量接入**：不拆 Phase 1/2/3，一期一次性接入全部 25 feature
 - **PG 索引维持 3 个**：`(project_id, occurred_at)`, `(org_id, occurred_at)`, `(account_id, occurred_at WHERE account_id IS NOT NULL)`，暂不增减
 - **Doris 索引前缀键调整**：DUPLICATE KEY 改为 `(occurred_at, org_id, project_id, account_id)` 以对齐高频查询路径
+- **StreamLoader 修改清单（代码评审确认）**：`Label()` 不存在需新增；认证头 `Bearer` → `Basic`（单行修改，与 `doris_apix.go:105` 对齐）；`IsSuccess()` 追加 `Label Already Exists + FINISHED` 判定；硬编码 `User-Agent: ID-Merge-Agent` 和 `Client` 未设 Timeout 需清理
+- **Doris 不设本地 spool（同 PG 方案）**：写入失败时非阻塞丢弃 + drop counter + error 日志，不 spill 到磁盘。原因：Wave 代码库中无任何 spool 基础设施（`grep -rn "spool"` 全库零结果），完整建设需 1-2 天，与 PG 方案的 no-spool 原则对齐
 
 ## OrgID 传递方案（2026-07-07）
 
