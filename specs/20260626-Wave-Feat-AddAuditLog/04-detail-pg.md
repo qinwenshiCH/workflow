@@ -156,6 +156,8 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_account_time
 | `idx_audit_log_org_time` | `global.audit_log` | `(org_id, occurred_at DESC)` | 组织级时间范围查询 |
 | `idx_audit_log_account_time` | `global.audit_log` | `(account_id, occurred_at DESC)` WHERE account_id NOT NULL | 按人追溯查询 |
 
+> 注：V1 未创建 `event_id` 独立索引。`event_id` 虽有序但非业务查询入口——所有查询均以 project_id / org_id / account_id 为先导条件，独立索引无实际查询收益，仅增加写入开销。V2 可替换为 `(project_id, event_id DESC)` 复合索引，利用 UUID v7 时序性消除 `occurred_at` 的冗余排序。
+
 ### 4.2 API / 接口
 
 #### 新增接口
@@ -226,6 +228,8 @@ func Log(ctx context.Context, domain, feature, action, targetID string, detail *
 | `pvctx` | 内部模块 | 鉴权与审计上下文 | 函数调用 | 当前版本 | 内部 | 需新增 `audit_source` 与 `client_ip` |
 
 > **IP 提取策略**：优先读反向代理透传的 `X-Real-IP`，降级读 `RemoteAddr`。不配置全局 `TrustedProxies`（影响所有 gin 路由，超出审计范围）。V1 文档说明此限制，IP 可能在某些场景下不准确。
+>
+> **连接池隔离**：PGWriter 使用独立的 `*sql.DB` 实例，不与业务请求共享连接池。独立池配置：最大空闲 2、最大打开 4，避免审计写满时影响业务连接。
 
 #### 集成契约
 
@@ -313,6 +317,17 @@ func (w *PGWriter) Stop(ctx context.Context)     // 停止 flushLoop，drain 剩
 > channel 是 Go 原生 `chan *Entry`，进程内 FIFO 队列。多副本时各进程独立，不跨副本协调。条目不会在 channel 中阻塞主流程——buffer 满时立即丢弃并记 counter + error 日志，不存在阻塞等待路径。
 > 
 > **优雅重启 drain 机制**：shutdown 顺序为 `server.Shutdown()`（先停 HTTP）→ `writer.Stop()`（等待 channel 消费完毕或超时 5s）→ `globaldb.Close()`。HTTP 先停保证无新 `audit.Log()` 调用，writer 执行时数据库连接仍可用。`kill -9`/OOM 等非优雅退出存在内存队列丢失窗口。
+>
+> #### 连接池配置
+>
+> PGWriter 持有独立 `*sql.DB` 实例，不与业务请求共享连接池，避免审计写满时影响业务连接。
+>
+> | 参数 | 值 | 说明 |
+> |------|----|------|
+> | 最大空闲连接 | 2 | 日常低负载下保持少量连接 |
+> | 最大打开连接 | 4 | 限制审计连接对 PG 的整体压力 |
+> | 连接最大存活时间 | 30m | 定期回收，避免长连接被中间件断掉 |
+> | 驱动 | `lib/pq` 或 `pgx` | 与项目现有 PG 驱动一致 |
 
 | 函数 | 作用 | 事务边界 | 权限校验 | 重入安全? |
 |---|---|---|---|---|
@@ -605,6 +620,10 @@ sequenceDiagram
 | detail 超限 | ❌ | 不重试，丢弃 detail | 记 warn 日志 | 审计行不丢失 |
 | channel 满 | ❌ | 非阻塞丢弃 + error 日志 | 记 drop counter | 接受极值有限丢失 |
 
+> **V1 已知限制：IP 地址准确性**
+>
+> V1 的 `client_ip` 来源依赖反向代理（APISIX）透传的 `X-Real-IP` 请求头。在未配置 `TrustedProxies` 白名单时，恶意客户端可伪造该头。这是 V1 的有意简化——IP 在审计中作为参考线索而非唯一证据，且内部环境下篡改风险可控。如合规要求提升，V2 按需引入 `TrustedProxies` + `gin.ClientIP()` 严格模式。
+
 ---
 
 ## 10. 接入清单：Controller → Domain/Feature/Action 映射
@@ -615,12 +634,14 @@ sequenceDiagram
 >
 > **org_id 来源说明**：`audit.Log()` 内部从 `pvctx.OrgID(ctx)` 提取 org_id。账号层事件（§10.1）ctx 中无 OrgID，写 NULL。组织/项目层事件（§10.2–§10.5）由 OrganizationFilter 中间件统一注入——该中间件已扩大范围，去掉 `IsAccountAPIToken` 提前返回。Org 路由从请求参数提取 org_id；项目路由通过 `GetOrgIDByProjectCached` 反查（走缓存）；Account/OP 等无上下文路径不注入，写 NULL。MCP 由 `authorizeProjectContext` 注入。各 handler 无需手动处理 org_id。
 >
+> Detail.Target 只包含业务相关字段（name、label、role 等），不含冗余的 id/type。
+>
 > 代码形态统一为：
 > ```go
 > audit.Log(ctx, audit.DomainXxx, audit.FeatureXxx, audit.ActionXxx,
 >     targetID, &audit.Detail{
 >         Account: map[string]any{"id": aid},
->         Target: map[string]any{"id": tid, "name": name, "type": "xxx"},
+>         Target:  map[string]any{"name": name}, // 仅业务字段
 >     })
 > ```
 >
@@ -633,91 +654,93 @@ sequenceDiagram
 | 1 | `session` | `logged_in` | `controller/account/account.go` | `LoginAccount` | 空 | Account: `{id}`, 无 Target |
 | 2 | `session` | `logged_out` | `controller/account/account.go` | `LogoutAccount` | 空 | Account: `{id}`, 无 Target |
 | 3 | `session` | `login_failed` | `controller/account/account.go` | `LoginAccount`（失败路径） | 空 | Account: `{id}`（可识别时）或 `{name: "登录名"}`（仅标识），不记录密码 |
-| 4 | `account_setting` | `updated` | `controller/account/account.go` | `UpdateAccountInfo` / `UpdateAccountPwd` | account ID | Target: `{id, name, type:"account"}` |
-| 5 | `api_token` | `created` | `controller/account/account_api_token.go` | `CreateAAPIToken` | token ID | Target: `{id, name, type:"api_token"}` |
-| 6 | `api_token` | `updated` | 同上 | `UpdateAAPIToken` / `OperateAAPITokenStatus` | token ID | Target: `{id, name, type:"api_token"}` |
-| 7 | `api_token` | `deleted` | 同上 | `DeleteAAPIToken` | token ID | Target: `{id, name, type:"api_token"}` |
+| 4 | `account_setting` | `updated` | `controller/account/account.go` | `UpdateAccountInfo` / `UpdateAccountPwd` | account ID | Target: `{name}` |
+| 5 | `api_token` | `created` | `controller/account/account_api_token.go` | `CreateAAPIToken` | token ID | Target: `{label}` |
+| 6 | `api_token` | `updated` | 同上 | `UpdateAAPIToken` / `OperateAAPITokenStatus` | token ID | Target: `{label}` |
+| 7 | `api_token` | `deleted` | 同上 | `DeleteAAPIToken` | token ID | Target: `{label}` |
 
 ### 10.2 Domain: organization
 
 | # | Feature | Action | Controller | Handler | targetID | Detail 要点 |
 |---|---|---|---|---|---|---|
-| 8 | `org_setting` | `updated` | `controller/organization/organization.go` | `UpdateOrgInfo` | org ID | Target: `{id, name, type:"organization"}` |
-| 9 | `org_member` | `created` | `controller/organization/member.go` | `CreateOrgMemberInvite` | 成员 account ID | Target: `{id, name, type:"org_member", role}` |
+| 8 | `org_setting` | `updated` | `controller/organization/organization.go` | `UpdateOrgInfo` | org ID | Target: `{name}` |
+| 9 | `org_member` | `created` | `controller/organization/member.go` | `CreateOrgMemberInvite` | 成员 account ID | Target: `{name, role}` |
 | 10 | `org_member` | `updated` | 同上 | `UpdateOrgMember` | 成员 account ID | Extra: `{role_before, role_after}` |
-| 11 | `org_member` | `deleted` | 同上 | `DeleteOrgMember` | 成员 account ID | Target: `{id, name, type:"org_member"}` |
-| 12 | `org_member_invitation` | `created` | `controller/organization/member.go` | `CreateOrgMemberInvite` | invitation ID | Target: `{id, email_hint, type:"org_invitation"}` |
-| 13 | `org_member_invitation` | `deleted` | 同上 | —（不存在独立 handler） | invitation ID | Target: `{id, type:"org_invitation"}` |
+| 11 | `org_member` | `deleted` | 同上 | `DeleteOrgMember` | 成员 account ID | Target: `{name}` |
+| 12 | `org_member_invitation` | `created` | `controller/organization/member.go` | `CreateOrgMemberInvite` | invitation ID | Target: `{email_hint}` |
+| 13 | `org_member_invitation` | `deleted` | 同上 | —（不存在独立 handler） | invitation ID | Target: `{}` |
 
 ### 10.3 Domain: project
 
 | # | Feature | Action | Controller | Handler | targetID | Detail 要点 |
 |---|---|---|---|---|---|---|
-| 14 | `project_setting` | `updated` | `controller/project/project.go` | `UpdateProjectInfo` | project ID | Target: `{id, name, type:"project"}` |
-| 15 | `project_member` | `created` | `controller/project/member.go` | `AddMember` | 成员 account ID | Target: `{id, name, type:"project_member", role}` |
-| 16 | `project_member` | `updated` | 同上 | `UpdateMemberRole` | 成员 account ID | Extra: `{role_before, role_after}` |
-| 17 | `project_member` | `deleted` | 同上 | `RemoveMember` | 成员 account ID | Target: `{id, name, type:"project_member"}` |
+| 14 | `project_setting` | `updated` | `controller/project/project.go` | `UpdateProjectInfo` | project ID | Target: `{name}` |
+| 15 | `project_member` | `created` | `controller/project/member.go` | `AddProjectMember` | 成员 account ID | Target: `{name, role}` |
+| 16 | `project_member` | `updated` | 同上 | `UpdateProjectMember` | 成员 account ID | Extra: `{role_before, role_after}` |
+| 17 | `project_member` | `deleted` | 同上 | `DeleteProjectMember` | 成员 account ID | Target: `{name}` |
 
 ### 10.4 Domain: asset
 
 | # | Feature | Action | Controller | Handler | targetID | Detail 要点 |
 |---|---|---|---|---|---|---|
-| 18 | `chart` | `created` | `controller/chart/chart.go` | `AddNewChart` | chart ID | Target: `{id, name, type:"chart", ...filtered}` |
-| 19 | `chart` | `updated` | 同上 | `UpdateChartDetail` | chart ID | Target: `{id, name, type:"chart", ...filtered}` |
+| 18 | `chart` | `created` | `controller/chart/chart.go` | `AddNewChart` | chart ID | Target: `{name, ...filtered}` |
+| 19 | `chart` | `updated` | 同上 | `UpdateChartDetail` | chart ID | Target: `{name, ...filtered}` |
 | 20 | `chart` | `deleted` | 同上 | `DeleteChart` | chart ID | Extra: `{ids: [...]}`（批量时需手动循环） |
-| 21 | `dashboard` | `created` | `controller/dashboard/dashboard.go` | `CreateNewDashboard` | dashboard ID | Target: `{id, name, type:"dashboard"}` |
+| 21 | `dashboard` | `created` | `controller/dashboard/dashboard.go` | `CreateNewDashboard` | dashboard ID | Target: `{name}` |
 | 22 | `dashboard` | `updated` | 同上 | `UpdateDashboardDetail` / `AddChartsToDashboard` / `PostUbaDashboardsChartsDelete` | dashboard ID | Extra: `{chart_ids: [...]}` |
 | 23 | `dashboard` | `deleted` | 同上 | `DeleteDashboard` | dashboard ID | Extra: `{ids: [...]}`（批量时需手动循环） |
-| 24 | `cohort` | `created` | `controller/analysis/cohort.go` | `CreateCohort` | cohort ID | Target: `{id, name, type:"cohort"}` |
-| 25 | `cohort` | `updated` | 同上 | `UpdateCohort` | cohort ID | Target: `{id, name, type:"cohort"}` |
-| 26 | `cohort` | `deleted` | 同上 | `DeleteCohort` | cohort ID | Target: `{id, name, type:"cohort"}` |
-| 27 | `experiment` | `created` | `controller/ab/ab.go` | `PostAbCreate` | experiment ID | Target: `{id, name, type:"experiment"}` |
-| 28 | `experiment` | `updated` | 同上 | `PostAbExpUpdate` | experiment ID | Target: `{id, name, type:"experiment"}` |
-| 29 | `experiment` | `deleted` | 同上 | `PostAbStatusUpdate` | experiment ID | Target: `{id, name, type:"experiment"}` |
-| 30 | `feature_gate` | `created` | `controller/ab/ab.go` | `PostAbCreate` | flag ID | Target: `{id, name, type:"feature_gate"}` |
-| 31 | `feature_gate` | `updated` | 同上 | `PostAbGateUpdate` | flag ID | Target: `{id, name, type:"feature_gate"}` |
-| 32 | `feature_gate` | `deleted` | 同上 | `PostAbStatusUpdate` | flag ID | Target: `{id, name, type:"feature_gate"}` |
-| 33 | `feature_config` | `created` | `controller/ab/ab.go` | `PostAbCreate` | config ID | Target: `{id, name, type:"feature_config"}` |
-| 34 | `feature_config` | `updated` | 同上 | `PostAbConfigUpdate` | config ID | Target: `{id, name, type:"feature_config"}` |
-| 35 | `feature_config` | `deleted` | 同上 | `PostAbStatusUpdate` | config ID | Target: `{id, name, type:"feature_config"}` |
-| 36 | `pipeline` | `created` | `controller/pipeline/pipeline.go` | `PipelineCreate` | pipeline ID | Target: `{id, name, type:"pipeline"}` |
-| 37 | `pipeline` | `updated` | 同上 | `PipelineUpdate` | pipeline ID | Target: `{id, name, type:"pipeline"}` |
-| 38 | `pipeline` | `deleted` | 同上 | `PipelineDelete` | pipeline ID | Target: `{id, name, type:"pipeline"}` |
-| 39 | `tracking_plan` | `created` | `trackingplan/controller/tracking_plan.go` | `PostDcTrackingPlanSave` | plan ID | Target: `{id, name, type:"tracking_plan"}` |
-| 40 | `tracking_plan` | `updated` | 同上 | `PostDcTrackingPlanSave` | plan ID | Target: `{id, name, type:"tracking_plan"}` |
-| 41 | `tracking_plan` | `deleted` | 同上 | `PostDcTrackingPlanDelete` | plan ID | Target: `{id, name, type:"tracking_plan"}` |
-| 42 | `layer` | `created` | `controller/ab/ab.go` | `PostAbLayerCreate` | layer ID | Target: `{id, name, type:"layer", parent_experiment_id}` |
-| 43 | `layer` | `updated` | 同上 | —（不存在独立 handler） | layer ID | Target: `{id, name, type:"layer"}` |
-| 44 | `layer` | `deleted` | 同上 | `PostAbLayerDelete` | layer ID | Target: `{id, name, type:"layer"}` |
-| 45 | `holdout` | `created` | `controller/ab/ab.go` | `PostAbHoldoutCreate` | holdout ID | Target: `{id, name, type:"holdout", parent_experiment_id}` |
-| 46 | `holdout` | `updated` | 同上 | `PostAbHoldoutUpdate` | holdout ID | Target: `{id, name, type:"holdout"}` |
-| 47 | `holdout` | `deleted` | 同上 | `PostAbHoldoutDelete` | holdout ID | Target: `{id, name, type:"holdout"}` |
-| 48 | `target` | `created` | `controller/ab/ab.go` | `PostAbTargetCreate` | target ID | Target: `{id, name, type:"target", parent_experiment_id}` |
-| 49 | `target` | `updated` | 同上 | `PostAbTargetUpdate` | target ID | Target: `{id, name, type:"target"}` |
-| 50 | `target` | `deleted` | 同上 | `PostAbTargetDelete` | target ID | Target: `{id, name, type:"target"}` |
+| 24 | `cohort` | `created` | `controller/analysis/cohort.go` | `CreateRuleCohort` | cohort ID | Target: `{name}` |
+| 25 | `cohort` | `updated` | 同上 | `UpdateRuleCohort` | cohort ID | Target: `{name}` |
+| 26 | `cohort` | `deleted` | 同上 | `DeleteCohort` | cohort ID | Target: `{name}` |
+| 27 | `experiment` | `created` | `controller/ab/ab.go` | `PostAbCreate` | experiment ID | Target: `{name}` |
+| 28 | `experiment` | `updated` | 同上 | `PostAbExpUpdate` | experiment ID | Target: `{name}` |
+| 29 | `experiment` | `deleted` | 同上 | `PostAbStatusUpdate` | experiment ID | Target: `{name}`（仅 DELETE） |
+| 30 | `feature_gate` | `created` | `controller/ab/ab.go` | `PostAbCreate` | flag ID | Target: `{name}` |
+| 31 | `feature_gate` | `updated` | 同上 | `PostAbGateUpdate` | flag ID | Target: `{name}` |
+| 32 | `feature_gate` | `deleted` | 同上 | `PostAbStatusUpdate` | flag ID | Target: `{name}`（仅 DELETE） |
+| 33 | `feature_config` | `created` | `controller/ab/ab.go` | `PostAbCreate` | config ID | Target: `{name}` |
+| 34 | `feature_config` | `updated` | 同上 | `PostAbConfigUpdate` | config ID | Target: `{name}` |
+| 35 | `feature_config` | `deleted` | 同上 | `PostAbStatusUpdate` | config ID | Target: `{name}`（仅 DELETE） |
+| 36 | `pipeline` | `created` | `controller/pipeline/pipeline.go` | `PipelineCreate` | pipeline ID | Target: `{name}` |
+| 37 | `pipeline` | `updated` | 同上 | `PipelineUpdate` | pipeline ID | Target: `{name}` |
+| 38 | `pipeline` | `deleted` | 同上 | `PipelineDelete` | pipeline ID | Target: `{name}` |
+| 39 | `tracking_plan` | `created` | `trackingplan/controller/tracking_plan.go` | `PostDcTrackingPlanSave` | plan ID | Target: `{name}` |
+| 40 | `tracking_plan` | `updated` | 同上 | `PostDcTrackingPlanSave` | plan ID | Target: `{name}` |
+| 41 | `tracking_plan` | `deleted` | 同上 | `PostDcTrackingPlanDelete` | plan ID | Target: `{name}` |
+| 42 | `layer` | `created` | `controller/ab/ab.go` | `PostAbLayerCreate` | layer ID | Target: `{name, parent_experiment_id}` |
+| 43 | `layer` | `updated` | 同上 | —（不存在独立 handler） | layer ID | Target: `{name}` |
+| 44 | `layer` | `deleted` | 同上 | `PostAbLayerDelete` | layer ID | Target: `{name}` |
+| 45 | `holdout` | `created` | `controller/ab/ab.go` | `PostAbHoldoutCreate` | holdout ID | Target: `{name, parent_experiment_id}` |
+| 46 | `holdout` | `updated` | 同上 | `PostAbHoldoutUpdate` | holdout ID | Target: `{name}` |
+| 47 | `holdout` | `deleted` | 同上 | `PostAbHoldoutDelete` | holdout ID | Target: `{name}` |
+| 48 | `target` | `created` | `controller/ab/ab.go` | `PostAbTargetCreate` | target ID | Target: `{name, parent_experiment_id}` |
+| 49 | `target` | `updated` | 同上 | `PostAbTargetUpdate` | target ID | Target: `{name}` |
+| 50 | `target` | `deleted` | 同上 | `PostAbTargetDelete` | target ID | Target: `{name}` |
+
+> - PostAbStatusUpdate 仅对 `operation_type=DELETE` 场景审计；状态变更（ONLINE/OFFLINE/DEBUG）属产品功能，不审计。
 
 ### 10.5 Domain: metadata
 
 | # | Feature | Action | Controller | Handler | targetID | Detail 要点 |
 |---|---|---|---|---|---|---|
-| 51 | `metric` | `created` | `controller/metadata/metric.go` | `CreateMetric` | metric ID | Target: `{id, name, type:"metric"}` |
-| 52 | `metric` | `updated` | 同上 | `UpdateMetric` | metric ID | Target: `{id, name, type:"metric"}` |
-| 53 | `metric` | `deleted` | 同上 | `DeleteMetrics` | metric ID | Target: `{id, name, type:"metric"}` |
-| 54 | `tracked_event` | `created` | `controller/metadata/tracked_event.go` | `CreateTrackedEvent` | event ID | Target: `{id, name, type:"tracked_event"}` |
-| 55 | `tracked_event` | `updated` | 同上 | `UpdateTrackedEvent` | event ID | Target: `{id, name, type:"tracked_event"}` |
-| 56 | `tracked_event` | `deleted` | 同上 | `DeleteTrackedEvent` | event ID | Target: `{id, name, type:"tracked_event"}` |
-| 57 | `virtual_event` | `created` | `controller/metadata/virtual_event.go` | `CreateVirtualEvent` | event ID | Target: `{id, name, type:"virtual_event"}` |
-| 58 | `virtual_event` | `updated` | 同上 | `UpdateVirtualEvent` | event ID | Target: `{id, name, type:"virtual_event"}` |
-| 59 | `virtual_event` | `deleted` | 同上 | `DeleteVirtualEvent` | event ID | Target: `{id, name, type:"virtual_event"}` |
-| 60 | `event_property` | `created` | `controller/metadata/event_property.go` | `CreateEventProperty` | property ID | Target: `{id, name, type:"event_property"}` |
-| 61 | `event_property` | `updated` | 同上 | `UpdateEventProperty` | property ID | Target: `{id, name, type:"event_property"}` |
-| 62 | `event_property` | `deleted` | 同上 | `DeleteEventProperty` | property ID | Target: `{id, name, type:"event_property"}` |
-| 63 | `user_property` | `created` | `controller/metadata/user_property.go` | `CreateUserProperty` | property ID | Target: `{id, name, type:"user_property"}` |
-| 64 | `user_property` | `updated` | 同上 | `UpdateUserProperty` | property ID | Target: `{id, name, type:"user_property"}` |
-| 65 | `user_property` | `deleted` | 同上 | `DeleteUserProperty` | property ID | Target: `{id, name, type:"user_property"}` |
-| 66 | `virtual_property` | `created` | `controller/metadata/virtual_property.go` | `CreateVirtualProperty` | property ID | Target: `{id, name, type:"virtual_property"}` |
-| 67 | `virtual_property` | `updated` | 同上 | `UpdateVirtualProperty` | property ID | Target: `{id, name, type:"virtual_property"}` |
-| 68 | `virtual_property` | `deleted` | 同上 | `DeleteVirtualProperty` | property ID | Target: `{id, name, type:"virtual_property"}` |
+| 51 | `metric` | `created` | `controller/metadata/metric.go` | `CreateMetric` | metric ID | Target: `{name}` |
+| 52 | `metric` | `updated` | 同上 | `UpdateMetric` | metric ID | Target: `{name}` |
+| 53 | `metric` | `deleted` | 同上 | `DeleteMetrics` | metric ID | Target: `{name}` |
+| 54 | `tracked_event` | `created` | `controller/metadata/tracked_event.go` | `CreateTrackedEvent` | event ID | Target: `{name}` |
+| 55 | `tracked_event` | `updated` | 同上 | `UpdateTrackedEvent` | event ID | Target: `{name}` |
+| 56 | `tracked_event` | `deleted` | 同上 | `DeleteTrackedEvent` | event ID | Target: `{name}` |
+| 57 | `virtual_event` | `created` | `controller/metadata/virtual_event.go` | `CreateVirtualEvent` | event ID | Target: `{name}` |
+| 58 | `virtual_event` | `updated` | 同上 | `UpdateVirtualEvent` | event ID | Target: `{name}` |
+| 59 | `virtual_event` | `deleted` | 同上 | `DeleteVirtualEvent` | event ID | Target: `{name}` |
+| 60 | `event_property` | `created` | `controller/metadata/event_property.go` | `CreateEventProperty` | property ID | Target: `{name}` |
+| 61 | `event_property` | `updated` | 同上 | `UpdateEventProperty` | property ID | Target: `{name}` |
+| 62 | `event_property` | `deleted` | 同上 | `DeleteEventProperty` | property ID | Target: `{name}` |
+| 63 | `user_property` | `created` | `controller/metadata/user_property.go` | `CreateUserProperty` | property ID | Target: `{name}` |
+| 64 | `user_property` | `updated` | 同上 | `UpdateUserProperty` | property ID | Target: `{name}` |
+| 65 | `user_property` | `deleted` | 同上 | `DeleteUserProperty` | property ID | Target: `{name}` |
+| 66 | `virtual_property` | `created` | `controller/metadata/virtual_property.go` | `CreateVirtualProperty` | property ID | Target: `{name}` |
+| 67 | `virtual_property` | `updated` | 同上 | `UpdateVirtualProperty` | property ID | Target: `{name}` |
+| 68 | `virtual_property` | `deleted` | 同上 | `DeleteVirtualProperty` | property ID | Target: `{name}` |
 
 ### 10.6 接入代码示例
 
@@ -736,7 +759,7 @@ func (h *ChartHandler) UpdateChart(ctx, id, req) (res, err) {
     audit.Log(ctx, audit.DomainAsset, audit.FeatureChart, audit.ActionUpdated,
         fmt.Sprint(chart.ID), &audit.Detail{
             Account: map[string]any{"id": fmt.Sprint(pvctx.Aid(ctx))}, // name 天然已知时也可填
-            Target:        map[string]any{"id": chart.ID, "name": chart.Name, "type": "chart"},
+            Target:        map[string]any{"name": chart.Name},
         })
     return res, nil
 }
@@ -801,7 +824,7 @@ func (h *OrgMemberHandler) UpdateMemberRole(ctx, memberID, newRole) (res, err) {
     audit.Log(ctx, audit.DomainOrganization, audit.FeatureOrgMember, audit.ActionUpdated,
         fmt.Sprint(member.AccountID), &audit.Detail{
             Account: map[string]any{"id": fmt.Sprint(pvctx.Aid(ctx))},
-            Target:        map[string]any{"id": member.AccountID, "type": "org_member"},
+            Target:        map[string]any{}, // 角色变更通过 Extra 记录
             Extra:         map[string]any{"role_before": oldRole, "role_after": newRole},
         })
     return res, nil
@@ -835,6 +858,18 @@ func (h *OrgMemberHandler) UpdateMemberRole(ctx, memberID, newRole) (res, err) {
 |---|---|---|---|
 | audit_channel_drop_total | 0 | > 0（需确认是否短暂峰值） | > 1000 持续增长 |
 | 业务 P99 延迟 | 增量 ≤ 5ms | 增量 > 10ms | 增量 > 50ms |
+
+---
+
+## 12. V2 规划
+
+以下为 V1 明确不做的功能，列入 V2 范围：
+
+| # | 项目 | 原因 | 触发条件 |
+|---|---|---|---|
+| 1 | **防篡改**：对 `audit_log` 表施加写入权限约束（TRIGGER / RLS / 独立 DB 用户），防止应用层被入侵后攻击者抹除审计痕迹 | V1 优先保证功能完整性和通路畅通，安全加固在底座稳定后跟进 | 安全审计要求 / SOC 2 认证 |
+| 2 | **IP 地址可信**：引入 `TrustedProxies` 白名单，启用 `gin.ClientIP()` 严格模式 | V1 依赖反向代理透传，IP 作为参考线索 | 合规要求提升 |
+| 3 | **复合索引优化**：`(project_id, event_id DESC)` 替换现有 `(project_id, occurred_at DESC)`，利用 UUID v7 天然时序保序特性消除 `occurred_at` 的冗余排序 | V1 现有索引已满足查询需求；迁移索引需停机窗口 | 查询性能瓶颈 / 表数据量 > 5000 万行 |
 
 ---
 

@@ -343,3 +343,13 @@ V1 不再以通用 diff 引擎为前提，Detail 构造遵循以下规则：
 - `org_id` 和 `project_id` 在 `audit.Log()` 内部从 `pvctx` 提取，拿不到时写入 NULL
 - 调用方在调用 `audit.Log()` 前确保 `pvctx` 中已注入 org_id（详见 [04-detail-pg.md §4.4](./04-detail-pg.md)）
 - pvctx 扩展见 [04-detail-pg.md §5.3](./04-detail-pg.md)：新增 `ClientIP()` / `WithClientIP()` / `AuditSource()` / `WithAuditSource()`；`BackGroundCtx` 补充复制 `client_ip` / `audit_source` / `org_id`
+
+## 安全与性能审查结果（2026-07-07）
+
+基于对 PG 方案的全面安全与性能审查，以下决策记录入档：
+
+- **IP 地址限制已文档化**：在 [04-detail-pg.md §9.1](./04-detail-pg.md) 风险表及告警中明确说明 V1 无 TrustedProxies 白名单的局限
+- **防篡改列入 V2**：对 `audit_log` 表施加 TRIGGER/RLS/独立 DB 用户防篡改保护，列入 V2 规划。V1 优先保证功能通路和安全基线（access control + scope 隔离），不因防篡改延迟交付
+- **event_id 不单独建索引**：event_id 非业务查询入口，独立索引无查询收益。V2 可替换现有 `(project_id, occurred_at DESC)` 为 `(project_id, event_id DESC)`，利用 UUID v7 时序性消除冗余排序
+- **连接池隔离**：PGWriter 使用独立 `*sql.DB` 连接池（MaxOpen=4, MaxIdle=2, ConnMaxLifetime=30m），不影响业务 globaldb；详见 [04-detail-pg.md §4.5](./04-detail-pg.md)
+- **V2 规划**：新增 [04-detail-pg.md §12](./04-detail-pg.md) 记录防篡改、IP 可信、复合索引优化三项 V2 规划
