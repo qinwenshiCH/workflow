@@ -164,7 +164,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_account_time
 | 方法 | 路径 | 输入 | 输出 | 权限 | 频率限制 |
 |---|---|---|---|---|---|
 | `GET` | `/api/audit/logs` | Query params: org_id, project_id, account_id, domain, feature, action, target_id, start_time, end_time, cursor, limit | `{items: [], next_cursor: string, has_more: bool}` | 组织管理员/项目管理员 | 60 req/min |
-| `GET` | `/api/audit/export` | 同上 + `format: csv\|xlsx` | `Content-Disposition: attachment`；上限 100,000 行 | 组织管理员/项目管理员 | 10 req/min |
+| `GET` | `/api/audit/export` | 同上 + `format: csv\|xlsx` | `Content-Disposition: attachment`；上限 1000 行 | 组织管理员/项目管理员 | 10 req/min |
 
 ### 4.3 配置项
 

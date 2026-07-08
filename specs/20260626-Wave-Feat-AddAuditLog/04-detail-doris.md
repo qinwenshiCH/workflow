@@ -280,7 +280,7 @@ type Query struct {
 | `audit_log_flush_interval` | `duration` | `5s` | 定时 flush 间隔 |
 | `audit_log_flush_timeout` | `duration` | `30s` | 单批 Stream Load 超时 |
 | `audit_log_queue_size` | `int` | `4096` | 内存队列容量 / channel buffer 大小，满时非阻塞丢弃 + error 日志 |
-| `audit_log_detail_max_bytes` | `int` | `64000` | detail 最大字节数。Doris `STRING` 类型硬上限 65,533 字节，64000 留足余量——超限将导致 Stream Load 整批拒绝 |
+| `audit_log_detail_max_bytes` | `int` | `64000` | detail 最大字节数。Doris `STRING` 默认 ~1 MB、最大 ~2 GB，无硬限压力；64000 与 PG 64KB 对齐、enqueue 时已裁剪，不触及 Stream Load 侧限制 |
 
 ### 4.4 Detail 定义
 

@@ -157,7 +157,7 @@
   | `created_at` | TIMESTAMPTZ | NOT NULL, default now() | 入库时间，异步场景下可能晚于 `occurred_at` |
 
 - PG 方案 V1 不分区；Doris 方案保留自动月分区
-- `detail` 类型由具体方案决定：PG 用 `TEXT`，Doris 用 `STRING`
+- `detail` 类型两方案统一用 `TEXT`（PG 原生 `TEXT`，Doris 4.x 中 `TEXT` 等价于 `STRING`；Wave 现有 Doris DDL 也统一用 `TEXT`）
 - Detail 结构以对象摘要 envelope 为主，不强制 field-level diff，也不为此额外查库
 - V1 索引只服务 `org/project + time range` 与 `account + time range` 高频查询，不为 `target_id` 额外建专用复合索引
 - V1 不冗余 `actor_name` / `target_name` / `request_id` / `trace_id` 顶层列
@@ -352,7 +352,7 @@ V1 不再以通用 diff 引擎为前提，Detail 构造遵循以下规则：
 ## Doris 查询与 detail 约束（2026-07-08）
 
 - **新增 `dorisx.UseGlobalDB()`**：Doris 全局表查询需不拼 `sw_dw_{pid}` 的查询方法。新增 `UseGlobalDB()` 返回 `globalDB`，不改 `UseDB()` 行为。只加一行，不影响既有 per-project 查询
-- **Doris detail 最大字节数改为 64000**：Doris `STRING` 类型硬上限 65,533 字节，原 64KB（65,536）超了 3 个字节。改为 64000 留余量。PG 方案仍用 65536
+- **Doris detail 最大字节数（与 PG 对齐）**：Doris `STRING` 类型默认 ~1 MB、最大 ~2 GB，无硬限压力。V1 统一设为 64000（与 PG 64KB 对齐），按需可调的合理预算。
 
 ## 安全与性能审查结果（2026-07-07）
 
