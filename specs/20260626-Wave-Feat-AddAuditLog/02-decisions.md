@@ -23,7 +23,7 @@
 - 两套方案共享同一条产品约束：**主流程必须异步，不因审计阻塞日常操作**
 - 但”异步”不等于”可静默丢失”：channel 满时必须非阻塞丢弃 + error 日志 + drop counter
 - 当前评审偏向：**先上 PG**；Doris 保留为规模化 / 成本优化备选
-- Doris 若要作为主存落地，至少需要给 `pkg/dal/dorisx/stream_loader.go` 补稳定 `label` 能力
+- Doris 若要作为主存落地，需要在 `service/auditlog/` 中自建专注的 Stream Load 客户端（支持 Bearer Auth、stable label、幂等判定）
 - 如果未来确有长期保留成本压力，优先考虑 **PG 主存 + Doris 镜像**，而不是 day-1 直接 Doris 单写
 
 ## 范围（新 — 审计日志）
@@ -55,7 +55,7 @@
 
 - Doris 是 Wave 现有的基础设施（`dorisx` 包），无需引入新组件
 - Doris 的自动月分区和列存压缩仍然成立，但它是成本优化价值，不是当前 V1 首要价值
-- ZSTD 列存压缩，预计存储量仅为 PG 的 1/7（~50GB/年 vs ~360GB/年）
+- ZSTD 列存压缩在 CUD 场景下有 ~3.6x 优势（详见 01-spec.md §规模假设），非早期估算的 7x
 - Stream Load HTTP PUT JSON 异步攒批写入，不阻塞主流程
 - 去掉了 GORM 插件（~450 行）和 changes diff 引擎，改为 ~150 行显式 `audit.Log()` 调用
 - Detail 收敛为版本化的 `schema_version / account / target / comment / extra` JSON envelope，不记录 field-level changes
@@ -250,7 +250,7 @@ V1 不再以通用 diff 引擎为前提，Detail 构造遵循以下规则：
 - 官方产品不默认展示审计日志（类 PostHog premium feature）
 - 导出格式：CSV / Excel，应用当前过滤条件，通过 OpenAPI 提供
 - V1 不提供前端查看页面，仅通过 OpenAPI 导出
-- 分页使用 **cursor** 模式，采用 `(created_at, id|event_id)` 复合游标，避免同时间戳下漏数/重数
+- 分页使用 **cursor** 模式，采用 `(occurred_at, id|event_id)` 复合游标，避免同时间戳下漏数/重数
 - 返回结构含 `next_cursor` 和 `has_more`，支持前端"加载更多"和导出循环
 
 ## 交付顺序（新 — 审计日志）
@@ -323,19 +323,24 @@ V1 不再以通用 diff 引擎为前提，Detail 构造遵循以下规则：
 - **决策理由**：V1 简单性优先于 detail 完整性。合规审计只需要"谁在何时做了什么"，detail 为空不影响行级追溯。后续如有细化需求可补充逐级裁剪。
 - 详细说明见 [04-detail-pg.md §5.4](./04-detail-pg.md)
 
-## Doris 方案补充决策（2026-07-07，修正 2026-07-07）
+## Doris 方案补充决策（2026-07-07，修正 2026-07-08）
 
 针对第三方审核发现的缺口，以下决策立即生效：
 
 - **`occurred_at` 字段**：Doris 表结构加 `occurred_at` 列，DUPLICATE KEY 第一列改为 `occurred_at`
-- **`event_id` 字段**：Doris 表结构加 `event_id` 列；Stream Load 使用稳定 label（`audit_log_{date}_{hash}`）实现幂等
+- **DUPLICATE KEY**：调整为 `(occurred_at, org_id, project_id, account_id, event_id)`：`occurred_at` 确保时间分区剪枝，scope 列加速范围查询；`event_id` 放末位使 ORDER BY 无需额外排序，也支持按 event_id 对账查询
+- **`event_id` 字段**：Doris 表结构加 `event_id` 列；Stream Load 使用稳定 label（`audit_log_{first_event_id_prefix}_{last_event_id_prefix}_{batch_size}`）实现幂等
 - **登录审计写入位置**：确认在 `controller/account`（LoginAccount/LogoutAccount 成功返回前、LoginValidate 错误路径），不在 session 认证 filter
 - **source 补充 mcp**：枚举值新增 `mcp`；MCP 入口鉴权完成后显式赋值 `source = mcp`
 - **一期全量接入**：不拆 Phase 1/2/3，一期一次性接入全部 25 feature
-- **PG 索引维持 3 个**：`(project_id, occurred_at)`, `(org_id, occurred_at)`, `(account_id, occurred_at WHERE account_id IS NOT NULL)`，暂不增减
-- **Doris 索引前缀键调整**：DUPLICATE KEY 改为 `(occurred_at, org_id, project_id, account_id)` 以对齐高频查询路径
-- **StreamLoader 修改清单（代码评审确认）**：`Label()` 不存在需新增；认证头 `Bearer` → `Basic`（单行修改，与 `doris_apix.go:105` 对齐）；`IsSuccess()` 追加 `Label Already Exists + FINISHED` 判定；硬编码 `User-Agent: ID-Merge-Agent` 和 `Client` 未设 Timeout 需清理
+- **DDL 精度对齐 Wave 规范**：使用 `DATETIME(3)` 而非 `DATETIME(6)`，与 Wave 现有 Doris DDL（`doris.sql`）一致
+- **Doris Stream Load 客户端：自建，不修 dead code**：`stream_loader.go` 是 ID-Merge 时期遗留的死代码（零生产调用），不在此之上修补。改为在 `service/auditlog/doris_stream.go` 中写一份专注的 Stream Load 客户端，只包含审计写入需要的能力。认证头使用 Wave Stream Load 真实约定（`Bearer <base64(user:pass)>`），非 `doris_apix.go` 的 Query API Basic Auth 模式。标准 header：`Expect: 100-continue`、`strip_outer_array: true`、`format: json`
 - **Doris 不设本地 spool（同 PG 方案）**：写入失败时非阻塞丢弃 + drop counter + error 日志，不 spill 到磁盘。原因：Wave 代码库中无任何 spool 基础设施（`grep -rn "spool"` 全库零结果），完整建设需 1-2 天，与 PG 方案的 no-spool 原则对齐
+- **Phase 0 前置验证**：在 dev 环境用 curl 验证 Stream Load Bearer Auth、label 幂等、AUTO PARTITION（需 Doris ≥ 2.1.0）后再进入实现；未通过则 Doris 方案暂停（详见 [04-detail-doris.md §12](./04-detail-doris.md)）
+
+## PG 索引维持（2026-07-07）
+
+- **PG 索引维持 3 个**：`(project_id, occurred_at)`, `(org_id, occurred_at)`, `(account_id, occurred_at WHERE account_id IS NOT NULL)`，暂不增减
 
 ## OrgID 传递方案（2026-07-07）
 
@@ -344,6 +349,11 @@ V1 不再以通用 diff 引擎为前提，Detail 构造遵循以下规则：
 - 调用方在调用 `audit.Log()` 前确保 `pvctx` 中已注入 org_id（详见 [04-detail-pg.md §4.4](./04-detail-pg.md)）
 - pvctx 扩展见 [04-detail-pg.md §5.3](./04-detail-pg.md)：新增 `ClientIP()` / `WithClientIP()` / `AuditSource()` / `WithAuditSource()`；`BackGroundCtx` 补充复制 `client_ip` / `audit_source` / `org_id`
 
+## Doris 查询与 detail 约束（2026-07-08）
+
+- **新增 `dorisx.UseGlobalDB()`**：Doris 全局表查询需不拼 `sw_dw_{pid}` 的查询方法。新增 `UseGlobalDB()` 返回 `globalDB`，不改 `UseDB()` 行为。只加一行，不影响既有 per-project 查询
+- **Doris detail 最大字节数改为 64000**：Doris `STRING` 类型硬上限 65,533 字节，原 64KB（65,536）超了 3 个字节。改为 64000 留余量。PG 方案仍用 65536
+
 ## 安全与性能审查结果（2026-07-07）
 
 基于对 PG 方案的全面安全与性能审查，以下决策记录入档：
@@ -351,5 +361,6 @@ V1 不再以通用 diff 引擎为前提，Detail 构造遵循以下规则：
 - **IP 地址限制已文档化**：在 [04-detail-pg.md §9.1](./04-detail-pg.md) 风险表及告警中明确说明 V1 无 TrustedProxies 白名单的局限
 - **防篡改列入 V2**：对 `audit_log` 表施加 TRIGGER/RLS/独立 DB 用户防篡改保护，列入 V2 规划。V1 优先保证功能通路和安全基线（access control + scope 隔离），不因防篡改延迟交付
 - **event_id 不单独建索引**：event_id 非业务查询入口，独立索引无查询收益。V2 可替换现有 `(project_id, occurred_at DESC)` 为 `(project_id, event_id DESC)`，利用 UUID v7 时序性消除冗余排序
-- **连接池隔离**：PGWriter 使用独立 `*sql.DB` 连接池（MaxOpen=4, MaxIdle=2, ConnMaxLifetime=30m），不影响业务 globaldb；详见 [04-detail-pg.md §4.5](./04-detail-pg.md)
+- **连接池隔离（V1）**：PGWriter 复用 globaldb 连接池，不创建独立池。分布式下多副本 × 独立池会无谓增加 PG 连接数，且审计丢弃可接受，无需隔离。详见 [04-detail-pg.md §4.5](./04-detail-pg.md)
+- **连接池隔离（V2）**：如审计流量明显影响业务 P99，再引入独立 `*sql.DB`；详见 [04-detail-pg.md §12](./04-detail-pg.md)
 - **V2 规划**：新增 [04-detail-pg.md §12](./04-detail-pg.md) 记录防篡改、IP 可信、复合索引优化三项 V2 规划

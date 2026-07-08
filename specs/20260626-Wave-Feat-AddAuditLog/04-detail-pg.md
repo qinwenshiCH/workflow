@@ -46,7 +46,7 @@ PG 优先的理由是改动面最小（复用现有 `globaldb` 和 DAO 模式）
 |---|---|---|
 | `pvctx.IsAccountAPIToken` 可用于识别 token 鉴权 | ⚠️ 部分满足 | 可覆盖 `ui / api_token`，但不能表达 `mcp`；需新增独立 `audit_source` ctx 字段 |
 | `BackGroundCtx` 可扩展复制 client_ip / source | ✅ 可扩展 | 现实现已复制 `token / reqid / traceid / language` 等字段，审计补充时不能把这些能力退化掉 |
-| MCP 写路径可直接复用 gin 的 IP 提取 | ❌ 不成立 | MCP 走 `net/http`，需单独从 `X-Real-IP`（APISIX 透传）提取 `client_ip` |
+| MCP 写路径可直接复用 gin 的 IP 提取 | ❌ 不成立 | MCP 走 `net/http`，需单独从 `X-Real-IP`（反向代理透传）提取 `client_ip` |
 | 登录/登出在 controller/account | ✅ 存在 | `apps/web/controller/account/account.go:70-114` |
 | 服务启动/关闭有明确接入点 | ✅ 存在 | `apps/web/server.go:94,212,326` |
 | 现有异步 writer 不可复用 | ✅ 确认 | `pkg/qm/async_batch_writer.go:87-110` select + default drop |
@@ -98,7 +98,6 @@ PG 优先的理由是改动面最小（复用现有 `globaldb` 和 DAO 模式）
 
 #### 新增表
 
-> 逻辑表名仍记为 `schema_global.audit_log`，但 **实际 global migration SQL** 应使用无 schema 限定的 `audit_log`，由 Wave 的 global migration 在事务内设置 `search_path` 后执行。  
 > global migration 脚本命名如 `script/migration/scripts/global_v20260707_audit_log.sql`；bootstrap DDL 同步到 `script/sql/pgsql/global.sql`。  
 > 因现有 SQL migration 运行在事务中，**不要使用 `CREATE INDEX CONCURRENTLY`**；这里建的是新表，普通 `CREATE INDEX IF NOT EXISTS` 即可。
 
@@ -173,9 +172,9 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_account_time
 |---|---|---|---|---|
 | `audit_log_batch_size` | `int` | `100` | 单批最大行数；上限 500（spec 约束） | ❌ |
 | `audit_log_flush_interval` | `duration` | `1s` | 定时 flush 间隔 | ❌ |
-| `audit_log_queue_size` | `int` | `4096` | channel 容量，满时非阻塞丢弃并记 counter + error 日志，不设 spool。日均 ~6 条/秒（全环境 50 万行/天），4096 可容纳 ~11 分钟突发峰值 | ❌ |
-| `audit_log_detail_max_bytes` | `int` | `65536` | detail 大小预算 (64KB)，超限丢弃 detail 并打 warn 日志。正常 detail 1-10KB，64KB = 6-10x 正常值 | ❌ |
-| `audit_log_export_max_rows` | `int` | `100000` | 单次导出最大行数。全环境约 5.6 小时数据；XLSX 约 50MB | ❌ |
+| `audit_log_queue_size` | `int` | `4096` | channel 容量，满时非阻塞丢弃并记 counter + error 日志，不设 spool。日均 ~6 条/秒（全环境 50 万行/天），4096 可容纳 ~11 分钟突发峰值（4096 条 × 假设每条 Entry ~1KB ≈ 4MB 内存，完全可以接受，后续再按实际调整） | ❌ |
+| `audit_log_detail_max_bytes` | `int` | `65536` | detail 大小预算 (64KB)，超限清零 detail 并打 warn 日志。正常 detail 1-10KB，64KB = 6-10x 正常值 | ❌ |
+| `audit_log_export_max_rows` | `int` | `1000` | 单次导出最大行数。CSV < 1MB。按需逐步上调 | ❌ |
 
 ### 4.4 Detail 结构
 
@@ -228,14 +227,13 @@ func Log(ctx context.Context, domain, feature, action, targetID string, detail *
 | `pvctx` | 内部模块 | 鉴权与审计上下文 | 函数调用 | 当前版本 | 内部 | 需新增 `audit_source` 与 `client_ip` |
 
 > **IP 提取策略**：优先读反向代理透传的 `X-Real-IP`，降级读 `RemoteAddr`。不配置全局 `TrustedProxies`（影响所有 gin 路由，超出审计范围）。V1 文档说明此限制，IP 可能在某些场景下不准确。
->
-> **连接池隔离**：PGWriter 使用独立的 `*sql.DB` 实例，不与业务请求共享连接池。独立池配置：最大空闲 2、最大打开 4，避免审计写满时影响业务连接。
+> **连接池**：PGWriter 复用 globaldb 的连接池，不创建独立连接池。分布式下多副本 × 独立池会无谓增加 PG 连接数，且审计丢弃可接受（尽力记录原则），无需隔离。如未来审计流量显著影响业务池，见 §12 V2 规划 #4。
 
 #### 集成契约
 
 - **PostgreSQL（globaldb）**：
   - 接口契约：标准 SQL `INSERT ... ON CONFLICT DO NOTHING` / `SELECT ... WHERE ... ORDER BY ... LIMIT`
-  - 鉴权方式：连接池已建立，审计 writer 复用同一连接池
+  - 鉴权方式：复用 globaldb 连接池（同一 PG 实例、同一凭据），不创建独立池
   - 错误语义：连接超时（可重试）、唯一约束冲突（幂等正常）、字段超长（不可恢复）
   - 超时配置：查询超时 10s，写入超时 5s
   - 熔断降级：写入失败丢弃 + error 日志，不熔断
@@ -317,17 +315,8 @@ func (w *PGWriter) Stop(ctx context.Context)     // 停止 flushLoop，drain 剩
 > channel 是 Go 原生 `chan *Entry`，进程内 FIFO 队列。多副本时各进程独立，不跨副本协调。条目不会在 channel 中阻塞主流程——buffer 满时立即丢弃并记 counter + error 日志，不存在阻塞等待路径。
 > 
 > **优雅重启 drain 机制**：shutdown 顺序为 `server.Shutdown()`（先停 HTTP）→ `writer.Stop()`（等待 channel 消费完毕或超时 5s）→ `globaldb.Close()`。HTTP 先停保证无新 `audit.Log()` 调用，writer 执行时数据库连接仍可用。`kill -9`/OOM 等非优雅退出存在内存队列丢失窗口。
->
-> #### 连接池配置
->
-> PGWriter 持有独立 `*sql.DB` 实例，不与业务请求共享连接池，避免审计写满时影响业务连接。
->
-> | 参数 | 值 | 说明 |
-> |------|----|------|
-> | 最大空闲连接 | 2 | 日常低负载下保持少量连接 |
-> | 最大打开连接 | 4 | 限制审计连接对 PG 的整体压力 |
-> | 连接最大存活时间 | 30m | 定期回收，避免长连接被中间件断掉 |
-> | 驱动 | `lib/pq` 或 `pgx` | 与项目现有 PG 驱动一致 |
+> 
+> **连接池**：PGWriter 复用 globaldb 的 `*sql.DB`，不创建独立池。详见 §4.5。
 
 | 函数 | 作用 | 事务边界 | 权限校验 | 重入安全? |
 |---|---|---|---|---|
@@ -390,7 +379,7 @@ flushLoop:
 
 #### 职责
 
-构造审计详情。V1 不做裁剪，超 64KB 直接丢弃 detail。
+构造审计详情。V1 不做裁剪，超 64KB 直接清零 detail。
 
 #### 敏感字段处理
 
@@ -400,7 +389,7 @@ flushLoop:
 
 #### detail 大小预算
 
-单条 detail（JSON 序列化后）上限 **64KB**。超限时直接丢弃整个 detail 字段（`detail_payload = NULL`），将 `comment` 设为 `"detail exceeds 64KB, discarded"`，并打 warn 日志。审计行本身正常写入，不因超限丢弃整条。
+单条 detail（JSON 序列化后）上限 **64KB**。超限时直接清零 detail 字段（`detail_payload = NULL`），将 `comment` 设为 `"detail exceeds 64KB, discarded"`，并打 warn 日志。审计行本身正常写入，不因超限丢弃整条。
 
 > 阈值依据：正常操作（Chart/Dashboard/Cohort/Member 变更）detail 在 1-10KB 范围内。64KB 作为预警线。256KB 是 PG TOAST 物理上限，不作为逻辑限制。
 >
@@ -471,9 +460,9 @@ Export（CSV/XLSX）不承诺快照一致性。导出结果包含开始时刻前
 
 #### 导出实现
 
-- **上限**：单次导出最多 100,000 行，超过返回 422 Unprocessable Entity，提示缩小时间范围或分批导出
+- **上限**：单次导出最多 1,000 行，超过返回 422 Unprocessable Entity，提示缩小时间范围或分批导出
 - **CSV 流式**：DAO 层通过 `LIMIT/OFFSET` 分段读取（每批 1,000 行），service 层循环写入 `csv.Writer` 到 `http.ResponseWriter`，每批 flush 一次。不缓存全部数据在内存中
-- **XLSX 非流式**：使用 `excelize` 库构建完整 workbook 再写出，内存约 50MB（100,000 行 × 500B/行），可接受
+- **XLSX 非流式**：使用 `excelize` 库构建完整 workbook 再写出，上限 1,000 行，内存约 500KB
 
 #### 账号名补齐
 
@@ -494,38 +483,7 @@ func (s *Service) enrichAccountNames(ctx context.Context, items []Item) []ItemVi
 
 ### 6.1 正常流程（写路径）
 
-```mermaid
-flowchart TD
-    Start([业务操作完成]) --> Check{action 合法?}
-    Check -->|是| Validate{domain+feature<br/>已注册?}
-    Check -->|否| Skip1[error 日志<br/>+ audit_skip_total]
-
-    Validate -->|合法| CheckSize[64KB 大小预算检查]
-    Validate -->|非法| Skip2[error 日志<br/>+ audit_skip_total]
-
-    CheckSize -->|超限| DropDetail[丢弃 detail<br/>+ warn log]
-    CheckSize -->|正常| Enqueue[非阻塞 enqueue<br/>到 channel]
-    DropDetail --> Enqueue
-
-    Enqueue -->|channel OK| Done([返回成功])
-    Enqueue -->|channel 满| Drop[丢弃 + 记 drop counter<br/>+ error 日志]
-    Drop --> Done
-```
-
-### 6.2 失败流程（flush + 重试）
-
-```mermaid
-flowchart TD
-    FW[FlushWorker<br/>收集 batch] --> PG_INSERT{PG INSERT 成功?}
-
-    PG_INSERT -->|是| Continue([继续下一批])
-    PG_INSERT -->|唯一约束冲突| Ignore[ON CONFLICT DO NOTHING<br/>影响行数 0]
-    Ignore --> Continue
-
-    PG_INSERT -->|其他错误| Retry{重试 3 次<br/>都失败?}
-    Retry -->|否| Continue
-    Retry -->|是| Drop[丢弃 + error 日志<br/>+ drop counter]
-```
+> 流程图与 [§7 时序图](#7-时序图) 展示相同流程，以时序图为准。
 
 ---
 
@@ -589,7 +547,7 @@ sequenceDiagram
 |---|---|---|---|
 | **单元测试** | detail.go / registry.go / writer_pg.go / query.go | Go testing + mock DAO | 大小预算、cursor 编解码、scope 校验、flush 逻辑 |
 | **集成测试** | globaldb + audit writer | testcontainers PG | batch INSERT、ON CONFLICT、channel 满丢弃 |
-| **边界测试** | detail 大小超限、account_id NULL、队列满 | 参数化测试 | 超限丢弃 detail 并告警；空值写入；channel 满丢弃 |
+| **边界测试** | detail 大小超限、account_id NULL、队列满 | 参数化测试 | 超限清零 detail 并告警；空值写入；channel 满丢弃 |
 | **并发测试** | 多 goroutine 同时 Log() | `go test -race` | channel 竞争 |
 
 ### 8.2 可测试性分析
@@ -607,9 +565,9 @@ sequenceDiagram
 
 | # | 风险点 | 概率 | 影响 | 预防措施 | 补救措施 |
 |---|---|---|---|---|---|
-| 1 | IP 地址可能不准确 | 中 | 低 | 无 TrustedProxies 配置，依赖 APISIX X-Real-IP；文档说明限制 | V2 按需引入 TrustedProxies |
+| 1 | IP 地址可能不准确 | 中 | 低 | 无 TrustedProxies 配置，依赖反向代理透传 X-Real-IP；文档说明限制 | V2 按需引入 TrustedProxies |
 | 2 | PG 不可用导致审计行丢弃 | 低 | 中 | 3 次重试 + error 日志 + drop counter | 告警后人工恢复 PG |
-| 3 | detail 超大导致 detail 被丢弃 | 极低 | 低 | 64KB 预算，超限丢弃 detail 并告警 | 人工排查上游数据建模 |
+| 3 | detail 超大导致 detail 被清零 | 极低 | 低 | 64KB 预算，超限清零 detail 并告警 | 人工排查上游数据建模 |
 | 4 | event_id 冲突导致写入丢失 | 极低 | 低 | UUID v7，ON CONFLICT DO NOTHING 不影响已有记录 | 天然安全 |
 
 ### 9.1 补偿策略总表
@@ -617,12 +575,12 @@ sequenceDiagram
 | 失败场景 | 可重试? | 重试策略 | 回滚策略 | 最终一致性保障 |
 |---|---|---|---|---|
 | PG INSERT 失败 | ✅ | 3 次 + 指数退避，仍失败则丢弃 | 无（不涉及业务回滚） | error 日志 + drop counter |
-| detail 超限 | ❌ | 不重试，丢弃 detail | 记 warn 日志 | 审计行不丢失 |
+| detail 超限 | ❌ | 不重试，清零 detail | 记 warn 日志 | 审计行不丢失 |
 | channel 满 | ❌ | 非阻塞丢弃 + error 日志 | 记 drop counter | 接受极值有限丢失 |
 
 > **V1 已知限制：IP 地址准确性**
 >
-> V1 的 `client_ip` 来源依赖反向代理（APISIX）透传的 `X-Real-IP` 请求头。在未配置 `TrustedProxies` 白名单时，恶意客户端可伪造该头。这是 V1 的有意简化——IP 在审计中作为参考线索而非唯一证据，且内部环境下篡改风险可控。如合规要求提升，V2 按需引入 `TrustedProxies` + `gin.ClientIP()` 严格模式。
+> V1 的 `client_ip` 来源依赖反向代理透传的 `X-Real-IP` 请求头。在未配置 `TrustedProxies` 白名单时，恶意客户端可伪造该头。这是 V1 的有意简化——IP 在审计中作为参考线索而非唯一证据，且内部环境下篡改风险可控。如合规要求提升，V2 按需引入 `TrustedProxies` + `gin.ClientIP()` 严格模式。
 
 ---
 
@@ -870,6 +828,7 @@ func (h *OrgMemberHandler) UpdateMemberRole(ctx, memberID, newRole) (res, err) {
 | 1 | **防篡改**：对 `audit_log` 表施加写入权限约束（TRIGGER / RLS / 独立 DB 用户），防止应用层被入侵后攻击者抹除审计痕迹 | V1 优先保证功能完整性和通路畅通，安全加固在底座稳定后跟进 | 安全审计要求 / SOC 2 认证 |
 | 2 | **IP 地址可信**：引入 `TrustedProxies` 白名单，启用 `gin.ClientIP()` 严格模式 | V1 依赖反向代理透传，IP 作为参考线索 | 合规要求提升 |
 | 3 | **复合索引优化**：`(project_id, event_id DESC)` 替换现有 `(project_id, occurred_at DESC)`，利用 UUID v7 天然时序保序特性消除 `occurred_at` 的冗余排序 | V1 现有索引已满足查询需求；迁移索引需停机窗口 | 查询性能瓶颈 / 表数据量 > 5000 万行 |
+| 4 | **连接池隔离**：PGWriter 使用独立 `*sql.DB`，避免审计写满时影响业务 globaldb | V1 审计流量预期低，且 drop 可接受（尽力记录原则），无需隔离 | 审计流量明显影响业务 P99 |
 
 ---
 

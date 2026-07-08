@@ -2,7 +2,7 @@
 
 **目录**: `20260626-Wave-Feat-AddAuditLog`
 **创建日期**: 2026-06-26
-**最后更新**: 2026-07-07（对齐 5 domain × 25 feature 枚举，更新范围与计数）
+**最后更新**: 2026-07-08（补充规模假设与方案对比分析）
 **状态**: 评审中
 **技术方案**: [03-plan-pg.md](./03-plan-pg.md) + [04-detail-pg.md](./04-detail-pg.md)（当前推荐） / [03-plan-doris.md](./03-plan-doris.md) + [04-detail-doris.md](./04-detail-doris.md)（备选）
 
@@ -55,7 +55,7 @@
 
 **账号层**（无组织/项目归属）：
 
-- 登录/登出事件
+- 登录/登出事件（包括登录失败）
 - 账号设置变更（密码修改、邮箱变更等）
 - Account API Token created/updated/deleted
 
@@ -197,7 +197,7 @@ CREATE INDEX idx_alog_account_time ON global.audit_log (account_id, occurred_at 
 - 高频路径是 `org/project + time range` 的查询和导出
 - `target_id` 过滤在 scoped 时间范围内完成，V1 不为它单独建复合索引
 - 只有当”按对象查历史”成为真实高频流量时，再补 scoped target 索引
-- PG V1 维持 3 个高频索引不动，不新增也不删减；Doris 使用 `(occurred_at, org_id, project_id, account_id)` 作为 DUPLICATE KEY 前缀列
+- PG V1 维持 3 个高频索引不动，不新增也不删减；Doris 使用 `(occurred_at, org_id, project_id, account_id, event_id)` 作为 DUPLICATE KEY
 
 ---
 
@@ -286,6 +286,49 @@ CREATE INDEX idx_alog_account_time ON global.audit_log (account_id, occurred_at 
 - **SC-004**: 按 `org/project + time range` 的常规审计查询与导出分页 P99 < 1s；单对象历史查询在该范围内可完成筛选
 - **SC-005**: 支持 CSV/Excel 导出
 - **SC-006**: 保留 / 归档策略可运维；当选择 Doris 时自动月分区可用
+
+---
+
+## 规模假设与方案对比
+
+### 规模假设
+
+基于 Wave 平台特征（每个 org 数十个活跃用户，管理面操作为低频），且按月分区为前提：
+
+| 场景 | 每 org 日均事件数 | 100 org | 500 org | 1000 org |
+| --- | --- | --- | --- | --- |
+| **CUD**（CUD + 登录） | ~50 | 5K/天 → ~1.8M/年 | 25K/天 → ~9M/年 | 50K/天 → ~18M/年 |
+| **CRUD**（CRUD + 登录） | ~5,000 | 500K/天 → ~180M/年 | 2.5M/天 → ~900M/年 | 5M/天 → ~1.8B/年 |
+
+> 读操作按每人每天 ~100 次估算（Dashboard 加载、Chart 查询、列表翻页等），每 org 约 50 个活跃用户。实际量级取决于接入范围，以上为上限估算。
+
+### 月分区存储对比
+
+按 ~1KB/行（PG 行存）、~0.3KB/行（Doris 列存 + ZSTD 压缩）、保留 1 年估算：
+
+| 场景 | 规模 | PG 每年存储 | Doris 每年存储 | Doris 压缩收益 |
+| --- | --- | --- | --- | --- |
+| CUD | 1,000 org | ~18 GB | ~5 GB | ~3.6x |
+| CRUD | 1,000 org | ~1.8 TB | ~0.5 TB | ~3.6x |
+
+### 方案适用性
+
+双方均以月分区为前提：
+
+| 场景 | PG 方案 | Doris 方案 |
+| --- | --- | --- |
+| **CUD, ≤ 1,000 org**（V1 当前范围） | ✅ 月分区后无压力，团队运维熟练 | ✅ 但改动面大，V1 优先选 PG |
+| **CRUD, 1,000 org**（若读操作全量接入） | ⚠️ 月分区后索引/vacuum 可控，但存储 ~1.8TB/年，行存代价持续存在 | ✅ 列存压缩 ~0.5TB/年，append-only 零维护 |
+
+### 关键分歧
+
+CUD-only 时 PG 和 Doris 的差距主要是运维审美问题——PG 的 B-tree 索引和 autovacuum 在几千万行级别完全成熟，团队也熟练。
+
+CRUD（加入读操作）之后，**月分区解决了 PG 的索引和 vacuum 问题**，剩余差距收窄为**存储成本和分区管理体验**：
+- 存储：PG 行存 ~1.8TB/年 vs Doris 列存 ~0.5TB/年（物理差异，分区无法改变）
+- 管理：PG 需手动建 12+ 个分区/年 vs Doris `AUTO PARTITION BY RANGE` 一行声明
+
+这也是当前方案设计保持两套并行的原因：**PG 方案最小改动落地，Doris 方案作为量级上升时的自然演进路径，两者共享同一套应用层代码和查询接口。**
 
 ---
 

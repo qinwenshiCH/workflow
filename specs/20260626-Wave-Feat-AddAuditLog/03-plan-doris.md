@@ -1,10 +1,12 @@
+<!-- /autoplan restore point: /Users/wenshiqin/.gstack/projects/qinwenshiCH-workflow/main-autoplan-restore-20260708-133920.md -->
+
 # 概要设计 B：Wave 审计日志（Doris 方案）
 
 | 元数据 | |
 |---|---|
 | **目录** | `20260626-Wave-Feat-AddAuditLog` |
 | **创建日期** | 2026-07-06 |
-| **最后更新** | 2026-07-07（按最新 speckit 概要设计重写） |
+| **最后更新** | 2026-07-08（Stream Load 客户端：自建不修 dead code） |
 | **状态** | Reviewing |
 | **关联 spec** | [01-spec.md](./01-spec.md) |
 | **关联方案** | [03-plan-pg.md](./03-plan-pg.md)（当前整体评审仍偏向 PG） |
@@ -28,12 +30,12 @@
 ### 1.2 成功标准
 
 - **SC-001**: 覆盖 5 个 domain × 25 个 feature 的管理面操作，以及 `logged_in / logged_out / login_failed`
-- **SC-002**: 只记录站外客户操作，`source ∈ {ui, api_token}`
+- **SC-002**: 只记录站外客户操作，`source ∈ {ui, api_token, mcp}`
 - **SC-003**: 主流程附加开销维持在“构造 entry + enqueue”级别，P99 < 5ms
 - **SC-004**: 查询与导出必须要求“时间范围 + 范围限定（org / project / account 至少一个）”，避免无界扫描
 - **SC-005**: Doris 写入失败时非阻塞丢弃并记 +1 drop counter + error 日志（同 PG 方案）；Doris 写入失败不应导致业务失败或数据不一致
 - **SC-006**: Doris 方案复用现有 `config.Inf.GetDoris()`、`dorisx.Init()` 与 Doris HTTP Host，不新增第二套 Doris 连接配置
-- **SC-007（Doris）**: 在 dev 环境完成一次可重复的 Stream Load 验证：Basic Auth 可用、stable label 可复用、重复 label 的状态判定可解释
+- **SC-007（Doris）**: 在 dev 环境完成一次可重复的 Stream Load 验证：Bearer Auth 可用、stable label 可复用、重复 label 的状态判定可解释
 
 ### 1.3 本次故意不做
 
@@ -52,7 +54,7 @@
 | 实体 | 职责 | 关键属性 | 与其他实体的关系 |
 |---|---|---|---|
 | `AuditEntry` | 一条不可变的审计证据 | `event_id`、`org_id`、`project_id`、`account_id`、`domain`、`feature`、`action`、`source`、`ip_address`、`detail`、`occurred_at` | 被 `AuditBatch` 聚合写入 |
-| `Detail` | 版本化详情 envelope | `schema_version`、`snapshot`、`comment`、`extra` | 内嵌在 `AuditEntry` |
+| `Detail` | 版本化详情 envelope | `schema_version`、`account`、`target`、`comment`、`extra` | 内嵌在 `AuditEntry` |
 | `AuditScope` | 查询和导出的范围锚点 | `org_id` / `project_id` / `account_id` + `start_time` / `end_time` | 限制 `AuditEntry` 的读取范围 |
 | `AuditBatch` | 一批异步写入 Doris 的审计条目 | `label`、`entries` | 同一批次初次写入和重试复用同一 label |
 
@@ -72,7 +74,7 @@
 | `sw_dw_global.audit_log` | Doris 侧的统一审计表 | 不是 `sw_dw_{pid}` 项目业务库 |
 | stable label | 同一批次初次写入和重试必须复用的 Doris Stream Load label | 不是 request id |
 | `source` | 认证来源，而不是协议入口 | `ui` 包含浏览器 session 和 MCP session；`api_token` 包含普通 API Token 与 MCP Token |
-| `snapshot` | 被操作对象的过滤后摘要 | 不是 before/after diff，不是 actor 快照 |
+| `target` | 被操作对象的过滤后摘要 | 不是 before/after diff，不是 actor 快照 |
 
 ### 2.4 Domain / Feature / Action 完整枚举
 
@@ -119,7 +121,9 @@
 - `dorisx.DB.GetGlobalDB()` 已存在，可用于跨库 DDL 和不绑定项目库的查询
 - `dorisx.DB.UseDB(ctx, query)` 会自动拼 `sw_dw_{pid}`，**不适合** `sw_dw_global.audit_log`
 - `pkg/dal/dorisx/stream_loader.go` 已能发 Stream Load 请求，也已解析 `Status / Label / ExistingJobStatus`
-- 但当前 `StreamLoader` 没有生产调用者，而且认证头使用的是非标准 `Bearer <base64(user:pass)>`（`stream_loader.go:122`），而 `doris_apix.go:105` 使用标准 `Basic` Auth。Phase 0 必须在 dev 验证 `Basic` 是否能正常通过 Doris FE HTTP
+- 但它是死代码：零生产调用，且遗留了 ID-Merge 的硬编码（`User-Agent: ID-Merge-Agent`）
+- 与其修复这份从未用过的代码，不如在 `service/auditlog/` 中写一份专注的 Doris Stream Load 客户端，只包含审计写入需要的能力
+- 认证头沿用 Wave Stream Load 的真实约定：`Bearer <base64(user:pass)>`（`stream_loader.go:122` 和 `http_test.go` 确认），非 `doris_apix.go` 的 Query API Basic Auth 模式
 - 迁移框架 `script/migration/` 的 `DBType` 只有三种：`DBTypeMeta`（逐项目 PG）、`DBTypeGlobal`（全局 PG）、`DBTypeDoris`（逐项目 Doris）。**不存在针对全局 Doris 库 `sw_dw_global` 的迁移类型**，`audit_log` 表无法通过现有迁移路径创建
 
 ### 3.2 约束条件
@@ -130,8 +134,9 @@
 | 技术 | 写入失败时非阻塞丢弃并记 +1 drop counter + error 日志（同 PG 方案） | 审计可靠性要求（PG 方案已验证） |
 | 技术 | Doris 方案必须复用现有 Doris infra 配置 | 减少运维面和实现面 |
 | 技术 | `sw_dw_global.audit_log` 必须使用全限定表名访问 | `UseDB(ctx, query)` 只适合项目库 |
+| 技术 | AUTO PARTITION 需要 Doris ≥ 2.1.0；Phase 0 验证未通过则降级为手动 `PARTITION BY RANGE` | Wave 线上集群版本需确认 |
 | 技术 | Stream Load 写入失败时，同一批重试必须复用同一 label | Doris Stream Load label 幂等去重依赖 |
-| 技术 | `audit_log` DDL 通过新增 `doris_global.sql` 在服务启动时 bootstrap 建表 | 全局表不走 per-project 迁移框架；在 `dorisx.Init()` 成功后执行 |
+| 技术 | `audit_log` DDL 通过 `initDatabase()` 在 `dorisx.Init()` 成功后 bootstrap 执行 | 全局表不走 per-project 迁移框架；`script/sql/doris/audit_log.sql` 通过 embed 在服务启动时执行 |
 | 业务 | `domain / feature / target_id` 只有在 scope 内才有意义 | 已确认的查询约束 |
 | 业务 | `source` 枚举 `ui / api_token / mcp` | 审计关注认证来源和接入通道 |
 | 合规 | detail 里不能泄漏邮箱、token、密钥等敏感字段 | 已确认的脱敏要求 |
@@ -154,9 +159,9 @@
 
 | 对比维度 | 方案 A：全局单表 + 最小 Stream Load 补丁 | 方案 B：全局单表 + 范围优化键模型 | 方案 C：按项目分库分表 |
 |---|---|---|---|
-| **核心思路** | `sw_dw_global.audit_log` 单表；`DUPLICATE KEY(occurred_at, event_id)`；补齐 label、Basic Auth、重复 label 判定 | 仍是单表，但把 Key 调整为范围导向，例如 `org_id / project_id / occurred_at`，并为 key 列引入哨兵值 | 项目事件放入 `sw_dw_{pid}.audit_log`，账号/组织事件另建全局表或应用层 union |
+| **核心思路** | `sw_dw_global.audit_log` 单表；`DUPLICATE KEY(occurred_at, org_id, project_id, account_id, event_id)` 对齐高频查询路径与排序；补齐 label、Bearer Auth、重复 label 判定 | 仍是单表，但把 Key 调整为范围导向，例如 `org_id / project_id / occurred_at`，并为 key 列引入哨兵值 | 项目事件放入 `sw_dw_{pid}.audit_log`，账号/组织事件另建全局表或应用层 union |
 | **架构方式** | 一条写链路、一张表 | 一条写链路，但 writer 要做 NULL → 哨兵转换、读侧要做反向恢复 | 至少两套表模型，写入路由和读取聚合都更复杂 |
-| **接口复杂度** | 小：`audit.Log()` + `StreamLoader.Label()` | 中：除了 `Label()` 还要额外处理 key 兼容、结果恢复 | 高：写入和查询接口都要带分库路由 |
+| **接口复杂度** | 小：`audit.Log()` + `DorisStreamClient.Load()` | 中：除了 label 还要额外处理 key 兼容、结果恢复 | 高：写入和查询接口都要带分库路由 |
 | **实现工作量** | 约 7.5 人天 | 约 9 人天 | 约 11+ 人天 |
 | **扩展性** | 足够支撑 V1；后续可先加倒排索引，再考虑改 key | 查询剪枝更好，但 schema 语义更重 | 最贴近 Wave 现有项目库模式，但对跨项目/账号层审计扩展最差 |
 | **运维成本** | 低：一张表、月分区、现有 Doris 配置 | 中：多一层哨兵语义和恢复逻辑 | 高：排障时要看多库、多表 |
@@ -166,7 +171,7 @@
 
 ### 4.2 推荐方案：方案 A
 
-**推荐方案 A：`sw_dw_global.audit_log` + 最小 Stream Load 补丁。**
+**推荐方案 A：`sw_dw_global.audit_log` + 专注的 Stream Load 客户端。**
 
 选择理由：
 
@@ -202,7 +207,7 @@ flowchart TD
     subgraph 写入层[Doris Writer]
         FW[Flush Worker]
         LAB[Stable Label]
-        SL[StreamLoader]
+        SL[DorisStreamClient]
     end
     subgraph 存储层[Storage]
         DORIS[(sw_dw_global.audit_log)]
@@ -225,14 +230,14 @@ sequenceDiagram
     participant C as Controller
     participant A as audit.Log
     participant W as DorisWriter
-    participant SL as StreamLoader
+    participant SL as DorisStreamClient
     participant D as Doris
 
     C->>A: Log(ctx, input)
     A->>A: scope 校验 + 脱敏 + 裁剪
     A->>W: enqueue
     W->>W: 攒批 + 生成 stable label
-    W->>SL: Label(label).Load(payload)
+    W->>SL: Load(ctx, payload, label)
     SL->>D: PUT /api/sw_dw_global/audit_log/_stream_load
     alt Success / Publish Timeout
         D-->>SL: 成功
@@ -252,7 +257,7 @@ sequenceDiagram
 |---|---|---|---|
 | `audit.Log()` | — | 深 | 调用方只传业务含义，内部隐藏 scope 校验、脱敏、裁剪、enqueue |
 | `DorisWriter` | — | 深 | 对外只暴露 `Start/Stop/Enqueue`，内部封装 batch、label、flush |
-| `StreamLoader` | 浅 | 保持浅 | 只补最小能力：`Label()`、Basic Auth 对齐、幂等状态判定 |
+| `DorisStreamClient`（`service/auditlog/` 新增） | 浅 | — | 在 auditlog 包内写专注的客户端，只暴露 `Load(ctx, data, label)` 一个方法；支持 Bearer Auth、stable label、幂等判定、超时控制 |
 | `QueryService` | — | 中 | 负责限定查询范围、拼 SQL、补当前账号名，不额外承担存储抽象 |
 
 ---
@@ -262,7 +267,8 @@ sequenceDiagram
 | 模块 | 变更类型 | 影响程度 | 改动要点 | 风险等级 |
 |---|---|---|---|---|
 | `script/sql/doris/audit_log.sql` | 新增 | 🟢低 | 新增 `sw_dw_global.audit_log` 建库建表 DDL；通过 `initDatabase()` 在 `dorisx.Init()` 后 bootstrap 执行 | 低 |
-| `pkg/dal/dorisx/stream_loader.go` | 修改 | 🟡中 | 新增 `Label()`；认证头 `Bearer` → `Basic`（与 `doris_apix.go:105` 对齐）；`IsSuccess()` 追加 `Label Already Exists + FINISHED` 判定 | 中 |
+| `apps/web/service/auditlog/doris_stream.go` | 新增 | 🟢低 | 专注的 Stream Load 客户端，支持 Bearer Auth、stable label、幂等判定、超时控制；不碰 `pkg/dal/dorisx/stream_loader.go` 死代码 | 低 |
+| `dorisx` 现有模块 | — | — | 只复用 `dorisx.DB.GetGlobalDB()` 和 `config.Inf.GetDoris()` 连接配置，Stream Load 客户端在 auditlog 包内自建 | — |
 | `pkg/lib/pvctx/pvctx.go` | 修改 | 🟢低 | 增加 `ClientIP()` / `WithClientIP()` 并在 `BackGroundCtx` 中复制 | 低 |
 | `pkg/config/app_cfg.go` | 修改 | 🟢低 | 只补审计 writer 配置，不新增 Doris 连接配置 | 低 |
 | `apps/web/server.go` | 修改 | 🟢低 | 在 Doris 初始化后启动 audit writer，并在 shutdown 时 drain | 低 |
@@ -292,14 +298,17 @@ type LogInput struct {
 func Log(ctx context.Context, input LogInput)
 ```
 
-本方案新增的 Doris 侧最小接口补丁：
+Doris 侧新写专注的 Stream Load 客户端：
 
 ```go
-// Label 设置 stable label；同一批次初次写入和重试必须复用。
-func (s *StreamLoader) Label(label string) *StreamLoader
+type DorisStreamClient struct { /* 不导出 */ }
+
+// Load 发送 Stream Load 请求；label 为空时不设 label 头。
+// 返回 nil 表示成功（含幂等成功）；返回 error 表示失败，调用方重试或丢弃。
+func (c *DorisStreamClient) Load(ctx context.Context, data []byte, label string) error
 ```
 
-同时约定 `Load()` 的成功语义修正为：
+成功语义：
 
 - `Status == "Success"` → 成功
 - `Status == "Publish Timeout"` → 视为成功（沿用现有行为）
@@ -308,9 +317,9 @@ func (s *StreamLoader) Label(label string) *StreamLoader
 
 ### 7.2 接口深度分析
 
-- **Interface 大小**：业务写入仍是 1 个 `Log()`；Doris 侧只补 1 个 `Label()` 方法
+- **Interface 大小**：业务写入仍是 1 个 `Log()`；Doris 侧 1 个 `Load(ctx, data, label)` 方法
 - **隐藏复杂度**：batch 组装、label 生成、失败丢弃全收敛在 writer 内部
-- **可测试性**：`Label()`、`IsSuccess()`、label 生成都可单测；HTTP 路径可用 `httptest` 覆盖
+- **可测试性**：`Load()` 的 `isSuccess()`、label 生成都可单测；HTTP 路径可用 `httptest` 覆盖
 
 ---
 
@@ -318,9 +327,9 @@ func (s *StreamLoader) Label(label string) *StreamLoader
 
 | # | 挑战 | 回应 | 是否可接受 |
 |---|---|---|---|
-| 1 | `StreamLoader` 现在零生产调用者，而且认证头和 `doris_apix.go` 不一致，真的能直接用吗？ | 不能直接“盲信可用”。这就是 Doris 方案必须有 Phase 0 验证的原因。文档里把 Basic Auth 对齐和 dev curl 验证列为前置门槛。 | ✅ |
+| 1 | 现有 `stream_loader.go` 是死代码，为什么不自建客户端？ | 已在 decisions.md 确认：自建 `DorisStreamClient`，不修死代码。客户端遵循 Wave Stream Load 真实约定（Bearer Auth、`strip_outer_array`、`format: json`），Phase 0 验证 HTTP 通路。 | ✅ |
 | 2 | 为什么故意违反 Wave”每项目一个 Doris DB”的习惯，单独做 `sw_dw_global`？ | 审计日志天然包含账号层、组织层、跨项目导出；如果按项目拆库，查询和导出会被人为拆碎，复杂度高于收益。作为**显式例外**管理：DDL 通过 `initDatabase()` 在 `dorisx.Init()` 后 bootstrap 执行，不改变现有项目迁移流程。 | ✅ |
-| 3 | 为什么不把 key 做成 `org_id / project_id / occurred_at`，让范围查询更快？ | 因为当前审计量级远小于主事件库，先保证语义简单和实现清晰更重要。未来慢了，先加索引再改 key。 | ✅ |
+| 3 | DUPLICATE KEY 为什么选择了 `(occurred_at, org_id, project_id, account_id, event_id)`？ | `occurred_at` 作为第一列确保分区剪枝和按时间排序；`org_id/project_id/account_id` 作为后续列让 scope 查询可利用前缀索引加速；`event_id` 放最后位，使 `ORDER BY occurred_at, event_id` 无需额外排序，也支持对账场景的 `WHERE event_id = ?` 点查。 | ✅ |
 | 4 | 不存 actor 快照，会不会影响第三方审计？ | 第三方审计首先看“稳定 actor 标识 + 时间 + 操作 + 对象 + 来源 IP”。V1 以 `account_id` 为主证据，显示名读侧补齐即可；如果未来审计方明确要求“当时名”，再扩展。 | ✅ |
 | 5 | `Label Already Exists` 能不能一概视为成功？ | 不能。必须同时检查 `ExistingJobStatus == FINISHED`。如果还是 `RUNNING` 或其他状态，writer 继续按失败路径处理。 | ✅ |
 | 6 | 项目异常重启会不会把内存里的审计批次丢掉？ | 会有有限窗口，所以必须在 shutdown 时 drain；异常崩溃仍然存在极小窗口，这也是为什么需要 metrics 监控。 | ✅ |
@@ -331,8 +340,8 @@ func (s *StreamLoader) Label(label string) *StreamLoader
 
 | Phase | 内容 | 依赖 | 交付物 | 预估时长 |
 |---|---|---|---|---|
-| **Phase 0（可行性验证）** | dev 环境 curl 验证 Stream Load：Basic Auth、label 重复、HTTP 通路 | 无 | “Doris 直写可用”结论 | 0.5 天 |
-| **Phase 1（底座）** | `initDatabase()` bootstrap DDL、`StreamLoader` 补丁、writer、metrics | Phase 0 | 审计写入基础能力 | 2 天 |
+| **Phase 0（可行性验证）** | dev 环境 curl 验证 Stream Load：Bearer Auth、label 重复、HTTP 通路 | 无 | “Doris 直写可用”结论 | 0.5 天 |
+| **Phase 1（底座）** | `initDatabase()` bootstrap DDL、`doris_stream.go` 客户端、writer、metrics | Phase 0 | 审计写入基础能力 | 2 天 |
 | **Phase 2（业务接入）** | 13 个 controller 接入 25 个 feature | Phase 1 | 全量审计写入 | 3 天 |
 | **Phase 3（查询导出）** | List / Export OpenAPI、PG 补当前名称、导出格式 | Phase 2 | 审计取证能力 | 2 天 |
 
@@ -344,7 +353,7 @@ func (s *StreamLoader) Label(label string) *StreamLoader
 |---|---|---|---|---|
 | 运维 | Doris FE HTTP 通路在 web 服务上未被现网路径证明 | 中 | 中 | Phase 0 先验证；不通过则 Doris 方案暂停 |
 | 可靠性 | Doris 长时间不可达导致写入丢弃 | 中 | 中 | 暴露 `audit_channel_drop_total` 监控；Doris 恢复后正常写入新数据 |
-| 性能 | 以 `occurred_at + event_id` 为 key，极宽时间窗下的 scope 查询可能不如 PG | 中 | 低 | 查询强制带时间范围；后续再评估倒排索引或 key 调整 |
+| 性能 | DUPLICATE KEY 含 `occurred_at, org_id, project_id, account_id, event_id`，scope 查询已有前缀索引剪枝，但极宽时间窗下的查询仍可能慢于 PG | 低 | 低 | 查询强制带时间范围；后续再评估倒排索引 |
 | 合规解释 | 不存 actor 快照，导出显示名来自读侧补齐 | 低 | 中 | 明确把 `account_id` 作为主证据字段；显示名仅作展示辅助 |
 | 架构 | `sw_dw_global` 打破 Wave"每项目一库"约定，通过 `initDatabase()` bootstrap DDL | 高 | 低 | 显式作为例外管理；通过 `dorisx.DB.GetGlobalDB().ExecContext()` 在启动时执行一次，不改变现有项目迁移流程 |
 | 复杂度 | Doris 方案仍比 PG 多一层 label / HTTP 语义 | 高 | 中 | 这是 Doris 方案固有代价，因此整体评审仍偏向 PG |
