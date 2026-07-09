@@ -2,9 +2,9 @@
 
 **目录**: `20260626-Wave-Feat-AddAuditLog`
 **创建日期**: 2026-06-26
-**最后更新**: 2026-07-08（补充规模假设与方案对比分析）
+**最后更新**: 2026-07-08（重组：规划内容归入 03-plan.md）
 **状态**: 评审中
-**技术方案**: [03-plan-pg.md](./03-plan-pg.md) + [04-detail-pg.md](./04-detail-pg.md)（当前推荐） / [03-plan-doris.md](./03-plan-doris.md) + [04-detail-doris.md](./04-detail-doris.md)（备选）
+**技术方案**: [03-plan.md](./03-plan.md) + [04-detail-pg.md](./04-detail-pg.md)（当前推荐） / [04-detail-doris.md](./04-detail-doris.md)（备选）
 
 ---
 
@@ -201,39 +201,31 @@ CREATE INDEX idx_alog_account_time ON global.audit_log (account_id, occurred_at 
 
 ---
 
-## 写入与读取
+## 写入
 
-### 写入路径
+1. Handler/Service 业务成功后显式调用 `audit.Log(ctx, domain, feature, action, targetID, detail)`
+2. 内部校验 domain+feature 已注册，从 pvctx 提取 org_id/project_id/source/client_ip
+3. 构造 detail（schema_version/account/target/comment/extra），64KB 预算裁剪
+4. 非阻塞 enqueue 到 channel，满则丢弃 + drop counter + error 日志（不阻塞主流程）
+5. 后台 flush worker 批次写入 `global.audit_log`
+6. 写入失败时非阻塞丢弃 + drop counter，不设本地 spool
 
-1. HTTP/MCP 请求进入 → Middleware（或 MCP handler）提取 `account_id`、`ip_address` 等上下文；`source` 由 `ui / api_token / mcp` 派生
-2. Handler / Service 在业务成功后显式调用 `audit.Log(...)`；登录 / 登出 / 登录失败在 `controller/account` 写入
-3. Audit writer 校验 `domain + feature` 组合已注册
-4. 主流程只做 enqueue，不等待最终落库
-5. 后台批量 flush 到目标存储（PG 或 Doris）
-6. flush 失败进入可回放队列并告警，不允许静默 drop
+**写入约束**：
+- 仅站外流量：source ∈ {ui, api_token, mcp}，internal/scheduler/backfill 不写入
+- 缺少 client_ip 时记 critical 告警，不回滚业务操作
+- 未注册的 domain+feature 组合拒绝写入
 
-**MCP 入口说明**：MCP 协议不走标准 gin middleware，但现有鉴权已注入 `Aid / Token / IsAccountAPIToken / Pid`；V1 需额外补 `client_ip` 与独立 `audit_source`，并在 MCP 入口显式写入 `source = mcp`。
+## 读取
 
-### 写入入口拦截
+查询接口 `List(ctx, req)` 和导出 `Export(ctx, req)` 共享 scope 校验：
 
-- 只有站外管理面请求会显式调用审计写入；其 `source` 只允许 `ui | api_token | mcp`
-- `internal / scheduler / backfill` 不进入显式审计写入路径
-- MCP 请求在鉴权后显式设为 `source = mcp`
-
-### 读取路径
-
-1. 查询接口：`AuditLogService.List(ctx, &Query{OrgID, ProjectID, AccountID, Domain, Feature, TargetID, Action, StartTime, EndTime, Cursor, PageSize})`
-2. 导出与查询以 `account_id` 为准；如需当前操作者名称，再按 `account_id` 补齐
-3. 过滤维度：时间范围、组织、项目、操作人、domain、feature、target_id、action；其中 `domain / feature / target_id` 只在 scoped 查询内有意义
-4. 排序：`occurred_at DESC`
-5. 分页：**cursor 模式**，使用 `(occurred_at, id|event_id)` 作为复合游标，避免同时间戳下漏数/重数
-6. 返回结构含 `next_cursor` 和 `has_more`，cursor 为空表示无更多数据
-
-### 导出
-
-- 格式：CSV / Excel
-- 应用当前查询过滤条件
-- V1 提供 OpenAPI 导出，不提供前端查看页面
+| 规则 | 说明 |
+|------|------|
+| scope 约束 | `OrgID / ProjectID / AccountID` 至少一个必填（防全表扫） |
+| 时间范围 | `StartTime / EndTime` 必填 |
+| 分页 | **cursor** 模式：`(occurred_at, event_id)` 复合游标，返回 `{items, next_cursor, has_more}` |
+| 排序 | `occurred_at DESC` |
+| 导出 | CSV / Excel，通过 OpenAPI 提供，V1 不提供前端查看页面 |
 
 ---
 
@@ -287,51 +279,13 @@ CREATE INDEX idx_alog_account_time ON global.audit_log (account_id, occurred_at 
 - **SC-005**: 支持 CSV/Excel 导出
 - **SC-006**: 保留 / 归档策略可运维；当选择 Doris 时自动月分区可用
 
----
-
-## 规模假设与方案对比
-
-### 规模假设
+## 规模假设
 
 基于 Wave 平台特征（每个 org 数十个活跃用户，管理面操作为低频），且按月分区为前提：
 
-| 场景 | 每 org 日均事件数 | 100 org | 500 org | 1000 org |
-| --- | --- | --- | --- | --- |
-| **CUD**（CUD + 登录） | ~50 | 5K/天 → ~1.8M/年 | 25K/天 → ~9M/年 | 50K/天 → ~18M/年 |
-| **CRUD**（CRUD + 登录） | ~5,000 | 500K/天 → ~180M/年 | 2.5M/天 → ~900M/年 | 5M/天 → ~1.8B/年 |
+| 场景 | 每 org 日均事件数 | 1,000 org/年 |
+|------|-------------------|-------------|
+| **CUD**（CUD + 登录） | ~50 | ~18M 行 / ~18 GB（PG）|
+| **CRUD**（CRUD + 登录） | ~5,000 | ~1.8B 行 / ~1.8 TB（PG）|
 
-> 读操作按每人每天 ~100 次估算（Dashboard 加载、Chart 查询、列表翻页等），每 org 约 50 个活跃用户。实际量级取决于接入范围，以上为上限估算。
-
-### 月分区存储对比
-
-按 ~1KB/行（PG 行存）、~0.3KB/行（Doris 列存 + ZSTD 压缩）、保留 1 年估算：
-
-| 场景 | 规模 | PG 每年存储 | Doris 每年存储 | Doris 压缩收益 |
-| --- | --- | --- | --- | --- |
-| CUD | 1,000 org | ~18 GB | ~5 GB | ~3.6x |
-| CRUD | 1,000 org | ~1.8 TB | ~0.5 TB | ~3.6x |
-
-### 方案适用性
-
-双方均以月分区为前提：
-
-| 场景 | PG 方案 | Doris 方案 |
-| --- | --- | --- |
-| **CUD, ≤ 1,000 org**（V1 当前范围） | ✅ 月分区后无压力，团队运维熟练 | ✅ 但改动面大，V1 优先选 PG |
-| **CRUD, 1,000 org**（若读操作全量接入） | ⚠️ 月分区后索引/vacuum 可控，但存储 ~1.8TB/年，行存代价持续存在 | ✅ 列存压缩 ~0.5TB/年，append-only 零维护 |
-
-### 关键分歧
-
-CUD-only 时 PG 和 Doris 的差距主要是运维审美问题——PG 的 B-tree 索引和 autovacuum 在几千万行级别完全成熟，团队也熟练。
-
-CRUD（加入读操作）之后，**月分区解决了 PG 的索引和 vacuum 问题**，剩余差距收窄为**存储成本和分区管理体验**：
-- 存储：PG 行存 ~1.8TB/年 vs Doris 列存 ~0.5TB/年（物理差异，分区无法改变）
-- 管理：PG 需手动建 12+ 个分区/年 vs Doris `AUTO PARTITION BY RANGE` 一行声明
-
-这也是当前方案设计保持两套并行的原因：**PG 方案最小改动落地，Doris 方案作为量级上升时的自然演进路径，两者共享同一套应用层代码和查询接口。**
-
----
-
-## 技术方案
-
-所有技术设计详见 [03-plan-pg.md](./03-plan-pg.md)、[04-detail-pg.md](./04-detail-pg.md)、[03-plan-doris.md](./03-plan-doris.md)、[04-detail-doris.md](./04-detail-doris.md)。当前评审偏向是：先落 PG，再根据真实规模决定是否引入 Doris。
+规模估算、方案对比、存储决策详见 [03-plan.md §4](./03-plan.md#4-存储方案)。

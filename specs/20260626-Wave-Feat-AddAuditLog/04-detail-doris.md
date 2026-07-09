@@ -7,7 +7,7 @@
 | **最后更新** | 2026-07-08（Stream Load 客户端：自建不修 dead code） |
 | **状态** | Reviewing |
 | **关联 spec** | [01-spec.md](./01-spec.md) |
-| **关联 plan** | [03-plan-doris.md](./03-plan-doris.md) |
+| **关联 plan** | [03-plan.md](./03-plan.md) |
 | **设计者** | AI 架构师 |
 | **产出命名** | `04-detail-doris.md`（多方案，后缀 `-doris` 标识 Doris 方案） |
 
@@ -17,7 +17,7 @@
 
 ### 1.1 回顾
 
-[03-plan-doris.md](./03-plan-doris.md) 已将 Doris 方案收敛为：
+[03-plan.md](./03-plan.md) 已将 Doris 方案收敛为：
 
 - 单表：`sw_dw_global.audit_log`
 - 单写链路：业务成功后显式 `audit.Log()`，后台异步攒批 Stream Load
@@ -36,53 +36,6 @@
 
 ---
 
-## 2. 一致性校验
-
-### 2.1 Spec vs Plan
-
-| 校验项 | 状态 | 说明 |
-|---|---|---|
-| P0 用户故事与方案目标 | ✅ 匹配 | 第三方审计导出、安全追溯、组织治理都被覆盖 |
-| “主流程必须异步” | ✅ 匹配 | 仍然是 enqueue + 后台 flush |
-| 失败不能静默丢 | ✅ 匹配 | Doris 方案同 PG 方案：非阻塞丢弃 + drop counter + error 日志 |
-| `source` 与 detail 文案 | ✅ 已同步 | 与 PG 方案一致：`ui / api_token / mcp`、`Account + Target` 结构 |
-
-### 2.2 Plan vs 代码现实
-
-| 假设 | 验证结果 | 备注 |
-|---|---|---|
-| Web 服务已初始化 Doris 连接 | ✅ 已确认 | `apps/web/server.go` 已调用 `dorisx.Init(...)` 与 `dorisx.InitDorisApiClient(...)` |
-| 存在可跨库查询/DDL 的 Doris 连接 | ✅ 已确认 | `dorisx.DB.GetGlobalDB()` 可直接使用 |
-| `UseDB(ctx, query)` 可直接服务审计全局表 | ❌ 不成立 | 它会拼接 `sw_dw_{pid}`，不适用于 `sw_dw_global` |
-| `StreamLoader` 已能解析 Stream Load 状态 | ✅ 已确认 | 已有 `Status`、`Label`、`ExistingJobStatus` 字段 |
-| `StreamLoader` 可直接用于审计写入 | ⚠️ 部分成立 | 还缺 `Label()`；认证头和项目里其他 Doris HTTP 调用不一致 |
-| `sw_dw_global` DDL 可通过迁移框架执行 | ❌ 不成立 | `DBTypeDoris` 只支持逐项目遍历（`sw_dw_{pid}`），`DBTypeGlobal` 指向全局 PG。改为 `initDatabase()` 在 `dorisx.Init()` 后 bootstrap 执行 |
-| Doris 写入一定要用哨兵值代替 NULL | ❌ 不成立 | Wave 现有 Doris 表与 Doris 官方能力都允许非 key 列为 NULL，本方案移除全量哨兵转换假设 |
-
-### 2.3 修正记录
-
-- **修正 1：`source` 新增 `mcp` 枚举值**
-  - MCP 是入口协议，不是独立认证来源
-  - 统一规则：`pvctx.IsAccountAPIToken(ctx) == true` → `api_token`，否则 `ui`
-
-- **修正 2：detail 不再存 actor 快照**
-  - V1 只保留 `schema_version / account / target / comment / extra`
-  - 审计证据主键是 `account_id`，显示名读侧补齐，详见 [01-spec.md §Detail 结构](./01-spec.md#detail-结构)
-
-- **修正 3：放弃“Doris 全字段哨兵值”**
-  - DUPLICATE KEY 选 `(occurred_at, org_id, project_id, account_id, event_id)`：前 4 列确保分区剪枝 + scope 前缀加速；`event_id` 放最后位，使 `ORDER BY occurred_at DESC, event_id DESC` 无需额外排序，同时支持按 `event_id` 点查的对账场景
-  - 不把 NULL scope 改写成哨兵值
-
-- **修正 4：不新增 Doris 审计专用连接配置**
-  - Doris 连接与 HTTP Host 全部复用 `config.Inf.GetDoris()`
-
-- **修正 5：`sw_dw_global` DDL 不走迁移框架，改为 `initDatabase()` bootstrap**
-  - 迁移框架现在只能对逐项目 Doris 库（`sw_dw_{pid}`）执行 DDL，不支持全局库
-  - 在 `server.go` 的 `initDatabase()` 中，于 `dorisx.Init()` 成功后调用 `dorisx.DB.GetGlobalDB().ExecContext(ctx, doris_global_sql)`
-  - 使用 `CREATE DATABASE IF NOT EXISTS` + `CREATE TABLE IF NOT EXISTS` 保证幂等
-
----
-
 ## 3. 实现总览
 
 Doris 方案与 PG 方案共享的部分不重复造轮子：
@@ -98,27 +51,6 @@ Doris 方案与 PG 方案共享的部分不重复造轮子：
 2. **幂等机制**：PG 依赖唯一约束；Doris 依赖 stable label
 3. **失败兜底**：PG 可以单事件 JSONL；Doris 更适合批次级文件重放
 
-### 3.1 文件影响清单
-
-| 文件 | 变更类型 | 改动内容 | 改动的理由 |
-| --- | --- | --- | --- |
-| `script/migration/migration.go` | — | — | Doris 全局 DDL 不走迁移框架，通过 `initDatabase()` bootstrap |
-| `script/migration/service.go` | — | — | Doris 全局 DDL 不走迁移框架，通过 `initDatabase()` bootstrap |
-| `script/sql/doris/audit_log.sql` | 新增 | 建库建表 DDL（与现有 `doris.sql` 风格一致） | Doris 审计表独立于 PG，需要单独 DDL |
-| `apps/web/service/auditlog/doris_stream.go` | 新增 | 专注的 Stream Load 客户端，Bearer Auth、stable label、幂等判定、超时控制 | 不碰 `pkg/dal/dorisx/stream_loader.go` 死代码；在 auditlog 包内新写一份只给审计用的客户端 |
-| `pkg/lib/pvctx/pvctx.go` | 修改 | 新增 `ClientIP()` / `WithClientIP()`，并在 `BackGroundCtx()` 复制 | 审计必须记录 IP，异步 goroutine 也要拿到 |
-| `pkg/config/app_cfg.go` | 修改 | 增加 audit writer 配置项 | 审计写入参数需要可配置，但 Doris 连接本身复用现有配置 |
-| `apps/web/server.go` | 修改 | 在 Doris 初始化后启动 audit writer，并在 shutdown 时 drain | writer 生命周期应挂在 Web 服务主生命周期上 |
-| `apps/web/metrics/metrics.go` | 修改 | 增加 audit 指标 factory | 监控必须独立，不混进现有 Doris query 指标 |
-| `apps/web/service/auditlog/audit.go` | 新增 | `Log()` 入口、枚举校验、source 派生 | 统一入口最适合收口业务层接入 |
-| `apps/web/service/auditlog/detail.go` | 新增 | detail 脱敏、裁剪、序列化 | detail 是合规边界，应该集中处理 |
-| `apps/web/service/auditlog/writer_doris.go` | 新增 | batch、label、flush、queue overflow 处理 | Doris 专用复杂度深埋在 writer 中 |
-| `apps/web/service/auditlog/spool_doris.go` | — | — | Doris 方案不设本地 spool（同 PG 方案），此文件不需要 |
-| `apps/web/service/auditlog/query_doris.go` | 新增 | 查询、游标、PG 补当前名称 | Doris 查询与 PG 补名天然是这一层职责 |
-| `apps/web/controller/auditlog/audit.go` | 新增 | OpenAPI 查询与导出 handler | 审计产品出口在 controller 层 |
-| 13 个 controller 文件 | 修改 | 在成功路径显式调用 `audit.Log()` | 它们是具体业务动作的唯一入口 |
-
----
 
 ## 4. 数据模型 / API / 配置定义
 
@@ -926,56 +858,3 @@ sequenceDiagram
 | AUTO PARTITION 不支持（需 Doris ≥ 2.1.0） | 降级 | 回退到手动 `PARTITION BY RANGE` 按月建分区，或升级 Doris 集群 |
 | Label 幂等语义异常 | 方案设计需调整 | 重新评估 Stable Label 策略或降级 PG 方案 |
 
----
-
-## Quality Gates
-
-### QG-1 Performance
-- [x] 无 N+1：读侧补名使用批量 `GetAccountNamesMapByIds`
-- [x] 无大事务：Doris 方案没有数据库事务，只做单批 HTTP PUT
-- [x] 查询必须带时间范围和 scope，避免无界扫描
-
-### QG-2 Data Integrity
-- [x] queue 满时非阻塞丢弃 + drop counter + error 日志（同 PG 方案）
-- [x] Doris Stream Load 幂等通过 stable label + ExistingJobStatus 判断保证
-- [x] `Label Already Exists` 只在 `FINISHED` 时视为成功
-
-### QG-3 Security
-- [x] 每个入口都明确 source 派生规则
-- [x] detail 脱敏边界已定义
-- [x] 导出不返回邮箱
-
-### QG-4 Simplicity
-
-- [ ] ~~无新增框架~~ — Doris 全局 DDL 不走迁移框架，通过 `initDatabase()` bootstrap，不是新框架
-- [x] Doris 连接配置完全复用现有 infra
-
-### QG-5 Completeness
-- [x] 文件清单完整
-- [x] 失败路径完整
-- [x] 测试矩阵完整
-
-### QG-6 Architecture
-- [x] 业务层只依赖 `audit.Log()`，不直接碰 Doris DAO
-- [x] Doris 细节都收口在 `auditlog` 子模块
-
-### QG-7 Cache / Redis
-- [x] 不涉及缓存一致性
-
-### QG-8 分布式部署兼容性
-- [x] 主流程不阻塞等待 Doris
-- [x] 幂等依赖 stable label，不依赖单机内存状态
-
-### QG-9 一致性校验
-- [x] Spec ↔ Plan ↔ Code 差异已显式记录
-- [x] 老稿中的 `mcp source / actor 快照 / 全量哨兵值` 已被修正
-
-### QG-10 外部依赖
-
-- [x] Doris HTTP / MySQL 协议、PG 补名、迁移框架的契约都已记录
-- [x] 每个外部依赖的故障影响已评估
-
-### QG-11 上线回滚
-- [x] DDL 为新增型，可安全回滚服务版本
-- [x] 上线观测指标和告警阈值已定义
-- [x] 回滚检查清单已覆盖

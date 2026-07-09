@@ -7,7 +7,7 @@
 | **最后更新** | 2026-07-07（按新模版重写） |
 | **状态** | Reviewing |
 | **关联 spec** | [01-spec.md](./01-spec.md) |
-| **关联 plan** | [03-plan-pg.md](./03-plan-pg.md) |
+| **关联 plan** | [03-plan.md](./03-plan.md) |
 | **设计者** | AI 架构师 |
 | **产出命名** | `04-detail-pg.md`（多方案，后缀 `-pg` 标识 PostgreSQL 方案） |
 
@@ -28,34 +28,7 @@ PG 优先的理由是改动面最小（复用现有 `globaldb` 和 DAO 模式）
 - detail 大小预算与 PG TOAST 压缩
 - Cursor 编解码格式：`occurred_at` 与 `event_id` 如何拼接
 
----
 
-## 2. 一致性校验
-
-### 2.1 Spec vs Plan
-
-| 校验项 | 状态 | 说明 |
-|---|---|---|
-| Spec 所有用户故事在 plan 中有对应方案 | ✅ 匹配 | 5 个价值定位在 plan 中均有对应设计 |
-| Plan 的 out-of-scope 与 spec 一致 | ✅ 一致 | changes diff、前端审计页面、强一致同步写均在 out-of-scope |
-| Spec 中的边界情况在 plan 中有考量 | ✅ 覆盖 | 大小预算、缺 IP、channel 满、PG 故障均有处理 |
-
-### 2.2 Plan vs 代码现实
-
-| 假设 | 验证结果 | 备注 |
-|---|---|---|
-| `pvctx.IsAccountAPIToken` 可用于识别 token 鉴权 | ⚠️ 部分满足 | 可覆盖 `ui / api_token`，但不能表达 `mcp`；需新增独立 `audit_source` ctx 字段 |
-| `BackGroundCtx` 可扩展复制 client_ip / source | ✅ 可扩展 | 现实现已复制 `token / reqid / traceid / language` 等字段，审计补充时不能把这些能力退化掉 |
-| MCP 写路径可直接复用 gin 的 IP 提取 | ❌ 不成立 | MCP 走 `net/http`，需单独从 `X-Real-IP`（反向代理透传）提取 `client_ip` |
-| 登录/登出在 controller/account | ✅ 存在 | `apps/web/controller/account/account.go:70-114` |
-| 服务启动/关闭有明确接入点 | ✅ 存在 | `apps/web/server.go:94,212,326` |
-| 现有异步 writer 不可复用 | ✅ 确认 | `pkg/qm/async_batch_writer.go:87-110` select + default drop |
-| 批量补账号名模式已存在 | ✅ 存在 | `apps/web/service/account/account.go:390-408` |
-
-### 2.3 修正记录
-
-- **plan-pg.md §1 out-of-scope 修正**：已从"V1 明确不做"列表中删除"actor 快照/邮箱快照"（该限制与 decisions.md 2026-07-07 矛盾）
-- **`Detail` struct 字段修正**：`snapshot` 拆分为 `account` + `target` 两独立字段
 
 ---
 
@@ -69,26 +42,7 @@ PG 优先的理由是改动面最小（复用现有 `globaldb` 和 DAO 模式）
 
 数据流动方向：Controller → `audit.Log()` → channel → FlushWorker → `global.audit_log`（失败则丢弃 + error 日志）
 
-### 3.1 文件影响清单
 
-| 文件 | 变更类型 | 改动内容 | 改动的理由 |
-|---|---|---|---|
-| `script/migration/scripts/global_v20260707_audit_log.sql` | 新增 | 新增 `audit_log` 表与索引的现网 migration | 现网 rollout 不能只改 `global.sql` |
-| `script/sql/pgsql/global.sql` | 修改 | 同步 `audit_log` DDL 到 bootstrap 快照 | 保证全新环境首次初始化也带上该表 |
-| `pkg/lib/pvctx/pvctx.go` | 修改 | 新增 `ClientIP()` / `WithClientIP()` / `AuditSource()` / `WithAuditSource()`；`BackGroundCtx` 增加复制 client_ip / audit_source / org_id | 审计 IP、source、org_id 都需要透传到异步 goroutine |
-| `apps/web/config/web_cfg.go` | 修改 | 新增 audit 配置项（batch/flush/queue） | 审计是 web 模块专属，放 WebConf |
-| `apps/web/server.go` | 修改 | `initService()` 中 init audit writer；`Shutdown` 中 drain | 管理 writer 生命周期 |
-| `pkg/ginx/middleware/session.go` | 修改 | gin 站外请求默认注入 `source = ui` | 覆盖登录/登出/登录失败等无 token 路径 |
-| `pkg/ginx/middleware/account_api_token.go` | 修改 | token 鉴权命中时覆盖 `source = api_token` | 保证 API token 请求来源正确 |
-| `apps/web/metrics/metrics.go` | 修改 | 新增 `audit` Factory | 审计指标隔离 |
-| `apps/web/dao/global/audit_log.go` | 新增 | BatchInsert / List / Export 方法 | DAO 层 |
-| `apps/web/service/auditlog/audit.go` | 新增 | Log() / Detail 类型 / 常量 / registry | 核心入口 |
-| `apps/web/service/auditlog/writer_pg.go` | 新增 | FlushWorker / batch INSERT / ON CONFLICT | 异步批量写入 |
-| `apps/web/service/auditlog/detail.go` | 新增 | Detail 构造 / 大小预算检查 | 审计详情处理 |
-| `apps/web/controller/auditlog/audit.go` | 新增 | OpenAPI List / Export handler | 查询导出接口 |
-| `apps/web/controller/account/account.go` | 修改 | 成功后调用 `audit.Log()` | 登录/登出/登录失败审计 |
-| `apps/web/mcp/server.go` | 修改 | 显式注入 `source = mcp`，并按 trusted proxies 规则提取 `client_ip` | MCP 不走 gin，不能复用 `ClientIP()` |
-| 12 个其他 controller 文件 | 修改 | 每个 handler 成功路径加 `audit.Log()` | 25 feature 审计接入 |
 
 ---
 
@@ -181,6 +135,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_account_time
 ```go
 // Detail 审计详情。schema_version 由 Log 内部写入，调用方不关注。
 type Detail struct {
+    SchemaVersion int            `json:"schema_version"`          // 固定 1，Log 内部写入
     Account       map[string]any `json:"account,omitempty"`       // {id, name?} 操作时 actor 快照；name 仅在天然已知时写入，不额外查库，不含邮箱
     Target        map[string]any `json:"target,omitempty"`        // {id, name, type, ...} 资源摘要
     Comment       string         `json:"comment,omitempty"`       // 可选人类可读说明
@@ -205,6 +160,7 @@ func Log(ctx context.Context, domain, feature, action, targetID string, detail *
 
 ```json
 {
+  "schema_version": 1,
   "account": {"id": "123", "name": "张三"},
   "target": {
     "id": "34", "name": "增长看板",
@@ -227,6 +183,7 @@ func Log(ctx context.Context, domain, feature, action, targetID string, detail *
 | `pvctx` | 内部模块 | 鉴权与审计上下文 | 函数调用 | 当前版本 | 内部 | 需新增 `audit_source` 与 `client_ip` |
 
 > **IP 提取策略**：优先读反向代理透传的 `X-Real-IP`，降级读 `RemoteAddr`。不配置全局 `TrustedProxies`（影响所有 gin 路由，超出审计范围）。V1 文档说明此限制，IP 可能在某些场景下不准确。
+
 > **连接池**：PGWriter 复用 globaldb 的连接池，不创建独立连接池。分布式下多副本 × 独立池会无谓增加 PG 连接数，且审计丢弃可接受（尽力记录原则），无需隔离。如未来审计流量显著影响业务池，见 §12 V2 规划 #4。
 
 #### 集成契约
@@ -829,53 +786,3 @@ func (h *OrgMemberHandler) UpdateMemberRole(ctx, memberID, newRole) (res, err) {
 | 2 | **IP 地址可信**：引入 `TrustedProxies` 白名单，启用 `gin.ClientIP()` 严格模式 | V1 依赖反向代理透传，IP 作为参考线索 | 合规要求提升 |
 | 3 | **复合索引优化**：`(project_id, event_id DESC)` 替换现有 `(project_id, occurred_at DESC)`，利用 UUID v7 天然时序保序特性消除 `occurred_at` 的冗余排序 | V1 现有索引已满足查询需求；迁移索引需停机窗口 | 查询性能瓶颈 / 表数据量 > 5000 万行 |
 | 4 | **连接池隔离**：PGWriter 使用独立 `*sql.DB`，避免审计写满时影响业务 globaldb | V1 审计流量预期低，且 drop 可接受（尽力记录原则），无需隔离 | 审计流量明显影响业务 P99 |
-
----
-
-## Quality Gates
-
-### QG-1: Performance — N+1 查询禁止
-- [x] 集合操作用 batch/bulk 接口（`GetAccountNamesMapByIds`）
-- [x] 大事务锁范围已评估（单事务 < 200ms，仅含 100 行 INSERT）
-- [x] 关键查询已设计索引
-
-### QG-2: Data Integrity — 禁止孤儿数据
-- [x] 操作在同一事务内完成（batch INSERT 单条事务）
-- [x] 有异常处理机制（重试 + error 日志 + drop counter）
-
-### QG-3: Security
-- [x] 每个接口标注了权限校验逻辑（组织管理员/项目管理员）
-- [x] 跨组织数据访问显式隔离（scope 约束：OrgID/ProjectID/AccountID 至少一个非空）
-
-### QG-4: Simplicity — 禁止过度设计
-- [x] 无新框架/中间件引入（PG 方案复用现有 globaldb）
-- [x] 不涉及 3+ 文件且可简化时已评估合并方案
-- [x] 抽象层级不超过 2 层（Log → Writer → DAO）
-
-### QG-5: Completeness
-- [x] 文件影响清单完整，每个文件有修改理由
-- [x] 主要失败路径已分析（PG 故障、channel 满、detail 超限）
-- [x] 新增逻辑有对应测试策略
-
-### QG-6: Architecture — 跨模块只能依赖 Service
-- [x] 无跨模块 DAO 直接注入（所有查询通过 AuditService）
-
-### QG-7: Cache / Redis 安全
-- [ ] 不涉及缓存
-
-### QG-8: 分布式部署兼容性
-- [x] 事务内无跨网络调用（batch INSERT 无 RPC）
-- [x] 跨服务补偿/重试逻辑已保证幂等（ON CONFLICT DO NOTHING）
-
-### QG-9: 一致性校验通过
-- [x] Spec vs Plan 无遗漏
-- [x] Plan vs 代码现实无矛盾（或已修正）
-
-### QG-10: 外部依赖
-- [x] 所有外部依赖及其接口契约已记录（globaldb / gin ClientIP / pvctx）
-- [x] 每个依赖的故障影响已评估
-
-### QG-11: 上线与回滚
-- [x] 数据库 migration 有可回退的 DOWN 语句（DROP TABLE）
-- [x] 回滚检查清单已逐项确认
-- [x] 上线观测指标和回滚触发条件已定义
