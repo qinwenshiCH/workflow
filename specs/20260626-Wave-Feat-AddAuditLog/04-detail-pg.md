@@ -19,14 +19,14 @@
 
 [03-plan-pg.md](./03-plan-pg.md) 选择 PostgreSQL 作为审计日志 V1 的存储方案。PG 方案的核心思路是：业务操作成功后，Controller/Service 显式调用 `audit.Log()` 将审计事件 enqueue 到内存 channel；后台 FlushWorker 批量写入 `global.audit_log`；写入失败则记 error 日志 + 累加 drop counter，不设本地 spool。
 
-PG 优先的理由是改动面最小（复用现有 `globaldb` 和 DAO 模式）、幂等语义最干净（`event_id` 唯一约束 + `ON CONFLICT DO NOTHING`）、审计解释性最强。
+PG 优先的理由是改动面最小（复用现有 `globaldb` 和 DAO 模式）、幂等语义最干净（`id` PK 唯一性 + `ON CONFLICT DO NOTHING`）、审计解释性最强。
 
 ### 1.2 本详细设计聚焦的实现问题
 
 - FlushWorker 的 goroutine 生命周期管理：Start / Stop / Shutdown drain
 - channel 满时非阻塞 enqueue 与丢弃策略
 - detail 大小预算与 PG TOAST 压缩
-- Cursor 编解码格式：`occurred_at` 与 `event_id` 如何拼接
+- Cursor 编解码格式：基于 `id`（UUID v7）
 
 
 
@@ -37,7 +37,7 @@ PG 优先的理由是改动面最小（复用现有 `globaldb` 和 DAO 模式）
 审计日志模块在 Wave 中属于**新增基础设施**，不修改现有业务逻辑。变更集中在三层：
 
 1. **上下文层**（`pvctx`）：新增 `client_ip` 与 `audit_source` 的读取/写入/异步透传
-2. **审计核心层**（`apps/web/service/auditlog/`）：Log 入口、registry、writer
+2. **审计核心层**（`apps/web/service/auditlog/`）：Log 入口、枚举常量、writer
 3. **接入层**（13 个 controller + MCP server）：每处加 1-3 行显式调用
 
 数据流动方向：Controller → `audit.Log()` → channel → FlushWorker → `global.audit_log`（失败则丢弃 + error 日志）
@@ -57,20 +57,20 @@ PG 优先的理由是改动面最小（复用现有 `globaldb` 和 DAO 模式）
 
 ```sql
 CREATE TABLE IF NOT EXISTS audit_log (
-    id           BIGSERIAL PRIMARY KEY,
-    event_id     VARCHAR(64) NOT NULL UNIQUE,
+    id           VARCHAR(64) PRIMARY KEY,
     org_id       BIGINT,
     project_id   BIGINT,
     account_id   BIGINT,
+    account_name VARCHAR(128),
+    target_id    VARCHAR(64),
+    target_name  VARCHAR(256),
+    action       VARCHAR(64) NOT NULL,
     domain       VARCHAR(64) NOT NULL,
     feature      VARCHAR(64) NOT NULL,
-    target_id    VARCHAR(64),
-    action       VARCHAR(64) NOT NULL,
-    source       VARCHAR(16) NOT NULL DEFAULT 'ui',
-    detail       TEXT,
+    source       VARCHAR(16) NOT NULL DEFAULT 'web',
+    extra        TEXT,
     ip_address   VARCHAR(64) NOT NULL,
-    occurred_at  TIMESTAMPTZ NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    occurred_at  TIMESTAMPTZ NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_log_project_time
@@ -86,20 +86,20 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_account_time
 
 | 字段 | 类型 | 约束 | 默认值 | 说明 |
 |---|---|---|---|---|
-| `id` | `BIGSERIAL` | PK | — | 自增主键 |
-| `event_id` | `VARCHAR(64)` | NOT NULL, UNIQUE | — | UUID v7，幂等去重 |
+| `id` | `VARCHAR(64)` | PK | — | UUID v7，嵌入 ms 时间戳，可用作游标 |
 | `org_id` | `BIGINT` | NULL | — | 账号层事件为 NULL |
 | `project_id` | `BIGINT` | NULL | — | 组织/账号层事件为 NULL |
 | `account_id` | `BIGINT` | NULL | — | login_failed 等无法确认为 NULL |
-| `domain` | `VARCHAR(64)` | NOT NULL | — | account/organization/project/asset/metadata |
-| `feature` | `VARCHAR(64)` | NOT NULL | — | 共 25 个，完整列表见 §10：session/chart/experiment/... |
+| `account_name` | `VARCHAR(128)` | NULL | — | 事件发生时操作人名称快照，best effort |
 | `target_id` | `VARCHAR(64)` | NULL | — | 登录事件为 NULL |
+| `target_name` | `VARCHAR(256)` | NULL | — | 事件发生时被操作对象名称快照 |
 | `action` | `VARCHAR(64)` | NOT NULL | — | created/updated/deleted/logged_in/logged_out/login_failed |
-| `source` | `VARCHAR(16)` | NOT NULL | `'ui'` | ui/api_token/mcp |
-| `detail` | `TEXT` | NULL | — | JSON 字符串 |
+| `domain` | `VARCHAR(64)` | NOT NULL | — | account/organization/project |
+| `feature` | `VARCHAR(64)` | NOT NULL | — | 共 26 个，完整列表见 §10：session/chart/experiment/... |
+| `source` | `VARCHAR(16)` | NOT NULL | `'web'` | web/openapi/mcp/agent |
+| `extra` | `TEXT` | NULL | — | 自由格式 JSON 字符串 |
 | `ip_address` | `VARCHAR(64)` | NOT NULL | — | 合规刚需 |
-| `occurred_at` | `TIMESTAMPTZ` | NOT NULL | — | 事件发生时间 |
-| `created_at` | `TIMESTAMPTZ` | NOT NULL | `NOW()` | 入库时间 |
+| `occurred_at` | `TIMESTAMPTZ` | NOT NULL | — | 事件发生时间，唯一时间戳 |
 
 #### 索引策略
 
@@ -109,7 +109,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_account_time
 | `idx_audit_log_org_time` | `global.audit_log` | `(org_id, occurred_at DESC)` | 组织级时间范围查询 |
 | `idx_audit_log_account_time` | `global.audit_log` | `(account_id, occurred_at DESC)` WHERE account_id NOT NULL | 按人追溯查询 |
 
-> 注：V1 未创建 `event_id` 独立索引。`event_id` 虽有序但非业务查询入口——所有查询均以 project_id / org_id / account_id 为先导条件，独立索引无实际查询收益，仅增加写入开销。V2 可替换为 `(project_id, event_id DESC)` 复合索引，利用 UUID v7 时序性消除 `occurred_at` 的冗余排序。
+> 注：V1 未创建 `id` 独立索引。所有查询均以 project_id / org_id / account_id 为先导条件，独立索引无实际查询收益，仅增加写入开销。V2 可替换为 `(project_id, id DESC)` 复合索引，利用 UUID v7 时序性消除 `occurred_at` 的冗余排序。
 
 ### 4.2 API / 接口
 
@@ -127,49 +127,80 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_account_time
 | `audit_log_batch_size` | `int` | `100` | 单批最大行数；上限 500（spec 约束） | ❌ |
 | `audit_log_flush_interval` | `duration` | `1s` | 定时 flush 间隔 | ❌ |
 | `audit_log_queue_size` | `int` | `4096` | channel 容量，满时非阻塞丢弃并记 counter + error 日志，不设 spool。日均 ~6 条/秒（全环境 50 万行/天），4096 可容纳 ~11 分钟突发峰值（4096 条 × 假设每条 Entry ~1KB ≈ 4MB 内存，完全可以接受，后续再按实际调整） | ❌ |
-| `audit_log_detail_max_bytes` | `int` | `65536` | detail 大小预算 (64KB)，超限清零 detail 并打 warn 日志。正常 detail 1-10KB，64KB = 6-10x 正常值 | ❌ |
+| `audit_log_extra_max_bytes` | `int` | `2048` | extra 大小预算 (2KB)，超限截断至前 2KB 并打 warn 日志。正常 extra < 100B，2KB 充足 | ❌ |
 | `audit_log_export_max_rows` | `int` | `1000` | 单次导出最大行数。CSV < 1MB。按需逐步上调 | ❌ |
 
-### 4.4 Detail 结构
+### 4.4 Entry 结构与 Extra 约定
 
 ```go
-// Detail 审计详情。schema_version 由 Log 内部写入，调用方不关注。
-type Detail struct {
-    SchemaVersion int            `json:"schema_version"`          // 固定 1，Log 内部写入
-    Account       map[string]any `json:"account,omitempty"`       // {id, name?} 操作时 actor 快照；name 仅在天然已知时写入，不额外查库，不含邮箱
-    Target        map[string]any `json:"target,omitempty"`        // {id, name, type, ...} 资源摘要
-    Comment       string         `json:"comment,omitempty"`       // 可选人类可读说明
-    Extra         map[string]any `json:"extra,omitempty"`         // 批量对象列表或事件专属扩展
+// Entry 审计日志条目。调用方只需填充业务字段，其余由 Log 内部从 pvctx 提取。
+type Entry struct {
+    Domain     Domain
+    Feature    Feature
+    Action     Action
+    TargetID   string         // 被操作资源 ID
+    TargetName string         // 事件发生时被操作对象名称快照
+    Extra      map[string]any // 自由格式 JSON，由 Log 内部序列化
 }
 
-// Log 审计日志入口。调用方只需传入 domain/feature/action，以及可选的 targetID 和 detail。
-// domain/feature/action 使用 audit 包定义的常量枚举。
-// 入参强校验：未注册的 domain/feature/action 组合记 error 日志 + audit_skip_total metric（编程错误，调用方无需处理）。
-// occurred_at 由 Log 内部取 time.Now()；schema_version 由 Log 内部写入。
-// org_id 和 project_id 从 pvctx 自动提取（调用方需确保 ctx 中已注入），拿不到时写入 NULL。
-func Log(ctx context.Context, domain, feature, action, targetID string, detail *Detail)
+type Domain string
+const (
+    DomainAccount      Domain = "account"
+    DomainOrganization Domain = "organization"
+    DomainProject      Domain = "project"
+)
+
+type Feature string
+const (
+    FeatureSession            Feature = "session"
+    FeatureAccountSetting     Feature = "account_setting"
+    FeatureAPIToken           Feature = "api_token"
+    FeatureOrgSetting         Feature = "org_setting"
+    FeatureOrgMember          Feature = "org_member"
+    FeatureOrgMemberInvitation Feature = "org_member_invitation"
+    FeatureProjectSetting     Feature = "project_setting"
+    FeatureProjectMember      Feature = "project_member"
+    FeatureChart              Feature = "chart"
+    FeatureDashboard          Feature = "dashboard"
+    FeatureCohort             Feature = "cohort"
+    FeaturePipeline           Feature = "pipeline"
+    FeatureTrackingPlan       Feature = "tracking_plan"
+    FeatureExperiment         Feature = "experiment"
+    FeatureFeatureGate        Feature = "feature_gate"
+    FeatureFeatureConfig      Feature = "feature_config"
+    FeatureLayer              Feature = "layer"
+    FeatureHoldout            Feature = "holdout"
+    FeatureTarget             Feature = "target"
+    FeatureMetric             Feature = "metric"
+    FeatureTrackedEvent       Feature = "tracked_event"
+    FeatureVirtualEvent       Feature = "virtual_event"
+    FeatureEventProperty      Feature = "event_property"
+    FeatureUserProperty       Feature = "user_property"
+    FeatureUserVirtualProperty  Feature = "user_virtual_property"
+    FeatureEventVirtualProperty Feature = "event_virtual_property"
+)
+
+type Action string
+const (
+    ActionCreated     Action = "created"
+    ActionUpdated     Action = "updated"
+    ActionDeleted     Action = "deleted"
+    ActionLoggedIn    Action = "logged_in"
+    ActionLoggedOut   Action = "logged_out"
+    ActionLoginFailed Action = "login_failed"
+)
+
+// Log 审计日志入口。domain/feature/action 使用编译时常量。
+// occurred_at 由 Log 内部取 time.Now()；org_id/project_id/account_id/account_name/source/client_ip 从 pvctx 自动提取。
+func Log(ctx context.Context, e Entry)
 ```
 
-补充约束：
+**Extra 约定**：
 
-- `detail.account.id` 在能识别操作者时应写入
-- `detail.account.name` 是 best effort 字段；session 链路通常可写，API token 链路默认不额外查库补名
-- `detail.account` 禁止写入邮箱等敏感信息
-
-**JSON 序列化示例：**
-
-```json
-{
-  "schema_version": 1,
-  "account": {"id": "123", "name": "张三"},
-  "target": {
-    "id": "34", "name": "增长看板",
-    "type": "dashboard", "visibility": "project"
-  },
-  "comment": "dashboard charts updated",
-  "extra": {"chart_ids": [1, 2, 3]}
-}
-```
+- 自由格式 JSON，业务方控制内容，无结构化 envelope
+- 单条 extra 大小预算 **2KB**（JSON 序列化后），超限直接截断至前 2KB + warn 日志
+- JSON marshal 失败视为编程错误，error 日志 + 跳过该事件
+- 调用方不得将密码、token、secret、email 等敏感内容放入 Extra
 
 ### 4.5 外部依赖与集成契约
 
@@ -211,7 +242,7 @@ func Log(ctx context.Context, domain, feature, action, targetID string, detail *
 ```go
 func ClientIP(ctx context.Context) string                      // 从 ctx 读取 client_ip
 func WithClientIP(ctx context.Context, ip string) context.Context // 将 client_ip 写入 ctx
-func AuditSource(ctx context.Context) string                   // 从 ctx 读取审计来源：ui / api_token / mcp
+func AuditSource(ctx context.Context) string                   // 从 ctx 读取审计来源：web / openapi / mcp / agent
 func WithAuditSource(ctx context.Context, source string) context.Context
 ```
 
@@ -312,7 +343,7 @@ flushLoop:
 | 失败场景 | 错误类型 | 处理方式 | 补偿机制 |
 |---|---|---|---|
 | PG 连接超时 | 可重试 | 重试 3 次，指数退避（100ms/500ms/1s），仍失败则丢弃 + error 日志 | 不设 spool，接受极值有限丢失 |
-| 唯一约束冲突（event_id） | 可忽略 | ON CONFLICT DO NOTHING，影响行数 0 | 天然幂等，无补偿 |
+| 唯一约束冲突（id） | 可忽略 | ON CONFLICT DO NOTHING，影响行数 0 | 天然幂等，无补偿 |
 | 字段超长 | 不可恢复 | 记 error log，跳过该条 | 人工排查 |
 
 #### 接口深度评估
@@ -332,25 +363,21 @@ flushLoop:
 
 ---
 
-### 5.4 Detail 模块（detail）
+### 5.4 Extra 模块（extra）
 
 #### 职责
 
-构造审计详情。V1 不做裁剪，超 64KB 直接清零 detail。
+处理 `Entry.Extra` 的 JSON 序列化与大小预算检查。
 
 #### 敏感字段处理
 
-调用方在构造 detail 时自行排除敏感字段。入口层不设脱敏过滤，不依赖运行时脱敏。
+调用方在构造 Extra 时自行排除敏感字段。入口层不设脱敏过滤，不依赖运行时脱敏。
 
-**约束约定**：调用方不得将密码、token、secret、email、api_key、connection_string 等敏感内容放入 detail。DAO 层做 batched INSERT，不对 detail 内容做字段级检查。
+**约束约定**：调用方不得将密码、token、secret、email、api_key、connection_string 等敏感内容放入 Extra。DAO 层做 batched INSERT，不对 Extra 内容做字段级检查。
 
-#### detail 大小预算
+#### Extra 大小预算
 
-单条 detail（JSON 序列化后）上限 **64KB**。超限时直接清零 detail 字段（`detail_payload = NULL`），将 `comment` 设为 `"detail exceeds 64KB, discarded"`，并打 warn 日志。审计行本身正常写入，不因超限丢弃整条。
-
-> 阈值依据：正常操作（Chart/Dashboard/Cohort/Member 变更）detail 在 1-10KB 范围内。64KB 作为预警线。256KB 是 PG TOAST 物理上限，不作为逻辑限制。
->
-> 权衡：简单性优先于 detail 完整性。合规审计只需要知道"谁在何时做了什么"，detail 为空不影响行级追溯。后续如有实际细化需求可补充逐级裁剪方案。**此决策记录于 `02-decisions.md`。**
+单条 extra（JSON 序列化后）上限 **2KB**。超限时直接截断至前 2KB + warn 日志。JSON marshal 失败视为编程错误，error 日志 + 跳过该事件。
 
 ---
 
@@ -382,15 +409,15 @@ func (q *Query) Validate() error {
 
 #### Cursor 编解码
 
-UUID v7 内含毫秒级时间戳且全局唯一，可独立保序。Wave 中直接复用 `pkg/lib/util.NewUUID()`（已封装 `google/uuid v1.6.0`，零新增依赖）。游标使用纯 `event_id`，不再依赖双字段组合。
+UUID v7 内含毫秒级时间戳且全局唯一，天然按时间排序，可用作游标。Wave 中直接复用 `pkg/lib/util.NewUUID()`（已封装 `google/uuid v1.6.0`，零新增依赖）。
 
 ```go
-// cursor 格式：base64(event_id)
-func EncodeCursor(eventID string) string {
-    return base64.RawURLEncoding.EncodeToString([]byte(eventID))
+// cursor 格式：base64(id)
+func EncodeCursor(id string) string {
+    return base64.RawURLEncoding.EncodeToString([]byte(id))
 }
 
-func DecodeCursor(cursor string) (eventID string, err error) {
+func DecodeCursor(cursor string) (id string, err error) {
     raw, err := base64.RawURLEncoding.DecodeString(cursor)
     if err != nil { return "", err }
     return string(raw), nil
@@ -399,15 +426,15 @@ func DecodeCursor(cursor string) (eventID string, err error) {
 
 查询 SQL（时间范围由 start_time/end_time 控制，游标仅用于分页翻页）：
 ```sql
-SELECT id, event_id, org_id, project_id, account_id,
-       domain, feature, target_id, action, source,
-       ip_address, detail, occurred_at, created_at
+SELECT id, org_id, project_id, account_id, account_name,
+       target_id, target_name, domain, feature, action, source,
+       ip_address, extra, occurred_at
 FROM global.audit_log
 WHERE project_id = $1
   AND occurred_at >= $2
   AND occurred_at < $3
-  AND event_id < $cursor_event_id
-ORDER BY event_id DESC
+  AND id < $cursor_id
+ORDER BY id DESC
 LIMIT $4;
 ```
 
@@ -425,7 +452,7 @@ Export（CSV/XLSX）不承诺快照一致性。导出结果包含开始时刻前
 
 ```go
 // 查询后补齐当前 account_name（辅助可读性字段）。
-// detail.account.name 若存在，代表写入时可获得的快照名；若为空，不额外回填成“历史快照”。
+// account_name 若存在，代表写入时可获得的快照名；若为空，不额外回填成”历史快照”。
 func (s *Service) enrichAccountNames(ctx context.Context, items []Item) []ItemView {
     ids := collectAccountIDs(items)
     if len(ids) == 0 { return toViews(items) }
@@ -502,7 +529,7 @@ sequenceDiagram
 
 | 测试类型 | 覆盖范围 | 方法 | 关键场景 |
 |---|---|---|---|
-| **单元测试** | detail.go / registry.go / writer_pg.go / query.go | Go testing + mock DAO | 大小预算、cursor 编解码、scope 校验、flush 逻辑 |
+| **单元测试** | extra.go / writer_pg.go / query.go | Go testing + mock DAO | 大小预算、cursor 编解码、scope 校验、flush 逻辑 |
 | **集成测试** | globaldb + audit writer | testcontainers PG | batch INSERT、ON CONFLICT、channel 满丢弃 |
 | **边界测试** | detail 大小超限、account_id NULL、队列满 | 参数化测试 | 超限清零 detail 并告警；空值写入；channel 满丢弃 |
 | **并发测试** | 多 goroutine 同时 Log() | `go test -race` | channel 竞争 |
@@ -511,8 +538,7 @@ sequenceDiagram
 
 | 模块 | 测试策略 | 依赖注入方式 | 是否需要 Mock 服务 |
 |---|---|---|---|
-| `Detail` 大小预算 | 纯函数测试 | 函数参数传入 Detail struct | 否 |
-| `Registry` 校验 | 纯函数测试 | 函数参数传入 domain/feature | 否 |
+| `Extra` 截断 | 纯函数测试 | 函数参数传入 Extra | 否 |
 | `PGWriter` flush | 接口测试 | DAO 接口注入 | 是，mock DAO |
 | `Query` cursor/scope | 纯函数测试 | 函数参数传入 Query | 否 |
 
@@ -524,15 +550,15 @@ sequenceDiagram
 |---|---|---|---|---|---|
 | 1 | IP 地址可能不准确 | 中 | 低 | 无 TrustedProxies 配置，依赖反向代理透传 X-Real-IP；文档说明限制 | V2 按需引入 TrustedProxies |
 | 2 | PG 不可用导致审计行丢弃 | 低 | 中 | 3 次重试 + error 日志 + drop counter | 告警后人工恢复 PG |
-| 3 | detail 超大导致 detail 被清零 | 极低 | 低 | 64KB 预算，超限清零 detail 并告警 | 人工排查上游数据建模 |
-| 4 | event_id 冲突导致写入丢失 | 极低 | 低 | UUID v7，ON CONFLICT DO NOTHING 不影响已有记录 | 天然安全 |
+| 3 | extra 超限截断 | 极低 | 低 | 2KB 预算，超限截断至前 2KB + warn 日志 | 人工排查上游数据建模 |
+| 4 | id 冲突导致写入丢失 | 极低 | 低 | UUID v7，PK 唯一性保证 | 天然安全 |
 
 ### 9.1 补偿策略总表
 
 | 失败场景 | 可重试? | 重试策略 | 回滚策略 | 最终一致性保障 |
 |---|---|---|---|---|
 | PG INSERT 失败 | ✅ | 3 次 + 指数退避，仍失败则丢弃 | 无（不涉及业务回滚） | error 日志 + drop counter |
-| detail 超限 | ❌ | 不重试，清零 detail | 记 warn 日志 | 审计行不丢失 |
+| extra 超限 | ❌ | 不重试，截断至前 2KB | 记 warn 日志 | 审计行不丢失 |
 | channel 满 | ❌ | 非阻塞丢弃 + error 日志 | 记 drop counter | 接受极值有限丢失 |
 
 > **V1 已知限制：IP 地址准确性**
@@ -549,22 +575,25 @@ sequenceDiagram
 >
 > **org_id 来源说明**：`audit.Log()` 内部从 `pvctx.OrgID(ctx)` 提取 org_id。账号层事件（§10.1）ctx 中无 OrgID，写 NULL。组织/项目层事件（§10.2–§10.5）由 OrganizationFilter 中间件统一注入——该中间件已扩大范围，去掉 `IsAccountAPIToken` 提前返回。Org 路由从请求参数提取 org_id；项目路由通过 `GetOrgIDByProjectCached` 反查（走缓存）；Account/OP 等无上下文路径不注入，写 NULL。MCP 由 `authorizeProjectContext` 注入。各 handler 无需手动处理 org_id。
 >
-> Detail.Target 只包含业务相关字段（name、label、role 等），不含冗余的 id/type。
+> Extra 只包含业务相关字段（name、label、role 等），不含冗余的 id/type。
 >
 > 代码形态统一为：
 > ```go
-> audit.Log(ctx, audit.DomainXxx, audit.FeatureXxx, audit.ActionXxx,
->     targetID, &audit.Detail{
->         Account: map[string]any{"id": aid},
->         Target:  map[string]any{"name": name}, // 仅业务字段
->     })
+> audit.Log(ctx, audit.Entry{
+>     Domain:     audit.DomainXxx,
+>     Feature:    audit.FeatureXxx,
+>     Action:     audit.ActionXxx,
+>     TargetID:   targetID,
+>     TargetName: name,
+>     Extra:      map[string]any{...}, // 可选
+> })
 > ```
 >
-> 各 handler 只需替换 Domain/Feature/Action/TargetID 和 Detail 中的字段值即可，不再为每个 handler 重复全量示例。
+> 各 handler 只需替换 Domain/Feature/Action/TargetID/TargetName 字段值即可，不再为每个 handler 重复全量示例。
 
 ### 10.1 Domain: account
 
-| # | Feature | Action | Controller | Handler | targetID | Detail 要点 |
+| # | Feature | Action | Controller | Handler | targetID | Extra 要点 |
 |---|---|---|---|---|---|---|
 | 1 | `session` | `logged_in` | `controller/account/account.go` | `LoginAccount` | 空 | Account: `{id}`, 无 Target |
 | 2 | `session` | `logged_out` | `controller/account/account.go` | `LogoutAccount` | 空 | Account: `{id}`, 无 Target |
@@ -576,7 +605,7 @@ sequenceDiagram
 
 ### 10.2 Domain: organization
 
-| # | Feature | Action | Controller | Handler | targetID | Detail 要点 |
+| # | Feature | Action | Controller | Handler | targetID | Extra 要点 |
 |---|---|---|---|---|---|---|
 | 8 | `org_setting` | `updated` | `controller/organization/organization.go` | `UpdateOrgInfo` | org ID | Target: `{name}` |
 | 9 | `org_member` | `created` | `controller/organization/member.go` | `CreateOrgMemberInvite` | 成员 account ID | Target: `{name, role}` |
@@ -587,16 +616,16 @@ sequenceDiagram
 
 ### 10.3 Domain: project
 
-| # | Feature | Action | Controller | Handler | targetID | Detail 要点 |
+| # | Feature | Action | Controller | Handler | targetID | Extra 要点 |
 |---|---|---|---|---|---|---|
 | 14 | `project_setting` | `updated` | `controller/project/project.go` | `UpdateProjectInfo` | project ID | Target: `{name}` |
 | 15 | `project_member` | `created` | `controller/project/member.go` | `AddProjectMember` | 成员 account ID | Target: `{name, role}` |
 | 16 | `project_member` | `updated` | 同上 | `UpdateProjectMember` | 成员 account ID | Extra: `{role_before, role_after}` |
 | 17 | `project_member` | `deleted` | 同上 | `DeleteProjectMember` | 成员 account ID | Target: `{name}` |
 
-### 10.4 Domain: asset
+### 10.4 Domain: project（资产类）
 
-| # | Feature | Action | Controller | Handler | targetID | Detail 要点 |
+| # | Feature | Action | Controller | Handler | targetID | Extra 要点 |
 |---|---|---|---|---|---|---|
 | 18 | `chart` | `created` | `controller/chart/chart.go` | `AddNewChart` | chart ID | Target: `{name, ...filtered}` |
 | 19 | `chart` | `updated` | 同上 | `UpdateChartDetail` | chart ID | Target: `{name, ...filtered}` |
@@ -634,34 +663,37 @@ sequenceDiagram
 
 > - PostAbStatusUpdate 仅对 `operation_type=DELETE` 场景审计；状态变更（ONLINE/OFFLINE/DEBUG）属产品功能，不审计。
 
-### 10.5 Domain: metadata
+### 10.5 Domain: project（元数据类）
 
-| # | Feature | Action | Controller | Handler | targetID | Detail 要点 |
+| # | Feature | Action | Controller | Handler | targetID | Extra 要点 |
 |---|---|---|---|---|---|---|
-| 51 | `metric` | `created` | `controller/metadata/metric.go` | `CreateMetric` | metric ID | Target: `{name}` |
-| 52 | `metric` | `updated` | 同上 | `UpdateMetric` | metric ID | Target: `{name}` |
-| 53 | `metric` | `deleted` | 同上 | `DeleteMetrics` | metric ID | Target: `{name}` |
-| 54 | `tracked_event` | `created` | `controller/metadata/tracked_event.go` | `CreateTrackedEvent` | event ID | Target: `{name}` |
-| 55 | `tracked_event` | `updated` | 同上 | `UpdateTrackedEvent` | event ID | Target: `{name}` |
-| 56 | `tracked_event` | `deleted` | 同上 | `DeleteTrackedEvent` | event ID | Target: `{name}` |
-| 57 | `virtual_event` | `created` | `controller/metadata/virtual_event.go` | `CreateVirtualEvent` | event ID | Target: `{name}` |
-| 58 | `virtual_event` | `updated` | 同上 | `UpdateVirtualEvent` | event ID | Target: `{name}` |
-| 59 | `virtual_event` | `deleted` | 同上 | `DeleteVirtualEvent` | event ID | Target: `{name}` |
-| 60 | `event_property` | `created` | `controller/metadata/event_property.go` | `CreateEventProperty` | property ID | Target: `{name}` |
-| 61 | `event_property` | `updated` | 同上 | `UpdateEventProperty` | property ID | Target: `{name}` |
-| 62 | `event_property` | `deleted` | 同上 | `DeleteEventProperty` | property ID | Target: `{name}` |
-| 63 | `user_property` | `created` | `controller/metadata/user_property.go` | `CreateUserProperty` | property ID | Target: `{name}` |
-| 64 | `user_property` | `updated` | 同上 | `UpdateUserProperty` | property ID | Target: `{name}` |
-| 65 | `user_property` | `deleted` | 同上 | `DeleteUserProperty` | property ID | Target: `{name}` |
-| 66 | `virtual_property` | `created` | `controller/metadata/virtual_property.go` | `CreateVirtualProperty` | property ID | Target: `{name}` |
-| 67 | `virtual_property` | `updated` | 同上 | `UpdateVirtualProperty` | property ID | Target: `{name}` |
-| 68 | `virtual_property` | `deleted` | 同上 | `DeleteVirtualProperty` | property ID | Target: `{name}` |
+| 51 | `metric` | `created` | `controller/metadata/metric.go` | `CreateMetric` | metric ID | 对象名 |
+| 52 | `metric` | `updated` | 同上 | `UpdateMetric` | metric ID | 对象名 |
+| 53 | `metric` | `deleted` | 同上 | `DeleteMetrics` | metric ID | 对象名 |
+| 54 | `tracked_event` | `created` | `controller/metadata/tracked_event.go` | `CreateTrackedEvent` | event ID | 对象名 |
+| 55 | `tracked_event` | `updated` | 同上 | `UpdateTrackedEvent` | event ID | 对象名 |
+| 56 | `tracked_event` | `deleted` | 同上 | `DeleteTrackedEvent` | event ID | 对象名 |
+| 57 | `virtual_event` | `created` | `controller/metadata/virtual_event.go` | `CreateVirtualEvent` | event ID | 对象名 |
+| 58 | `virtual_event` | `updated` | 同上 | `UpdateVirtualEvent` | event ID | 对象名 |
+| 59 | `virtual_event` | `deleted` | 同上 | `DeleteVirtualEvent` | event ID | 对象名 |
+| 60 | `event_property` | `created` | `controller/metadata/event_property.go` | `CreateEventProperty` | property ID | 对象名 |
+| 61 | `event_property` | `updated` | 同上 | `UpdateEventProperty` | property ID | 对象名 |
+| 62 | `event_property` | `deleted` | 同上 | `DeleteEventProperty` | property ID | 对象名 |
+| 63 | `user_property` | `created` | `controller/metadata/user_property.go` | `CreateUserProperty` | property ID | 对象名 |
+| 64 | `user_property` | `updated` | 同上 | `UpdateUserProperty` | property ID | 对象名 |
+| 65 | `user_property` | `deleted` | 同上 | `DeleteUserProperty` | property ID | 对象名 |
+| 66 | `user_virtual_property` | `created` | `controller/metadata/virtual_property.go` | `CreateVirtualProperty` | property ID | 对象名 |
+| 67 | `user_virtual_property` | `updated` | 同上 | `UpdateVirtualProperty` | property ID | 对象名 |
+| 68 | `user_virtual_property` | `deleted` | 同上 | `DeleteVirtualProperty` | property ID | 对象名 |
+| 69 | `event_virtual_property` | `created` | `controller/metadata/virtual_property.go` | `CreateVirtualProperty` | property ID | 对象名 |
+| 70 | `event_virtual_property` | `updated` | 同上 | `UpdateVirtualProperty` | property ID | 对象名 |
+| 71 | `event_virtual_property` | `deleted` | 同上 | `DeleteVirtualProperty` | property ID | 对象名 |
 
 ### 10.6 接入代码示例
 
 以下为四种典型场景的调用代码：
 
-**场景 A：Chart Update（asset domain 标准模式）**
+**场景 A：Chart Update（project domain 标准模式）**
 
 ```go
 // controller/chart/chart.go
@@ -671,11 +703,13 @@ func (h *ChartHandler) UpdateChart(ctx, id, req) (res, err) {
     h.dao.Update(chart) // 业务操作成功
 
     // 审计 — 异步，不阻塞返回
-    audit.Log(ctx, audit.DomainAsset, audit.FeatureChart, audit.ActionUpdated,
-        fmt.Sprint(chart.ID), &audit.Detail{
-            Account: map[string]any{"id": fmt.Sprint(pvctx.Aid(ctx))}, // name 天然已知时也可填
-            Target:        map[string]any{"name": chart.Name},
-        })
+    audit.Log(ctx, audit.Entry{
+        Domain:     audit.DomainProject,
+        Feature:    audit.FeatureChart,
+        Action:     audit.ActionUpdated,
+        TargetID:   fmt.Sprint(chart.ID),
+        TargetName: chart.Name,
+    })
     return res, nil
 }
 ```
@@ -688,27 +722,27 @@ func (h *AccountHandler) Login(ctx, req) (res, err) {
     account, err := h.auth.Authenticate(req)
     if err != nil {
         // 登录失败 — 仍记审计，account_id 可能为空
-        // account.name 记录登录用户名用于标识，不依赖 id
-        accountName := req.Username
-        audit.Log(ctx, audit.DomainAccount, audit.FeatureSession, audit.ActionLoginFailed,
-            "", &audit.Detail{
-                Account: map[string]any{"name": accountName},
-                Comment: "login failed: invalid credentials",
-            })
+        audit.Log(ctx, audit.Entry{
+            Domain:  audit.DomainAccount,
+            Feature: audit.FeatureSession,
+            Action:  audit.ActionLoginFailed,
+            Extra:   map[string]any{"reason": "invalid credentials"},
+        })
         return nil, err
     }
 
     token, _ := h.auth.GenerateToken(account)
     // 登录成功
-    audit.Log(ctx, audit.DomainAccount, audit.FeatureSession, audit.ActionLoggedIn,
-        "", &audit.Detail{
-            Account: map[string]any{"id": fmt.Sprint(account.ID), "name": account.Name},
-        })
+    audit.Log(ctx, audit.Entry{
+        Domain:  audit.DomainAccount,
+        Feature: audit.FeatureSession,
+        Action:  audit.ActionLoggedIn,
+    })
     return token, nil
 }
 ```
 
-**场景 C：Batch Delete（asset domain，extra 记录多对象）**
+**场景 C：Batch Delete（project domain，extra 记录多对象）**
 
 ```go
 // controller/dashboard/dashboard.go
@@ -716,12 +750,14 @@ func (h *DashboardHandler) BatchDeleteDashboards(ctx, ids) (res, err) {
     dashboards := h.dao.GetByIds(ids)
     h.dao.BatchDelete(ids) // 业务操作成功
 
-    audit.Log(ctx, audit.DomainAsset, audit.FeatureDashboard, audit.ActionDeleted,
-        fmt.Sprint(ids[0]), &audit.Detail{
-            Account: map[string]any{"id": fmt.Sprint(pvctx.Aid(ctx))},
-            Target:  map[string]any{"type": "dashboard"},
-            Extra:   map[string]any{"ids": ids, "count": len(ids)},
-        })
+    audit.Log(ctx, audit.Entry{
+        Domain:     audit.DomainProject,
+        Feature:    audit.FeatureDashboard,
+        Action:     audit.ActionDeleted,
+        TargetID:   fmt.Sprint(ids[0]),
+        TargetName: dashboards[0].Name,
+        Extra:      map[string]any{"ids": ids, "count": len(ids)},
+    })
     return res, nil
 }
 ```
@@ -736,12 +772,14 @@ func (h *OrgMemberHandler) UpdateMemberRole(ctx, memberID, newRole) (res, err) {
     member.Role = newRole
     h.dao.Update(member) // 业务操作成功
 
-    audit.Log(ctx, audit.DomainOrganization, audit.FeatureOrgMember, audit.ActionUpdated,
-        fmt.Sprint(member.AccountID), &audit.Detail{
-            Account: map[string]any{"id": fmt.Sprint(pvctx.Aid(ctx))},
-            Target:        map[string]any{}, // 角色变更通过 Extra 记录
-            Extra:         map[string]any{"role_before": oldRole, "role_after": newRole},
-        })
+    audit.Log(ctx, audit.Entry{
+        Domain:     audit.DomainOrganization,
+        Feature:    audit.FeatureOrgMember,
+        Action:     audit.ActionUpdated,
+        TargetID:   fmt.Sprint(member.AccountID),
+        TargetName: member.Name,
+        Extra:      map[string]any{"role_before": oldRole, "role_after": newRole},
+    })
     return res, nil
 }
 ```
@@ -784,5 +822,5 @@ func (h *OrgMemberHandler) UpdateMemberRole(ctx, memberID, newRole) (res, err) {
 |---|---|---|---|
 | 1 | **防篡改**：对 `audit_log` 表施加写入权限约束（TRIGGER / RLS / 独立 DB 用户），防止应用层被入侵后攻击者抹除审计痕迹 | V1 优先保证功能完整性和通路畅通，安全加固在底座稳定后跟进 | 安全审计要求 / SOC 2 认证 |
 | 2 | **IP 地址可信**：引入 `TrustedProxies` 白名单，启用 `gin.ClientIP()` 严格模式 | V1 依赖反向代理透传，IP 作为参考线索 | 合规要求提升 |
-| 3 | **复合索引优化**：`(project_id, event_id DESC)` 替换现有 `(project_id, occurred_at DESC)`，利用 UUID v7 天然时序保序特性消除 `occurred_at` 的冗余排序 | V1 现有索引已满足查询需求；迁移索引需停机窗口 | 查询性能瓶颈 / 表数据量 > 5000 万行 |
+| 3 | **复合索引优化**：`(project_id, id DESC)` 替换现有 `(project_id, occurred_at DESC)`，利用 UUID v7 天然时序保序特性消除 `occurred_at` 的冗余排序 | V1 现有索引已满足查询需求；迁移索引需停机窗口 | 查询性能瓶颈 / 表数据量 > 5000 万行 |
 | 4 | **连接池隔离**：PGWriter 使用独立 `*sql.DB`，避免审计写满时影响业务 globaldb | V1 审计流量预期低，且 drop 可接受（尽力记录原则），无需隔离 | 审计流量明显影响业务 P99 |

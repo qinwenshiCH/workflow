@@ -42,25 +42,24 @@
 
 ### 1.2 Doris 在架构中的角色
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    SensorsWave (Wave)                        │
-│                                                              │
-│  ┌──────┐   ┌──────┐   ┌──────┐   ┌────────┐   ┌─────────┐ │
-│  │ Edge │──▶│  C1  │──▶│ Kafka│──▶│ Doris  │──▶│ Query   │ │
-│  │采集  │   │清洗   │   │      │   │ OLAP   │   │ Engine  │ │
-│  └──────┘   └──────┘   └──────┘   │ 存储   │   └─────────┘ │
-│                                     │        │         │     │
-│  ┌─────────┐   ┌──────────┐        └────────┘         │     │
-│  │Postgres │   │  Redis   │             │              │     │
-│  │元数据   │   │ 缓存/协调│             ▼              │     │
-│  └─────────┘   └──────────┘       ┌──────────┐        │     │
-│                                    │ 前端 API │◀───────┘     │
-│  ┌──────────────────────────┐      └──────────┘              │
-│  │ Connector (导出到         │                                │
-│  │ BigQuery/Snowflake/...)  │                                │
-│  └──────────────────────────┘                                │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Wave[SensorsWave - Wave]
+        direction TB
+
+        Edge[Edge 采集] -->|写入| K1[Kafka K1 原始事件]
+        K1 -->|消费| C1[C1 清洗 / IDM / GeoIP]
+        C1 -->|写入| K2[Kafka K2 清洗后]
+        K2 -->|Routine Load| Doris[Doris OLAP 存储]
+        Doris --> QE[Query Engine]
+        QE --> API[前端 API]
+
+        PG[("Postgres 元数据")]
+        Redis[("Redis 缓存 / 协调")]
+        Connector[Connector 导出<br/>BigQuery / Snowflake / ...]
+
+        Doris -.->|OUTFILE Parquet| Connector
+    end
 ```
 
 **核心定位**: Doris 是 Wave 中**唯一的分析型 OLAP 引擎**，扮演以下角色：
@@ -389,26 +388,22 @@ PROPERTIES ("replication_allocation" = "tag.location.default: 3");
 
 ### 4.1 完整数据流
 
-```
-SDK/API                                HTTP/HTTPS
-   │
-   ▼
-┌──────┐     ┌──────────┐     ┌──────────────┐     ┌──────────┐
-│ Edge │────▶│  Kafka  │────▶│  C1 (清洗)   │────▶│  Kafka   │
-│采集   │     │ K1 原始  │     │ 验证/IDM/GeoIP│     │ K2 清洗后 │
-└──────┘     └──────────┘     └──────────────┘     └──────────┘
-                                                       │
-                                                    ┌──┴───┐
-                               ┌────────────────────│ Doris│───────┐
-                               │    Routine Load     │      │       │
-                               │                     └──┬───┘       │
-                               ▼                        ▼           ▼
-                          ┌──────────┐          ┌───────────┐ ┌────────────┐
-                          │raw_events│          │ raw_users │ │raw_event_  │
-                          │          │          │           │ │stat        │
-                          └──────────┘          └───────────┘ └────────────┘
+```mermaid
+flowchart LR
+    SDK[SDK / API] -->|HTTP| Edge
+    Edge -->|写入| K1[Kafka K1 原始事件]
+    K1 -->|消费| C1[C1 验证 / IDM / GeoIP]
+    C1 -->|写入| K2[Kafka K2 清洗后]
+    K2 -->|Routine Load| Doris
 
-Doris OUTFILE (Parquet) ──▶ 对象存储 ──▶ BigQuery / Snowflake / ByteHouse
+    Doris --> raw_events
+    Doris --> raw_users
+    Doris --> raw_event_stat
+
+    Doris -->|OUTFILE Parquet| OSS[(对象存储)]
+    OSS -->|COPY INTO| BQ[BigQuery]
+    OSS -->|COPY INTO| SF[Snowflake]
+    OSS -->|COPY INTO| BH[ByteHouse]
 ```
 
 ### 4.2 数据摄入链路

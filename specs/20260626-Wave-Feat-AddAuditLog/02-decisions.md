@@ -364,3 +364,31 @@ V1 不再以通用 diff 引擎为前提，Detail 构造遵循以下规则：
 - **连接池隔离（V1）**：PGWriter 复用 globaldb 连接池，不创建独立池。分布式下多副本 × 独立池会无谓增加 PG 连接数，且审计丢弃可接受，无需隔离。详见 [04-detail-pg.md §4.5](./04-detail-pg.md)
 - **连接池隔离（V2）**：如审计流量明显影响业务 P99，再引入独立 `*sql.DB`；详见 [04-detail-pg.md §12](./04-detail-pg.md)
 - **V2 规划**：新增 [04-detail-pg.md §12](./04-detail-pg.md) 记录防篡改、IP 可信、复合索引优化三项 V2 规划
+
+## 12 项模型修订（2026-07-09）
+
+基于 2026-07-09 讨论，对审计日志数据模型、API 签名和结构做 12 项修订。所有文档（spec/plan/detail-pg/decisions）同步更新。
+
+1. **id 改为 VARCHAR UUID v7**：删除 `BIGSERIAL id` + `event_id VARCHAR(64)`，单列 `id VARCHAR(64) PRIMARY KEY`，使用 `pkg/lib/util.NewUUID()`（Google UUID v7）。PK 即稳定事件标识，UUID v7 嵌入 48-bit ms 时间戳，天然按时间排序，可用作游标。PG 无特殊 UUID v7 加速器，VARCHAR(64) 为 PG/Doris 兼容选择。
+
+2. **游标改为基于 id**：`(occurred_at, event_id)` → `id`（UUID v7），ORDER BY id DESC + WHERE id < ?，格式 base64(id)。
+
+3. **domain 取消 asset/metadata → 合并到 project**：5 domain → 3 domain（account/organization/project），所有 asset.* 和 metadata.* feature 移至 project.*
+
+4. **virtual_property 拆分**：`project.virtual_property` → `project.user_virtual_property` + `project.event_virtual_property`，feature 总数 25 → 26。
+
+5. **account_name / target_name 入表**：`account_name VARCHAR(128)` 和 `target_name VARCHAR(256)` 作为顶层列，均为事件发生时快照。account_name 从 pvctx.Aname() 取，所有链路必须都有值。API token 链路在 GetTokenInfoCached 中嵌入 account_name，缓存在 TokenInfo 中，缓存命中零额外成本。
+
+6. **detail → extra，简化**：`detail TEXT` → `extra TEXT`，自由格式 JSON，业务方控制内容。删除结构化 envelope（schema_version/account/target/comment/extra）。超 2KB 直接截断至前 2KB + warn 日志。marshal 失败 → error 日志 + 跳过事件。
+
+7. **删除 created_at**：occurred_at 是唯一时间戳。
+
+8. **source 枚举扩展**：`ui` → `web`，`api_token` → `openapi`，保留 `mcp`，新增 `agent`。检测矩阵覆盖 5 条入口路径，wagent 路由通过 `/api/wagent/` 前缀区分。
+
+9. **audit.Log() 改为 struct 参数**：`Log(ctx, Entry{Domain, Feature, Action, TargetID, TargetName, Extra})`，Target 摘 要拆为 TargetID 和 TargetName 两个顶层列。
+
+10. **domain/feature/action 为枚举类型**：`type Domain/Feature/Action string` 编译时常量，消除 runtime registry 验证。
+
+11. **extra 大小预算 64KB → 2KB**：正常事件 < 100B，2KB 充足。
+
+12. **channel 满时非阻塞丢弃**：select { case ch <- e: default: }，永不阻塞主流程，满时 drop counter +1 + error 日志。Wave 已有相同模式（pkg/qm/async_batch_writer.go:104-110）。

@@ -34,7 +34,7 @@
 | 资产层 | Chart/Dashboard/Cohort/Pipeline/TrackingPlan/AB 对象 CRUD | 共 12 类 asset |
 | 元数据层 | Metric/TrackedEvent/VirtualEvent/EventProperty/UserProperty/VirtualProperty CRUD | 共 6 类 metadata |
 
-共 **5 domain × 25 feature**，一期全量接入。
+共 **3 domain × 26 feature**，一期全量接入。
 
 ### 不纳入
 
@@ -46,10 +46,11 @@
 ### 设计原则
 
 1. **Append-only**：审计日志不可修改、不可删除
-2. **仅站外流量**：只记录客户主动发起的操作（source ∈ {ui, api_token, mcp}）
+2. **仅站外流量**：只记录客户主动发起的操作（source ∈ {web, openapi, mcp, agent}）
 3. **管理面聚焦**：只记录 CUD 操作，不追踪内部状态流转
 4. **全局单表**：统一模型 `audit_log`，不再分散在各业务表
 5. **异步非阻塞**：主流程不等待最终落库
+6. **自由格式 extra**：业务方控制 JSON 内容，无结构化 envelope
 
 ---
 
@@ -81,7 +82,7 @@ flowchart LR
 
 - 表 `global.audit_log`（global schema）
 - 改动面最小：复用 globaldb 连接池和 GORM/sqlx 模式
-- 幂等最干净：`event_id` UNIQUE + `ON CONFLICT DO NOTHING`
+- 幂等最干净：`id`（UUID v7）PK 唯一性保证
 - 3 个高频索引 `(project_id, occurred_at DESC)`、`(org_id, occurred_at DESC)`、`(account_id, occurred_at DESC)`
 
 ### 4.2 规模验证
@@ -117,13 +118,13 @@ flowchart LR
 
 - 之前的 GORM 全局 callback 方案在 `globaldb` / `metadb` / batch 场景语义过重（~450 行框架 + changes diff 引擎）
 - 改为 ~150 行显式调用，每处 handler 加 1-3 行
-- `audit.Log()` 签名：`(ctx, domain, feature, action, targetID, detail)`（无 org_id/project_id，内部从 pvctx 提取）
+- `audit.Log()` 签名：`(ctx, Entry{Domain, Feature, Action, TargetID, TargetName, Extra})`（无 org_id/project_id，内部从 pvctx 提取）
 
-### 5.3 Detail 统一 envelope
+### 5.3 Extra 自由格式
 
-- 顶层固定 `schema_version / account / target / comment / extra`
-- 不记录 field-level diff（V1）
-- 单条 64KB 预算，超限丢弃 detail（行本身不丢）
+- 自由格式 JSON，业务方控制内容，无结构化 envelope
+- 单条 2KB 预算，超限截断至前 2KB
+- JSON marshal 失败 → error 日志 + 跳过事件（调用方编程错误）
 - 调用方不传敏感字段
 
 ### 5.4 pvctx 上下文透传
@@ -131,7 +132,7 @@ flowchart LR
 | 上下文 | 来源 | 用途 |
 |--------|------|------|
 | `client_ip` | gin `c.ClientIP()` / MCP `X-Real-IP` | 合规刚需，满则拒绝审计 |
-| `audit_source` | session → `ui`、API token → `api_token`、MCP → `mcp` | 站外流量分类 |
+| `audit_source` | SessionMiddleware → `web`、AccountAPITokenMiddleware → `openapi`、wagent → `agent`、MCP → `mcp` | 站外流量分类 |
 | `org_id` | OrganizationFilter + `GetOrgIDByProjectCached` | scope 过滤 |
 | `account_id` / `aname` | 认证中间件 | 操作人标识 |
 
@@ -143,7 +144,7 @@ PG / Doris 共享同一套 controller 层签名：
 - `Export(ctx, req)` → CSV / XLSX 流式下载
 - 默认 scope 约束：`OrgID / ProjectID / AccountID` 至少一个必填
 - 时间范围必填
-- Cursor 模式：`(occurred_at, event_id)` 复合游标
+- Cursor 模式：基于 `id`（UUID v7），格式 `base64(id)`
 
 ---
 
@@ -157,8 +158,8 @@ PG / Doris 共享同一套 controller 层签名：
 
 | 步骤 | 内容 | 涉及文件 |
 |------|------|---------|
-| 1 | pvctx 扩展（ClientIP / AuditSource / OrgID） + BackGroundCtx | `pkg/lib/pvctx/pvctx.go` |
-| 2 | audit writer 核心 + channel + detail 裁剪 | `service/auditlog/audit.go`, `detail.go`, `writer_pg.go` |
+| 1 | pvctx 扩展（ClientIP / AuditSource / OrgID / Aname 补齐） + BackGroundCtx | `pkg/lib/pvctx/pvctx.go` |
+| 2 | audit writer 核心 + channel + extra 截断 | `service/auditlog/audit.go`, `extra.go`, `writer_pg.go` |
 | 3 | 数据库初始化（PG migration / Doris bootstrap） | `migration/scripts/`, `doris_global.sql` |
 | 4 | 13 个 controller + MCP 接入 `audit.Log()` | 各 controller 文件 |
 | 5 | 查询 + 导出接口 | `controller/auditlog/`, `query_pg.go` |
@@ -180,7 +181,7 @@ OpenAPI 导出（CSV / XLSX），可独立上线。
 | `script/sql/pgsql/global.sql`（同步更新 DDL） | PG |
 | `script/sql/doris/audit_log.sql` | Doris |
 | `apps/web/service/auditlog/audit.go` | 公共 |
-| `apps/web/service/auditlog/detail.go` | 公共 |
+| `apps/web/service/auditlog/extra.go` | 公共 |
 | `apps/web/service/auditlog/writer_pg.go` | PG |
 | `apps/web/service/auditlog/doris_stream.go` | Doris |
 | `apps/web/service/auditlog/writer_doris.go` | Doris |
@@ -196,10 +197,11 @@ OpenAPI 导出（CSV / XLSX），可独立上线。
 | `apps/web/server.go` | +~20 行 | Writer 生命周期管理 |
 | `apps/web/config/web_cfg.go` | +~10 行 | 审计配置项 |
 | `apps/web/metrics/metrics.go` | +~5 行 | audit Factory |
-| `pkg/ginx/middleware/session.go` | +~2 行 | source = ui |
-| `pkg/ginx/middleware/account_api_token.go` | +~2 行 | source = api_token |
+| `pkg/ginx/middleware/session.go` | +~2 行 | source = web（默认） |
+| `pkg/ginx/middleware/account_api_token.go` | +~5 行 | source = openapi + 补齐 Aname |
 | `pkg/ginx/middleware/organization.go` | +~5 行 | 扩大 org_id 注入 |
 | `apps/web/mcp/server.go` | +~5 行 | source = mcp + client_ip |
+| `apps/web/server.go`（wagent 路由中间件） | +~5 行 | source = agent，路径前缀 `/api/wagent/` 检测 |
 | 13 个 controller 文件 | 各 +1-3 行 | `audit.Log()` 调用 |
 
 ---
@@ -210,7 +212,7 @@ OpenAPI 导出（CSV / XLSX），可独立上线。
 |------|------|------|------|
 | channel 满导致写入丢弃 | 低 | 中 | 监控 `web_audit_queue_depth`，扩容 queue |
 | PG 不可用导致审计行丢弃 | 低 | 中 | 3 次重试 + error 日志 + drop counter |
-| detail 超限被清零 | 极低 | 低 | 64KB 预算，正常 detail 1-10KB |
+| extra 超限截断 | 极低 | 低 | 2KB 预算，正常 extra < 100B |
 | IP 不准确（无 TrustedProxies） | 中 | 低 | V1 文档说明限制，V2 按需引入 |
 
 ### 补偿策略
