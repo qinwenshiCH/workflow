@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+  <title id="title">OP 客户详情生命周期管理 Tab 低保真原型</title>
+  <desc id="desc">客户详情页中位于账单和审计之间的生命周期管理 Tab，包含组织摘要和逐项目操作表格。</desc>
+  <defs>
+    <style>
+      .page { fill: #f5f7fa; }
+      .panel { fill: #ffffff; stroke: #dcdfe6; stroke-width: 1; }
+      .line { stroke: #e4e7ed; stroke-width: 1; }
+      .text { fill: #303133; font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .muted { fill: #909399; font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .primary { fill: #409eff; }
+      .success-bg { fill: #f0f9eb; stroke: #b3e19d; }
+      .success-text { fill: #529b2e; }
+      .warning-bg { fill: #fdf6ec; stroke: #f3d19e; }
+      .warning-text { fill: #b88230; }
+      .danger-bg { fill: #fef0f0; stroke: #fab6b6; }
+      .danger-text { fill: #c45656; }
+      .button { fill: #ffffff; stroke: #c0c4cc; }
+      .button-danger { fill: #ffffff; stroke: #f56c6c; }
+      .button-disabled { fill: #f5f7fa; stroke: #e4e7ed; }
+    </style>
+  </defs>
+
+  <rect class="page" width="1440" height="900" />
+  <rect x="0" y="0" width="1440" height="58" fill="#ffffff" />
+  <line class="line" x1="0" y1="58" x2="1440" y2="58" />
+  <text class="text" x="34" y="36" font-size="19" font-weight="600">Wave OP</text>
+  <text class="muted" x="1320" y="35" font-size="14">op@example.com</text>
+
+  <rect x="0" y="59" width="214" height="841" fill="#ffffff" />
+  <line class="line" x1="214" y1="59" x2="214" y2="900" />
+  <text class="muted" x="28" y="105" font-size="13">客户运营</text>
+  <rect x="16" y="123" width="182" height="42" rx="4" fill="#ecf5ff" />
+  <text class="primary" x="34" y="149" font-size="14" font-family="-apple-system, BlinkMacSystemFont, PingFang SC, Microsoft YaHei, sans-serif">客户管理</text>
+  <text class="muted" x="34" y="197" font-size="14">审计日志</text>
+
+  <text class="muted" x="254" y="101" font-size="13">客户管理 / 客户详情</text>
+  <text class="text" x="254" y="143" font-size="24" font-weight="600">示例客户</text>
+  <text class="muted" x="254" y="170" font-size="13">客户 ID 1024 · 当前组织：示例客户组织</text>
+
+  <rect class="panel" x="254" y="196" width="1138" height="648" rx="6" />
+  <text class="text" x="282" y="240" font-size="14">合同</text>
+  <text class="text" x="348" y="240" font-size="14">配置</text>
+  <text class="text" x="414" y="240" font-size="14">账单</text>
+  <text class="primary" x="480" y="240" font-size="14" font-weight="600">生命周期管理</text>
+  <text class="text" x="598" y="240" font-size="14">审计</text>
+  <line class="line" x1="254" y1="261" x2="1392" y2="261" />
+  <rect class="primary" x="476" y="258" width="96" height="3" />
+
+  <text class="text" x="282" y="302" font-size="18" font-weight="600">生命周期管理</text>
+  <text class="muted" x="282" y="328" font-size="13">仅 OP 可操作。Delete 保留数据并停用；Purge 永久清理且不可恢复。</text>
+  <rect class="button" x="1285" y="286" width="78" height="32" rx="4" />
+  <text class="text" x="1310" y="307" font-size="13">刷新</text>
+
+  <rect x="282" y="352" width="1082" height="112" rx="5" fill="#fafafa" stroke="#e4e7ed" />
+  <text class="text" x="306" y="385" font-size="16" font-weight="600">示例客户组织</text>
+  <text class="muted" x="306" y="409" font-size="13">组织 ID 10086 · 项目 3 个</text>
+  <rect class="success-bg" x="306" y="425" width="64" height="24" rx="12" />
+  <text class="success-text" x="324" y="442" font-size="12" font-family="-apple-system, BlinkMacSystemFont, PingFang SC, Microsoft YaHei, sans-serif">ENABLE</text>
+  <text class="muted" x="382" y="442" font-size="12">可执行 Delete；需先逐个 Delete 所有项目</text>
+  <rect class="button" x="1087" y="389" width="72" height="32" rx="4" />
+  <text class="text" x="1108" y="410" font-size="13">Delete</text>
+  <rect class="button-disabled" x="1169" y="389" width="72" height="32" rx="4" />
+  <text class="muted" x="1187" y="410" font-size="13">Restore</text>
+  <rect class="button-disabled" x="1251" y="389" width="88" height="32" rx="4" />
+  <text class="muted" x="1270" y="410" font-size="13">永久清理</text>
+
+  <text class="text" x="282" y="505" font-size="16" font-weight="600">项目</text>
+  <rect x="282" y="523" width="1082" height="44" fill="#f5f7fa" />
+  <text class="muted" x="306" y="550" font-size="13">项目</text>
+  <text class="muted" x="565" y="550" font-size="13">状态</text>
+  <text class="muted" x="820" y="550" font-size="13">更新时间</text>
+  <text class="muted" x="1080" y="550" font-size="13">操作</text>
+
+  <line class="line" x1="282" y1="567" x2="1364" y2="567" />
+  <text class="text" x="306" y="595" font-size="14" font-weight="500">Web Analytics</text>
+  <text class="muted" x="306" y="617" font-size="12">ID 20001</text>
+  <rect class="success-bg" x="565" y="587" width="64" height="24" rx="12" />
+  <text class="success-text" x="583" y="604" font-size="12" font-family="-apple-system, BlinkMacSystemFont, PingFang SC, Microsoft YaHei, sans-serif">ENABLE</text>
+  <text class="muted" x="820" y="606" font-size="13">2026-07-17 10:20</text>
+  <rect class="button" x="1080" y="584" width="72" height="32" rx="4" />
+  <text class="text" x="1101" y="605" font-size="13">Delete</text>
+
+  <line class="line" x1="282" y1="635" x2="1364" y2="635" />
+  <text class="text" x="306" y="663" font-size="14" font-weight="500">Feature Flags</text>
+  <text class="muted" x="306" y="685" font-size="12">ID 20002</text>
+  <rect class="warning-bg" x="565" y="655" width="72" height="24" rx="12" />
+  <text class="warning-text" x="581" y="672" font-size="12" font-family="-apple-system, BlinkMacSystemFont, PingFang SC, Microsoft YaHei, sans-serif">DISABLE</text>
+  <text class="muted" x="649" y="672" font-size="12">可恢复</text>
+  <text class="muted" x="820" y="674" font-size="13">2026-07-17 09:42</text>
+  <rect class="button" x="1080" y="652" width="72" height="32" rx="4" />
+  <text class="text" x="1098" y="673" font-size="13">Restore</text>
+  <rect class="button-danger" x="1162" y="652" width="88" height="32" rx="4" />
+  <text class="danger-text" x="1181" y="673" font-size="13" font-family="-apple-system, BlinkMacSystemFont, PingFang SC, Microsoft YaHei, sans-serif">永久清理</text>
+
+  <line class="line" x1="282" y1="703" x2="1364" y2="703" />
+  <text class="text" x="306" y="731" font-size="14" font-weight="500">Data Export</text>
+  <text class="muted" x="306" y="753" font-size="12">ID 20003</text>
+  <rect class="warning-bg" x="565" y="723" width="104" height="24" rx="12" />
+  <text class="warning-text" x="579" y="740" font-size="12" font-family="-apple-system, BlinkMacSystemFont, PingFang SC, Microsoft YaHei, sans-serif">INITIALIZING</text>
+  <text class="muted" x="681" y="740" font-size="12">仅可 Purge</text>
+  <text class="muted" x="820" y="742" font-size="13">2026-07-17 10:18</text>
+  <rect class="button-danger" x="1080" y="720" width="88" height="32" rx="4" />
+  <text class="danger-text" x="1099" y="741" font-size="13" font-family="-apple-system, BlinkMacSystemFont, PingFang SC, Microsoft YaHei, sans-serif">永久清理</text>
+
+  <line class="line" x1="282" y1="771" x2="1364" y2="771" />
+  <text class="muted" x="282" y="812" font-size="12">操作时使用同一个确认框：填写原因和真实对象 ID；套餐有效时再进行一次警告确认。</text>
+</svg>

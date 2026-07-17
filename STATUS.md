@@ -2,7 +2,7 @@
 
 ## 活跃
 
-（空）
+- `20260716-Wave-Refac-OrganizationProjectLifecycle`：`01-spec.md`、`02-decisions.md`、`03-plan.md`、`04-detail.md` 已完成并手工 simplify；详细设计已落实组织准入、PM/Dispatch/Scheduler、MA 双 Redis、Wagent/Kafka/OSS 清理、OP 审计和前端范围，等待 detail 评审，尚未进入开发
 
 ## 待启动
 
