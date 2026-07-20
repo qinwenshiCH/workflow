@@ -2,7 +2,15 @@
 
 ## 活跃
 
-（空）
+### 20260720-Wave-Docs-ApiRateLimitProductDiscovery — API 访问能力与请求保护产品调研
+
+| 项目 | 状态 |
+|---|---|
+| **阶段** | 需求调研 / 需求讨论中 |
+| **定位** | 产品探索 spec，不是立即开发的实现 spec |
+| **文档** | [01-spec.md](specs/20260720-Wave-Docs-ApiRateLimitProductDiscovery/01-spec.md) + [02-decisions.md](specs/20260720-Wave-Docs-ApiRateLimitProductDiscovery/02-decisions.md) |
+| **当前重点** | Account API Token 商业化、Session Token 安全、organization/project 边界、Redis 故障降级 |
+| **Dev 状态** | 未进入 Dev，不生成 tasks |
 
 ## 待启动
 
