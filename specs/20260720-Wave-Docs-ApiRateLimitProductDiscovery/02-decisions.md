@@ -6,14 +6,17 @@
 
 - `2026-07-20`: 本 change 定位为“需求调研与需求讨论 spec”，主要产出竞品证据、商业价值假设、Wave 现状、候选产品方向和待确认问题，不直接进入 Dev。
 - `2026-07-20`: 本次研究同时覆盖 Account API Token 和 Session Token，不能只完善 Account API Token 的 QPS 限流。
+- `2026-07-21`: 新增 `_research/wave-current-foundation.md` 作为 Wave 当前实现事实的单独证据底座；主 spec 只保留决策摘要，避免把代码现状、竞品事实和候选方案混写。
 
 ## 架构 & 技术选型
 
 - `2026-07-20`: 暂不确定最终限流实现、Redis 策略或数据模型；候选方案只作为产品讨论材料，不提前锁定技术方案。
+- `2026-07-21`: 参考 PostHog 的分层原则作为工作方向：organization/plan 负责商业 entitlement，project/account/token/global 分别承担资源、聚合、公平性和平台保护；这不是已确认的最终策略。
 
 ## 边界 & 异常处理
 
 - `2026-07-20`: Redis 限流故障、Session 鉴权 Redis 故障和普通业务缓存故障需要分开讨论，不能用一个全局 fail-open/fail-close 结论替代。
+- `2026-07-21`: 将“标准 OpenAPI scope 是否实际生效”和“审计是否需要精确到 token”列为 P0 需求核查项；当前代码证据显示 MCP 路径更完整，标准生成 handler 的 `requiredScope` 仍为空，审计表也没有 token 级字段。
 
 ## 数据模型
 
