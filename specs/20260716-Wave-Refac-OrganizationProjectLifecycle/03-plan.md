@@ -21,15 +21,15 @@
 
 | 事实 | 影响 |
 | --- | --- |
-| `project.status` 已有 `INITIALIZING/ENABLE/DISABLE` | 清理历史数据后复用 `DISABLE`，不新增同义状态 |
+| `project.status` 已有 `INITIALIZING/ENABLE/DISABLE` | 复用 `DISABLE` 表示可 Restore Delete，只增加 Purge 所需的 `PURGING/PURGED` |
 | 旧 Delete 会删除 Doris、Meta/Data PG、Kafka、成员和一个 Job | 旧资源删除能力全部收口到 Purge |
 | 名称唯一索引只排除 `is_deleted=true` | Delete 保持 `is_deleted=false`，自然保留名称 |
-| migration 使用 `GetAllNotDeletedProjects` | 长期 DISABLE 项目继续升级，无需 Restore 补 migration |
+| migration 使用 `GetAllNotDeletedProjects` | 改为单用途查询：DISABLE 继续升级，PURGING/PURGED 排除 |
 | PM 被多数请求入口、Token 解析和后台枚举使用 | PM 可作为主要可用目录，但不能假定所有组件都直接依赖 PM |
 | PM 部分写错误只记日志，订阅关闭后会退出 | 需要错误上抛、本地同步、重订阅和快照对账 |
 | Scheduler 已加载 cron/notify 和 Worker 不会统一重查 PM | 需要在 Master/Worker 中心入口补门禁 |
 | MCP、Internal S2S、LiveEvent、Wagent 存在 PM 旁路 | 必须分别在现有统一入口补最小检查 |
-| Edge、QE、C1 metadata、Asset Behavior 存在项目本地状态 | 只补实际清退，不增加统一资源接口 |
+| Edge、QE、C1 metadata、Asset Behavior 存在项目进程内状态 | 只补实际清退，不增加统一资源接口 |
 | OP 已有权限、确认和审计能力 | 直接复用，不新建权限或审计体系 |
 
 ### 2.2 设计约束
@@ -38,7 +38,7 @@
 - 组织必须逐项目 Delete/Purge，不自动级联。
 - Delete/Restore 不能删除、Stop、扫描或重建持久资源。
 - Purge 同步、可重入，不建执行表、步骤账本或后台任务。
-- 历史 DISABLE 由用户人工清理，不交付清理工具。
+- 历史 `DISABLE,true` 由用户逐个调用本期 Purge 清理；不交付批处理、扫描页或专用迁移工具。
 - 不增加 deny Key、`purge_started_at`、全表索引切换、生命周期 CHECK/trigger、专属错误码或通用协调器。
 
 ## 3. 顶层方案
@@ -47,28 +47,29 @@
 
 ```text
 Project:
-  INITIALIZING / ENABLE / DISABLE
+  INITIALIZING / ENABLE / DISABLE / PURGING / PURGED
 
 Organization:
-  ENABLE / DISABLE
+  ENABLE / DISABLE / PURGING / PURGED
 
 is_deleted=false:
-  主记录存在，继续受 migration 和名称索引管理
+  ENABLE / DISABLE / INITIALIZING / PURGING；主记录继续占用名称
 
 is_deleted=true:
-  Purge 已开始或旧流程墓碑，只能继续 Purge
+  PURGED 墓碑、历史 DISABLE，以及历史数据 Purge 中的 PURGING
 ```
 
 | 转换 | Global PG | PM | 持久资源 |
 | --- | --- | --- | --- |
 | Project Delete | `ENABLE -> DISABLE` | `DeleteInfo` | 不变 |
 | Project Restore | `DISABLE -> ENABLE` | `SetInfo` | 不变 |
-| Project Purge | 标记 `is_deleted=true`，最终删主记录 | 确保已移除 | 按固定步骤删除 |
+| Project Purge（新数据） | `DISABLE/INITIALIZING,false -> PURGING,false -> PURGED,true` | 确保已移除 | 显式顺序清理 |
+| Project Purge（历史） | `DISABLE,true -> PURGING,true -> PURGED,true` | 确保已移除 | 同一套显式顺序清理 |
 | Organization Delete | `ENABLE -> DISABLE` | 项目已逐个移除 | 不变 |
 | Organization Restore | `DISABLE -> ENABLE` | 不级联项目 | 不变 |
-| Organization Purge | 标记 `is_deleted=true`，最终删主记录 | 无 | 按固定步骤删除 |
+| Organization Purge | `DISABLE -> PURGING,false -> PURGED,true` | 无 | 显式顺序清理 |
 
-`INITIALIZING` 项目可直接 Purge。`ENABLE,false` 项目不能 Purge，任何 `is_deleted=true` 记录不能 Restore。
+`INITIALIZING` 项目和历史 `DISABLE,true` 项目可直接 Purge。`ENABLE` 项目不能 Purge；`PURGING/PURGED` 和历史 `is_deleted=true` 记录不能 Restore。用户在上线前通过同一 OP Project Purge 逐个处理历史软删除项目；本 change 不设计主记录的后续物理删除。
 
 ### 3.2 组件关系
 
@@ -82,7 +83,7 @@ flowchart LR
     Org --> Global["Global PostgreSQL"]
     Project --> Global
     Project --> PM["Project Manager"]
-    Project --> Purge["固定 Purge 步骤"]
+    Project --> Purge["显式顺序清理"]
 
     PM --> Admission["请求准入<br/>Web · MCP · Edge · ADTOL · ABOL · Connector"]
     PM --> Hooks["本地收敛<br/>Edge · QE · Dispatch/C1 · MA · LiveEvent"]
@@ -96,7 +97,7 @@ flowchart LR
     Purge --> ProjectPG["Meta / Data PG"]
 ```
 
-PM 是可用项目目录和通知通道，不是生命周期编排器。Purge 不通过 PM 逐组件调用清理。
+PM 是否存在 Project 是请求和任务的唯一运行开关，不是生命周期编排器。Purge 不通过 PM 逐组件调用清理，也不新增停止事件。
 
 ## 4. 核心流程
 
@@ -112,9 +113,9 @@ sequenceDiagram
     participant C as Components
 
     OP->>S: Delete(projectID)
-    S->>L: lock organization then project
-    S->>DB: load project and parent organization
-    S->>S: require organization ENABLE and project ENABLE/DISABLE
+    S->>L: lock project
+    S->>DB: load project
+    S->>S: require project ENABLE or DISABLE
     S->>PM: DeleteInfo(projectID)
     PM-->>C: OnProjectDelete / PM gate
     S->>DB: conditional ENABLE to DISABLE
@@ -127,7 +128,8 @@ sequenceDiagram
 2. PM 先失效是 fail-closed：DB 更新失败时项目可能暂时不可用，但不会继续接收新流量。
 3. 不调用资源删除函数、JobDelete/JobStop、成员删除、权限缓存扫描或业务 Redis 清理。
 4. Delete 成功表示 DB/PM 权威状态已提交，不表示所有远端进程已经 ACK。
-5. 已开始的短任务可以完成；长期任务由 Worker/lease heartbeat 取消。
+5. 所有运行中 Scheduler handler 在 Worker heartbeat 发现 PM 不含项目后取消本地 context、释放 lease；不修改任务持久状态。
+6. 不检查父 Organization status；Delete 是单向收缩操作，父组织已 `DISABLE` 时仍允许执行。Restore/Create 才要求父组织 `ENABLE,false`。
 
 ### 4.2 Project Restore
 
@@ -152,7 +154,7 @@ sequenceDiagram
 - Restore 不等待 Job/lease 或远端 Hook 收敛，不检查 Meta/Data PG、Doris、Kafka、OSS。
 - 不创建 Job、不重新初始化项目、不补 migration。
 - PM 写失败时返回依赖错误；重复 Restore 即使 DB 已为 `ENABLE` 也重新执行 `SetInfo`。
-- 历史 DISABLE 必须在功能开放前人工清理；代码不维护第二套历史状态判断。
+- 历史 `DISABLE,true` 必须在功能开放前逐个 Purge；Restore 始终拒绝 `is_deleted=true`。
 
 ### 4.3 Project Purge
 
@@ -161,24 +163,30 @@ flowchart TD
     A["OP Purge"] --> B["获取组织锁和项目锁"]
     B --> C{"项目允许 Purge"}
     C -->|否| X["返回 Conflict"]
-    C -->|是| D["确保 PM 已移除"]
-    D --> E{"长期工作已停止"}
-    E -->|否| Y["返回 Conflict 和阻塞信息"]
-    E -->|是| F["条件设置 is_deleted=true"]
-    F --> G["按固定顺序执行 purgeStep"]
-    G --> H{"步骤成功"}
-    H -->|否| I["保留墓碑并返回 step"]
+    C -->|PURGED| Z["返回 purged=true"]
+    C -->|新数据| D["条件写入 PURGING,false"]
+    C -->|历史软删除| DL["条件写入 PURGING,true"]
+    DL --> E
+    D --> E["确保 PM 已移除"]
+    E --> Q{"运行面已静默"}
+    Q -->|否| Y["保留 PURGING 并返回 Conflict"]
+    Q -->|是| F["显式顺序调用资源清理"]
+    F --> H{"步骤成功"}
+    H -->|否| I["保留 PURGING 并返回 step"]
     H -->|是| J["Global PG 最终事务"]
-    J --> K["返回 purged=true"]
+    J --> K["写入 PURGED,true"]
+    K --> R["返回 purged=true"]
 ```
 
 允许 Purge：
 
 - `DISABLE,false`。
 - `INITIALIZING,false`。
-- 任意 `is_deleted=true` 墓碑，用于重试。
+- `PURGING,false`，用于重试。
+- 历史 `DISABLE,true` 和 `PURGING,true`，保持 `is_deleted=true` 执行或重试。
+- `PURGED,true`，直接返回已完成。
 
-运行面静默只检查已有的可观测状态，例如 Scheduler Instance/Task/lease、Dispatch 项目任务数和 Wagent 运行执行；不为进程内 Hook 建远端 ACK。少量仍在收敛的本地状态如果与资源删除竞争，由现有依赖错误和幂等 Purge 重试兜底。
+运行面静默只检查已有的可观测状态，例如 Scheduler Instance/Task/lease、Dispatch 项目任务数和 Wagent 运行执行；不为 PM Delete Hook 建远端 ACK。少量仍在收敛的进程内状态如果与资源删除竞争，由现有依赖错误和幂等 Purge 重试兜底。
 
 最小步骤顺序：
 
@@ -191,24 +199,15 @@ flowchart TD
 | 5 | `project_doris` | Drop 项目 Database |
 | 6 | `project_pgdata` | Drop Data Schema |
 | 7 | `project_meta` | Drop Meta Schema，Scheduler Job 随 Schema 删除 |
-| 8 | `project_global` | 最终事务清引用并删除 project 主记录 |
+| 8 | `project_global` | 最终事务清引用和配置/凭据，写 project `PURGED,true` 最小墓碑 |
 
-实现只需普通切片：
-
-```go
-type purgeStep struct {
-    name string
-    run  func(context.Context, int64) error
-}
-```
-
-不存在资源视为成功；只有最终一致资源在自己的 `run` 内验证，不增加通用 verify 接口。
+ProjectService 直接按表中顺序调用已有或窄化后的资源函数，在返回错误上附稳定 step；不建设步骤切片、注册表或通用 verify 接口。不存在资源视为成功，最终一致资源只在自己的清理函数内验证。
 
 ### 4.4 Organization 生命周期
 
 - Delete：组织锁内重查项目；存在任何非 `DISABLE,false` 项目时拒绝；条件更新组织为 `DISABLE`。
 - Restore：`DISABLE,false -> ENABLE`，不级联项目。
-- Purge：要求组织非 `ENABLE` 且项目记录数为 0；标记 `is_deleted=true`，清组织派生关系，最后删除组织主记录。
+- Purge：要求组织为 `DISABLE,false` 且所有子项目均为 `PURGED,true`；写 `PURGING,false`，清组织派生关系，最后写组织 `PURGED,true`，项目墓碑继续保留。
 - OP Customer Profile、合同历史、共享 Account 和审计日志保留；客户绑定维持 `expired`。
 
 ## 5. PM 与执行面
@@ -223,27 +222,9 @@ type purgeStep struct {
 4. 重订阅后根据 Redis membership/info 快照对账本地 map，补发本地 set/delete Hook。
 5. Hook panic 继续隔离；不增加远端 ACK、Restore/Purge 事件或生命周期版本号。
 
-### 5.2 组件项目入口与本地资源
+### 5.2 组件入口与资源原则
 
-| 组件 | PM 依赖或通知现状 | 本期最小改动 | Restore |
-| --- | --- | --- | --- |
-| Web API | 项目大部分经过 `ProjectFilter`；现有 `OrganizationFilter` 不检查状态 | 保留项目门禁；扩展现有 `OrganizationFilter`，组织列表和项目 Create 只接受组织 `ENABLE` | PM/组织状态恢复后立即可用 |
-| MCP | 根路由绕过 `ProjectFilter` | 在统一项目授权函数检查 PM | 同普通请求 |
-| Internal S2S | 只解析 Project Header | 新工作入口检查 PM；finish/update/cleanup 允许回写 | 新工作恢复，旧回调不被卡住 |
-| Edge | Token 入口依赖 PM，Delete Hook 为空 | 清 token2id、pipelineVersion、internalSecrets map | update hook 重建 |
-| ADTOL | 请求均用 PM Token 查项目 | 无改动，补拒绝测试 | 自动恢复 |
-| ABOL | PM Hook 已停止 AB Core | 保留实现，补回归测试 | update hook 重建 |
-| Connector HTTP | AppsFlyer 入口依赖 PM | 无本地项目资源则不补空 Hook | 自动恢复 |
-| Scheduler | reload/repair 用 PM，live cron/Worker 有旁路 | Master 和 Worker 统一门禁；heartbeat 取消长期任务 | 下个调度周期或 repair 继续，不补跑 |
-| Connector Worker | 由 Scheduler 驱动长期 Kafka runner | 复用 Scheduler Worker 取消 | 从保留 offset 继续，受 broker 保留期约束 |
-| Dispatch/C1 | Hook 只删 `counts`，refresh 未把 Redis 残留项目标为 changed | 修正现有 refresh，重写 task map 后由 TaskManager 关闭 Pipeline；额外驱逐 C1 metadata map | Dispatch 重新分配并懒加载 metadata |
-| MA | ConfigSync 有 Hook，另有 cohort/matcher/feedback 本地态；event consumer 由 Scheduler 启动 | 保留 Untrack；Runtime Hook 驱逐本地态，长期 consumer 由 Worker 取消 | 从保留 offset 继续，运行态懒建 |
-| QE Catalog | Delete Hook 为空 | 驱逐项目 Catalog | 懒加载 |
-| LiveEvent | 只在 WebSocket 注册时检查 PM | Delete 关闭项目 consumer 和连接 | 新连接懒启动，不回放断开期消息 |
-| Wagent | HTTP 受 Web 保护，Redis Stream Worker 无门禁；quota/rate-limit Key 不使用通用项目前缀 | claim/start 前检查；禁用时不 ACK/丢弃可恢复消息；Purge 定向清额外 Key | 未过期消息可继续，过期执行需重试 |
-| Wagent MCP tool catalog | 进程内 TTL cache 的 key 含 project ID | 不补 Hook；新执行已被 Wagent/PM 门禁阻断，缓存不可单独产生工作并会按原 TTL 过期 | 后续执行按 TTL 重新加载 |
-| Asset Behavior | 每项目后台 batcher | 关闭并移除项目 batcher | 懒创建 |
-| Pipeline finalizer | 通过 PM 项目列表运行 | 无改动 | 重新进入列表后继续 |
+组件入口、资源和生命周期动作的逐项清单统一放在 [04-detail.md](./04-detail.md) 第 4 章；本 plan 只保留原则：所有新工作入口依赖 PM，真实进程内状态复用现有 PM Delete/Update Hook，Scheduler handler 统一由 Master/Worker 门禁和 heartbeat 收敛，无项目资源的组件不增加空接口。
 
 ### 5.3 Scheduler 语义
 
@@ -258,9 +239,9 @@ Delete 不调用：
 
 - 已加载 cron 和 Redis notify 在创建 Instance 前重查 PM。
 - Worker 领取 Instance/Task 前重查 PM。
-- 长期 handler 在现有 lease heartbeat 发现项目不可用时取消。
-- 短任务已经开始后可以完成，不建设分布式强制回滚。
-- Restore 不等待这些状态收敛；Purge 必须确认长期工作停止。
+- PM 是否存在 Project 是唯一运行开关，不新增停止信号或逐任务命令。
+- 所有运行中 handler 在现有 heartbeat 发现项目不可用时只取消本地 context、释放 lease；Job/Instance/Task 不写 STOP/CANCELED，也不增加业务失败次数。
+- Restore 不等待这些状态收敛；Purge 必须确认全部运行工作停止。
 - Delete 期间错过的 cron 不补跑，Restore 后从下一个周期继续。
 
 ## 6. 数据模型与 DAO
@@ -270,7 +251,7 @@ Delete 不调用：
 | 表 | 变更 |
 | --- | --- |
 | `organization` | 新增 `status varchar(64) not null default 'ENABLE'` |
-| `project` | 不新增字段和状态，复用现有 `DISABLE` |
+| `project` | 不新增字段，复用 `DISABLE` 并增加 `PURGING/PURGED` 常量 |
 | 名称索引 | 保持现有 `WHERE is_deleted=false` 部分唯一索引 |
 
 业务表只增加组织 status 并同步 bootstrap SQL。migration 不写 token，不注册额外服务身份，不添加 CHECK、trigger、全表索引或项目数据回填。
@@ -282,20 +263,20 @@ Delete 不调用：
 | 普通组织业务 | `organization.status=ENABLE AND is_deleted=false` |
 | 普通项目入口/列表 | `project.status=ENABLE AND is_deleted=false`，并要求父组织 `ENABLE` 或 PM 存在 |
 | 项目创建重名 | 所有 `is_deleted=false`，使 DISABLE 名称继续占用 |
-| OP Lifecycle | 包含 ENABLE、DISABLE、INITIALIZING 和 Purge 墓碑 |
-| Project migration | 所有 `is_deleted=false`，包括 INITIALIZING、DISABLE |
-| Purge | 显式 WithDeleted，支持 `is_deleted=true` 重试 |
+| OP Lifecycle | 包含 ENABLE、DISABLE、INITIALIZING、PURGING、PURGED |
+| Project migration | `INITIALIZING/ENABLE/DISABLE,is_deleted=false` |
+| Purge | 显式 WithDeleted，支持历史 `DISABLE/PURGING,true`、新 `PURGING,false` 和 `PURGED,true` 查询 |
 
-重点审查现有 `GetByID`、`ListByOrg`、`GetByOrgAndName`、`GetAllEnableProjects` 和 `GetAllNotDeletedProjects`，不把所有 DAO 机械改成同一个条件。
+重点审查现有 `GetByID`、`ListByOrg`、`GetByOrgAndName`、`GetAllEnableProjects`；migration 单用途方法改为 `GetAllMigrationProjects`，不把所有 DAO 机械改成同一个条件。
 
 ### 6.3 条件更新
 
 - Project Delete：`WHERE id=? AND status=ENABLE AND is_deleted=false`。
 - Project Restore：`WHERE id=? AND status=DISABLE AND is_deleted=false`。
-- Project Purge marker：新请求要求 `status<>ENABLE`；已有 `is_deleted=true` 墓碑允许幂等重试。
+- Project Purge marker：新数据 `DISABLE/INITIALIZING,false -> PURGING,false`；历史数据 `DISABLE,true -> PURGING,true`；两种 `PURGING` 均允许重试，`PURGED,true` 直接返回已完成。
 - Organization Delete/Restore 使用同样的 ENABLE/DISABLE 条件更新。
 - 项目普通根更新必须带 `status=ENABLE AND is_deleted=false`，不得用无条件 `Save` 恢复旧状态。
-- Organization Create、Project Create 与生命周期操作使用相同锁顺序，避免 Create 与 Delete 交叉。
+- Organization Create、Project Create、Project Restore 和 Organization lifecycle 在需要组织状态时使用相同锁顺序；Project Delete 只获取项目锁，不为不需要的父组织约束扩大锁范围。
 
 ## 7. API、权限与审计
 
@@ -317,7 +298,7 @@ Delete 不调用：
 错误复用现有 BadParam/PermissionDenied/Conflict/InternalError。结构化 data 只保留：
 
 ```text
-resource_id, blocked_ids, blocked_count, step, already_absent
+resource_id, status, purged, blocked_ids, blocked_count, step
 ```
 
 ### 7.2 权限和审计
@@ -371,7 +352,7 @@ flowchart TD
 | 超过 Kafka retention 或 offset retention 的数据 | 无法恢复，时长依线上 broker 配置 |
 | Redis/Wagent/MA 临时状态和 MA 内存 feedback queue | 过期或驱逐后不恢复，必要时用户重试 |
 | LiveEvent | 断开期间不回放 |
-| 已开始的有限任务 | 允许完成 |
+| 已开始的 Scheduler handler | heartbeat 后取消本地 context；取消前已经发生的外部副作用不回滚 |
 | 外部系统副作用 | 不回滚 |
 | 组织套餐变化 | 按 Restore 时的当前状态判断 |
 
@@ -383,13 +364,14 @@ flowchart TD
 | --- | --- | --- |
 | PM Delete 成功、DB 更新失败 | DB 仍 ENABLE，但运行面 fail-closed | 返回错误，重复 Delete/Restore 对账 |
 | DB Restore 成功、PM SetInfo 失败 | DB ENABLE，PM 暂不承认 | 返回错误，重复 Restore 重发 PM |
-| PM Pub/Sub 丢消息 | 远端本地状态暂时陈旧 | 重订阅后的快照对账纠正 |
-| Delete 后有限任务仍运行 | 可能完成 | 不阻塞 Restore；Purge 等长期任务停止 |
-| Purge step 失败 | `is_deleted=true` 墓碑保留 | 修复依赖后从第一步重试 |
-| Purge 目标不存在 | 已 Purged | `already_absent=true` |
+| PM Pub/Sub 丢消息 | 远端进程内状态暂时陈旧 | 重订阅后的快照对账纠正 |
+| Delete 后 handler 尚未退出 | heartbeat 收敛窗口 | 不阻塞 Restore；Purge 等全部运行工作停止 |
+| Purge step 失败 | 当前 `PURGING,is_deleted` 组合保留 | 修复依赖后从第一步重试 |
+| Purge 目标为 `PURGED,true` | 已完成 | 返回当前状态，不查审计 receipt |
+| Purge 墓碑不存在 | NotFound | 不推测历史归属 |
 | 组织仍有阻塞项目 | 状态不变 | 返回有限 blocked IDs 和总数 |
 
-跨 PG、Doris、Kafka、Redis、OSS 不模拟分布式事务；依靠步骤幂等和主记录最后删除恢复执行。
+跨 PG、Doris、Kafka、Redis、OSS 不模拟分布式事务；依靠资源函数幂等、`PURGING` 重试和最终 `PURGED,true` 恢复执行。
 
 ## 11. 影响范围
 
@@ -398,7 +380,7 @@ flowchart TD
 | Project/Organization Service | 重写 Delete，新增 Restore/Purge，旧资源删除只供 Purge | 高 |
 | Global DAO/Schema | organization status、条件更新、Lifecycle/WithDeleted 查询 | 高 |
 | PM | 写错误、本地同步、重订阅、快照对账 | 高 |
-| Scheduler | Master/Worker PM 门禁与长期任务取消 | 高 |
+| Scheduler | Master/Worker PM 门禁、heartbeat 本地取消与持久任务状态保留 | 高 |
 | MCP/Internal API | 统一授权门禁和新工作/回调边界 | 高 |
 | Edge/C1/MA/QE/LiveEvent/Wagent/Asset | 补真实本地清理或执行入口，不建统一接口 | 中 |
 | PG/Doris/Kafka/Redis/OSS client | 复用清理能力，补幂等和必要验证 | 高 |
@@ -413,27 +395,27 @@ flowchart TD
 
 1. 在网关永久阻断旧租户 `/project/delete`、`/org/delete`，防止旧实例继续物理清理。
 2. 部署 Global migration、MA 内部 Purge endpoint、全部后端门禁/Hook/OP API，并向 Web/MA 注入同一个 `MA_PROJECT_PURGE_TOKEN`；暂不开放生命周期前端。
-3. 用户人工清理历史 DISABLE，并确认不存在需要保留或 Restore 的旧记录；该步骤不是代码交付物。
+3. 用户通过本期 OP Purge 逐个清理历史 `DISABLE,true`，并确认不存在需要保留的旧记录；不建设批处理或历史清理专用入口。
 4. 人工确认完成后部署或开放 OP 生命周期 Tab；此后 `DISABLE,false` 只由新 Delete 产生。
 5. 回滚时旧租户路由仍保持阻断，避免恢复旧物理 Delete。
 
 兼容原则：
 
 - 新旧后端混部期间不开放前端动作。
-- 不迁移项目状态，不改名称索引和 Secret 约束。
+- 不回填项目状态，不改名称索引和 Secret 约束。
 - DISABLE 项目继续执行现有 Project migration。
-- 不增加运行时 cutover flag 或“历史/新 DISABLE”双状态判断。
+- Purge 只增加一个必要兼容分支：历史 `DISABLE,true` 保持 true 清理；不增加运行时 cutover flag 或其他双状态体系。
 
 ## 13. 测试与验证
 
 ### 13.1 单元测试
 
-- Project/Organization ENABLE/DISABLE 转换、幂等和父子约束。
+- Project/Organization ENABLE/DISABLE/PURGING/PURGED 转换、幂等和父子约束。
 - 条件 UPDATE 和并发生命周期操作。
-- INITIALIZING、Purge 墓碑和 NotFound 边界。
+- INITIALIZING、PURGING、PURGED 和 NotFound 边界。
 - PM 错误、本地同步、重订阅和快照对账。
-- Scheduler Master/Worker 门禁和长期任务取消。
-- Purge 步骤顺序、失败即停、重跑和主记录最后删。
+- Scheduler Master/Worker 门禁、heartbeat 本地取消和持久任务状态不变。
+- Purge 调用顺序、失败即停、PURGING 重跑和最终 PURGED 墓碑。
 - OP 权限、归属、ID/reason 和审计映射。
 
 ### 13.2 集成测试
@@ -447,7 +429,7 @@ flowchart TD
 ### 13.3 E2E
 
 - 客户详情 Delete → 新请求/新任务拒绝 → Restore → 新工作恢复。
-- 长期任务停止，短任务按约定完成，Restore 不等待收敛。
+- 所有运行中 Scheduler handler 在 heartbeat 后停止且不写 CANCELED，Restore 不等待收敛。
 - Project Purge 中途失败 → Restore 拒绝 → 手动重试成功。
 - Organization 逐项目 Delete/Purge，Restore 不级联。
 - 非 OP、跨客户、ID/reason 错误和套餐有效额外确认。
@@ -460,15 +442,15 @@ flowchart TD
 | --- | --- |
 | 入口绕过 PM | 逐项覆盖已发现的 MCP、Internal、LiveEvent、Wagent 和 Scheduler 旁路 |
 | PM 通知丢失 | 关键写报错、本地同步、重订阅和快照对账 |
-| 长期任务继续消费 | Scheduler Worker/lease heartbeat 中心取消，不逐组件建协调器 |
-| 历史 DISABLE 被误 Restore | 前端开放前由用户人工清理，不在代码中维护双语义 |
+| 运行中 handler 继续消费 | PM 是唯一运行开关，Scheduler heartbeat 中心取消本地 context，不逐组件发停止信号 |
+| 历史 `DISABLE,true` 被误 Restore | Restore 条件明确要求 `DISABLE,false`；前端开放前由用户通过 OP Project Purge 逐个清理，不增加扫描、批处理或第二套 Restore 语义 |
 | 长期 Delete 被误认为绝对无损 | 明确保留项与不补偿项，不建设重放和 TTL 冻结 |
-| Purge 漏资源 | 固定 owner 清单、资源级测试、幂等步骤和主记录最后删 |
-| 改动扩散成框架 | 规则留在现有 Service，真实本地状态用现有 Hook/函数处理 |
+| Purge 漏资源 | 固定 owner 清单、资源级测试、显式幂等调用和最终 PURGED 墓碑 |
+| 改动扩散成框架 | 规则留在现有 Service，真实进程内状态用现有 PM Delete/Update Hook 或函数处理 |
 
 ## 15. 下一步
 
-详细设计已生成于 [04-detail.md](./04-detail.md)，包含具体文件、函数、SQL、OpenAPI、前端组件、资源 owner 和测试命令。下一步先评审 detail；确认后再生成 tasks 并进入开发。
+详细设计已生成于 [04-detail.md](./04-detail.md)，包含具体文件、函数、SQL、OpenAPI、前端组件、清理 owner 和测试命令。下一步先评审 detail；确认后再生成 tasks 并进入开发。
 
 ## Quality Gates
 
@@ -477,5 +459,5 @@ flowchart TD
 - [x] 所有已发现的 PM 旁路和本地项目资源有明确处置。
 - [x] 长期 Restore 的保留项与不补偿项明确。
 - [x] 单元、集成、组件和 E2E 测试策略明确。
-- [x] Rollout 明确历史 DISABLE 由用户人工清理。
+- [x] Rollout 明确历史 `DISABLE,true` 由用户通过 OP Project Purge 逐个处理。
 - [x] simplify 已删除多余状态、清理工具、协调器、执行表和补偿系统。
