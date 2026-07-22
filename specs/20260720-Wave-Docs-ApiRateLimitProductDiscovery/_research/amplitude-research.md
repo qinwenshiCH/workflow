@@ -141,6 +141,21 @@ Amplitude 把 MCP 定位为**平台能力而非独立计费产品**：
 > [!NOTE]
 > 不能把"没有公开单次 MCP 价格"写成"Amplitude 不会按合同收费"。Enterprise 的具体能力、容量、add-on 和 overage 仍可能以合同为准。本次公开资料核查无法确认。
 
+### 3.4 套餐与 QPS 的关系
+
+Amplitude 所有公开 API 限流值（Dashboard REST 5 并发、Experiment Management 100 req/s + 100,000 req/day、User Profile 600 req/min 等）均为统一的 operational limits，**不随套餐层级变化**。Free / Plus / Growth / Enterprise 共享相同数值。
+
+| 维度 | Amplitude |
+| --- | --- |
+| **商业化核心锚点** | 月度事件量、MTU、产品能力 entitlement |
+| **API QPS 是否随套餐变化** | 不随套餐变化；所有 plan 相同 |
+| **超额处理** | 事件量超额 → 提醒或计费；QPS 超额 → 429（同一阈值） |
+| **能否联系 Support 提 QPS** | 除 User Profile API 标注"需联系"外，大部分 API 无此途径 |
+
+Amplitude 与 PostHog 共享相同的设计哲学：**rate limit 是 infra 保护参数，不是可直接购买的商品**。这也侧面说明，靠"卖 QPS"作为 API 产品的差异化手段并非行业主流。对 Wave 而言，如果第一版选择 plan 差异化 QPS，应该明确这只是过渡方案而非最终商业形态。
+
+> 证据来源：本节所有 QPS 数值来自 §1 限流现状表，Amplitude 官方未在任何文档中标注"此值会随 plan 提升"。
+
 ## 四、MCP 权限治理（非限流，但影响产品设计）
 
 Amplitude MCP 的公开设计重点在权限治理而非限流数值：

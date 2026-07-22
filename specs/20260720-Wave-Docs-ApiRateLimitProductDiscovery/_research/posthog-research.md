@@ -151,6 +151,72 @@ with (
 
 > 产品含义：便宜、短请求可以共享默认保护；查询、写入、实时配置等不同资源使用不同保护；高风险/高成本操作不应和普通 CRUD 共用一个 bucket。
 
+### 1.7 MCP 限流：独立 TypeScript 服务 + 独立 Redis 限流器
+
+PostHog 的 MCP 是**独立于 Django REST API 的 TypeScript 服务**（Cloudflare Worker + Hono），有自己独立的认证和限流体系。
+
+#### 架构
+
+```
+MCP 客户端 (Claude Code 等)
+       │
+       ▼
+Cloudflare Worker (index.ts) ── 校验 token 前缀
+       │
+       ▼
+Hono App (app.ts)
+  ├── securityHeaders 中间件
+  ├── httpMetrics 中间件
+  └── StreamableMcpHandler.fetch()
+        ├── authenticateAndParse()         → 401
+        ├── rateLimiter.check(userHash)    → 429
+        └── dispatcher.handleRequest()     → JSON-RPC 方法分派
+              ├── MAX_BATCH_SIZE = 100
+              └── MAX_BODY_BYTES = 1MB
+```
+
+#### 认证：只接受 API token，不接受 session
+
+MCP `authenticateAndParse()` 仅检查 `Authorization: Bearer`，支持三种 token 格式：
+
+| 凭证 | 前缀 | 说明 |
+|------|------|------|
+| Personal API Key | `phx_` | 用户手动创建的 API key |
+| OAuth Access Token | `pha_` | OAuth 2.1 授权码流程颁发 |
+| ID-JAG JWT | — | RFC 9068 JWT（需要 JWKS 验证） |
+
+> 源码：[Cloudflare Worker token 提取](services/mcp/src/index.ts:183–215)、[Hono authenticateAndParse](services/mcp/src/hono/request-utils.ts:55–93)
+
+**Session 不能走 MCP**——MCP 完全不读 cookie，也不检查 session token。这与 D2 理念一致：API 通道和浏览器通道物理隔离。
+
+#### 限流：独立 Redis 限流器，值对等到 REST API
+
+MCP 有自己独立的 Redis 滑动窗口限流器，和 REST API 值相同但 Redis key 独立：
+
+```typescript
+// rate-limiter.ts (第 25–35 行)
+const DEFAULT_BURST_LIMIT = 480      // 480 请求 / 60s 窗口
+const DEFAULT_SUSTAINED_LIMIT = 4800  // 4800 请求 / 3600s 窗口
+```
+
+- **Key 维度**：`mcp:rl:<scope>:<userHash>` —— `userHash` 是 token 的 PBKDF2 哈希
+- **分 scope 独立计数**：burst 和 sustained 各一个 Redis key
+- **fail-open**：Redis 出错时放行（第 48–52 行）
+- **429 响应头**：携带标准 `RateLimit-*` 头（[buildRateLimitResponse](services/mcp/src/hono/rate-limiter.ts:113–125)）
+
+> 源码：[RateLimiter 实现](services/mcp/src/hono/rate-limiter.ts)、[StreamableMcpHandler.fetch](services/mcp/src/hono/streamable-handler.ts:26–52)
+
+#### 资源保护（非速率类）
+
+| 限制 | 值 | 源码位置 |
+|------|-----|---------|
+| JSON-RPC batch 上限 | 100 条消息 | [`dispatcher.ts:39`](services/mcp/src/hono/dispatcher.ts:39) |
+| 请求体大小上限 | 1MB（1,048,576 字节） | [`dispatcher.ts:40`](services/mcp/src/hono/dispatcher.ts:40) |
+| 关闭优雅期 | 300s（5min） | [`shutdown.ts:10–36`](services/mcp/src/hono/shutdown.ts:10) |
+| 并发限制 | ❌ 无（仅有监控指标 `mcp_inflight_requests`） | [`metrics.ts:48–52`](services/mcp/src/hono/metrics.ts:48) |
+
+> **对 Wave 的启示**：(1) PostHog 的 MCP 与 REST API 限流值相同但 key 独立，Wave 也可考虑此模式而非直接复用 per-token + global；(2) MCP 不接受 session，与 D2 架构一致；(3) batch/body 上限作为资源保护层，Wave 当前 MCP 无此限制。
+
 ## 二、设计逻辑：商业归商业，运行时归运行时
 
 PostHog 最值得关注的设计原则是"商业归属和运行时保护故意分离"——billing 判断在 organization，fast path 可以按项目 token 做。以下是支撑这一原则的关键设计选择：

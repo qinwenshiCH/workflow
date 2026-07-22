@@ -30,16 +30,12 @@
 
 ### 当前已有的资源级产品约束
 
-- Dashboard 创建会在事务内检查项目配额，再创建资源并写审计日志；Chart 也有项目配额检查路径。[Dashboard service](</Users/wenshiqin/wave-worktrees/api_qps/apps/web/service/dashboard/dashboard.go:73>)、[Chart quota](</Users/wenshiqin/wave-worktrees/api_qps/apps/web/service/chart/chart.go:83>)
-- Dashboard/Chart 的读取和编辑使用资产级 `CheckViewable` / `CheckEditable`；这不是 QPS 限流，而是资源权限。[Dashboard permission](</Users/wenshiqin/wave-worktrees/api_qps/apps/web/service/dashboard/dashboard.go:48>)、[Chart permission](</Users/wenshiqin/wave-worktrees/api_qps/apps/web/service/chart/chart.go:47>)
-- Dashboard、Chart、Experiment 等资源已有 `created/updated/deleted` 审计事件。[Audit registry](</Users/wenshiqin/wave-worktrees/api_qps/apps/web/service/auditlog/audit.go:40>)、[Dashboard audit](</Users/wenshiqin/wave-worktrees/api_qps/apps/web/service/dashboard/dashboard.go:873>)、[AB audit](</Users/wenshiqin/wave-worktrees/api_qps/apps/web/service/ab/ab_common.go:107>)
+- **项目配额**：Dashboard/Chart 创建时检查项目配额。[Dashboard service](</Users/wenshiqin/wave-worktrees/api_qps/apps/web/service/dashboard/dashboard.go:73>)、[Chart quota](</Users/wenshiqin/wave-worktrees/api_qps/apps/web/service/chart/chart.go:83>)
+- **资源权限**：读取/编辑使用 `CheckViewable` / `CheckEditable`。[Dashboard permission](</Users/wenshiqin/wave-worktrees/api_qps/apps/web/service/dashboard/dashboard.go:48>)、[Chart permission](</Users/wenshiqin/wave-worktrees/api_qps/apps/web/service/chart/chart.go:47>)
+- **审计事件**：Dashboard、Chart、Experiment 已有 `created/updated/deleted` 事件。[Audit registry](</Users/wenshiqin/wave-worktrees/api_qps/apps/web/service/auditlog/audit.go:40>)
+- **Account API Token 限流**：已实现 Redis token bucket（per_token 默认 3/s + global 2000/s），通过全局 Gin 中间件对所有通道生效（含标准 API 和 MCP）。(</Users/wenshiqin/wave-worktrees/api_qps/apps/web/service/account/apitoken/ratelimit.go>) [middleware](</Users/wenshiqin/wave-worktrees/api_qps/pkg/ginx/middleware/account_api_token_rate_limit.go>)
 
-因此，Wave 已经有两个与未来 API 产品相关、但含义不同的基础：
-
-1. **项目资源配额**：限制“能拥有多少个 Dashboard/Chart/Experiment”。
-2. **资源权限**：限制当前账号是否能查看或编辑某个资源。
-
-这两者都不能直接替代请求速率、并发或 API 套餐额度。
+以上均非请求速率、并发或套餐额度类的 API 限流。
 
 ## 3. 标准 API 的认证和中间件链
 
@@ -154,9 +150,28 @@ MCP 认证当前支持两种凭证：
 
 对应代码：[MCP authentication](</Users/wenshiqin/wave-worktrees/api_qps/apps/web/mcp/server.go:128>)、[MCP Account API rate limit](</Users/wenshiqin/wave-worktrees/api_qps/apps/web/mcp/server.go:182>)。
 
-当前测试名称和断言直接证明 Session Token 绕过 Account API Token 限流；因此“补齐 Session Token 的请求保护”是明确的现状缺口，不是推测。[MCP bypass test](</Users/wenshiqin/wave-worktrees/api_qps/apps/web/mcp/server_test.go:357>)
+当前测试名称和断言直接证明 Session Token 绕过 Account API Token 限流；因此”补齐 Session Token 的请求保护”是明确的现状缺口，不是推测。[MCP bypass test](</Users/wenshiqin/wave-worktrees/api_qps/apps/web/mcp/server_test.go:357>)
 
 MCP 工具层对资源访问更完整：需要项目上下文的工具检查项目成员；Account API Token 再检查资源 scope；Dashboard/Chart 等写工具按角色权限声明 `PermDashboardEdit` 等。[MCP project scope](</Users/wenshiqin/wave-worktrees/api_qps/apps/web/mcp/tools/context.go:29>)、[MCP dashboard permissions](</Users/wenshiqin/wave-worktrees/api_qps/apps/web/mcp/tools/asset.go:414>)
+
+### 6.1 与 PostHog MCP 对比
+
+| 维度 | Wave MCP | PostHog MCP |
+|------|---------|-------------|
+| 部署架构 | 同 Web 服务（Go），`/api/mcp` 裸路由 | 独立 Cloudflare Worker（TypeScript/Hono），边缘节点 |
+| 认证方式 | Account API Token（`sm_`）+ Session Token | Personal API Key（`phx_`）+ OAuth token（`pha_`）+ JWT |
+| Session 支持 | ✅ 支持且不限流 | ❌ 不支持 |
+| 限流器 | 复用 REST API per-token + global（同一组 Redis key） | 独立 Redis，值同 REST API（key 独立命名空间 `mcp:rl:*`） |
+| 限流窗口 | 单层 burst | burst（480/min）+ sustained（4800/hour）双窗口 |
+| 限流 key 维度 | token hash | userHash（token 的 PBKDF2 哈希） |
+| Batch/body 限制 | ❌ 无 | batch ≤ 100，body ≤ 1MB |
+| 并发限制 | ❌ 无 | ❌ 无（仅监控） |
+| 故障模式 | fail-open（可配置） | fail-open |
+
+关键差异：
+1. **PostHog MCP 不接受 session**——只有 API token 能走 MCP，与 D2 理念一致
+2. **PostHog MCP 限流独立但与 REST API 值对等**——同一套保护标准，但 Redis key 隔离
+3. **PostHog 有 batch/body 上限**——作为资源保护层，Wave 当前无此限制
 
 ## 7. 审计与“到底是谁在用 key”
 
