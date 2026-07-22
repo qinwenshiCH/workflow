@@ -54,6 +54,12 @@
 - `2026-07-21` `[用户确认]`：普通 Web API、MCP、Internal S2S 一节改为“入口与在途请求边界”，不把请求或回调称为资源；Internal S2S 明确区分新工作命令、在途查询和结果/进度回写，删除没有明确接口含义的 `cleanup 回调`。
 - `2026-07-21` `[用户确认]`：`apps/web` 先列 Meta/Data PG Schema、Doris Database、Kafka Topic 集合和 OSS 前缀集合等项目存储根，再单独说明 Pipeline 业务资源与 migration runner；二者不再合并为同一种资源。
 - `2026-07-21` `[用户确认]`：C1 Kafka producer 关闭自动建 Topic；上线前检查并按项目初始化配置补齐所有 `ENABLE` 项目的预期 Topic。缺失 Topic 时写入进入现有错误日志和重试路径，直到 Topic 修复或 context 取消，不再静默补建；本 spec 不顺便调整 producer 重试和告警体系。
+- `2026-07-22` `[用户确认]`：Restore 只在 `ProjectService` 新增业务方法，PM 不新增 `RestoreInfo` 或 `OnProjectRestore`；Restore 复用 `SetInfo` 表达“项目当前可用”，使用已有配置恢复可用目录，不调用项目资源初始化。新启动或重连组件仍通过当前快照、`OnProjectUpdate`、Scheduler/Dispatch 或懒加载恢复。
+- `2026-07-22` `[用户确认]`：PM 按“进程初始化、模块显式接入、资源 owner 处理”三层描述；app 初始化 PM 不代表其内部所有模块自动受控，只有直接查询 PM、注册 Hook 或通过 Scheduler/Dispatch 间接受控的模块才算覆盖。
+- `2026-07-22` `[用户确认]`：Project Delete 只让确实拥有项目运行资源或可绕过 PM 的模块做最小收敛：入口拒绝新工作，PM Delete Hook 驱逐必要的进程内状态，Scheduler/Dispatch 收敛运行任务。Delete 不扫描或删除业务 Redis、PG、Doris、Kafka、OSS；只有 PM 控制 Key 和会继续驱动执行的派生运行状态允许移除、重写或自然释放。无项目运行资源的模块不增加空 Hook。
+- `2026-07-22` `[用户确认]`：资源台账只回答“项目拥有什么”，不能代替流量入口和运行收敛设计；文档新增“流量入口 → PM 门禁 → 运行资源 → 收敛方式”矩阵，明确区分当前代码事实与改造后目标。`PM.DeleteInfo` 只传播项目不可用状态，不是同步全局流量屏障；Delete 接受 Pub/Sub/快照对账驱动的最终一致收敛，不增加远端 ACK 或每请求直查 Redis。
+- `2026-07-22` `[用户确认]`：`04-detail.md` 现有资源台账内容不得删减。新增流量入口、门禁和收敛说明时，保留既有每项资源、生命周期变化图和适配结论；后续发现遗漏只能补充，不能用新的流量矩阵替代资源台账。
+- `2026-07-22` `[用户确认]`：`04-detail.md` 第 4.2 节的 PM 接入、Hook 缺口、流量入口和运行收敛等覆盖表统一按 `app/包 → 模块` 排列，使用同一模块名称方便横向核对；生命周期动作矩阵继续按动作组织，各组件资源台账继续在 app/module 章节内一行一个资源，不为格式统一改变其职责或删减内容。
 
 ### 1.4 已替代的人工决策
 
@@ -105,6 +111,7 @@
 - `2026-07-20` `[用户确认]`：PM 中是否存在 Project 是所有项目任务的唯一运行开关，不新增 Stop/Delete/Purge 事件或逐任务命令；Master 不生成、Worker 不领取，运行中 handler 在既有 heartbeat 读取 PM 后只取消本地 context、释放 lease。
 - `2026-07-20` `[用户确认]`：Delete 不删除、不 Stop、不标记 `CANCELED`，也不增加 Job/Instance/Task 的业务失败次数；Restore 后由现有 cron/repair 恢复，Delete 期间错过的 cron 不补跑。
 - `2026-07-17` `[用户已确认]`：MCP 在统一项目授权函数补 PM 门禁；Internal S2S 阻断新工作命令，Delete 后允许只读查询和结果/进度回写，进入 `PURGING` 后全部拒绝，静默后才删除底层资源。
+- `2026-07-22` `[自动采纳]`：PM 缺失不能区分 `DISABLE` 与 `PURGING/PURGED`。Internal S2S 新工作只用本地 PM 做 fail-closed 门禁；在途查询和结果/进度回写在 PM 缺失时查询 Global Project 生命周期，只允许 `DISABLE,false` 的既有执行收尾，`PURGING/PURGED/is_deleted=true/NotFound` 全部拒绝。不增加生命周期缓存或粗粒度全局 middleware。
 - `2026-07-17` `[用户已确认]`：Edge、QE、C1 metadata、LiveEvent 和 Asset Behavior 只补真实的项目本地清理；ADTOL、ABOL、Dispatch 和无项目级资源的组件不增加空接口。
 - `2026-07-17` `[用户已确认]`：Wagent claim/start 前检查项目；Delete 期间不 ACK 或丢弃可恢复队列消息。
 - `2026-07-20` `[用户确认]`：Connector、MA 等 Scheduler handler 不自行订阅生命周期信号，统一由 Scheduler Worker 门禁和 heartbeat 控制，不建设组件专属协调器。

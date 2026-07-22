@@ -191,10 +191,11 @@ stateDiagram-v2
 
 - `ENABLE` 项目才存在于 PM 可用项目集合索引和项目运行时快照。
 - Project Delete 调用 `DeleteInfo`；Restore 调用 `SetInfo`。
-- membership、info、Pub/Sub 关键写错误返回调用方。
+- 可用项目集合索引、项目运行时快照和 Pub/Sub 关键写错误返回调用方。
 - 调用节点同步更新本地 PM 状态，不等待自己的订阅回环。
 - Pub/Sub 断线后自动重订阅，并根据 Redis 可用项目集合索引和项目运行时快照对账本地项目 map。
 - 继续使用现有 `OnProjectDelete/OnProjectUpdate` 作为 PM Delete/Update Hook，收敛进程内状态；Scheduler 不依赖新的停止事件、Restore/Purge 事件或远端 ACK。
+- Restore 是 `ProjectService` 的业务方法；PM 不新增 `RestoreInfo/OnProjectRestore`。`SetInfo` 只表达项目当前可用，不调用项目资源初始化。
 
 ### FR-3：Scheduler 与长期任务
 
@@ -205,45 +206,33 @@ stateDiagram-v2
 - Restore 后由现有 cron/repair 恢复，Delete 期间错过的 cron 不补跑；Purge 必须等运行工作停止。
 - Job 位于项目 Meta Schema，Purge 删除 Meta Schema 时一并清理，不逐 Job 删除。
 
-### FR-4：入口和本地资源覆盖
+### FR-4：项目不可用必须覆盖所有工作入口
 
-| 组件/入口 | 代码现状 | Delete/Restore 最小要求 |
-| --- | --- | --- |
-| Web 普通 API | 项目大部分经过 PM；现有 `OrganizationFilter` 不检查状态 | 保留项目门禁；扩展现有 `OrganizationFilter`，组织列表和项目 Create 只接受组织 `ENABLE` |
-| MCP | 绕过 Web `ProjectFilter` | 在统一项目授权函数检查 PM，再做成员和 Token Scope 校验 |
-| Internal S2S API | 只解析 Project Header | start/create/materialize 等新工作命令检查 PM；Delete 后允许只读查询和 finish/update/progress 回写，进入 `PURGING` 后全部拒绝，静默后才删除底层资源 |
-| Edge | 请求依赖 PM，Delete Hook 为空 | 驱逐 token 路由、pipeline version、internal secret 本地 map；Restore 由 update hook 重建 |
-| ADTOL | 每次请求使用 PM Token 查项目 | 已覆盖，不增加 Hook |
-| ABOL | 请求依赖 PM，现有 Hook 关闭 AB Core | 保留实现并补回归测试 |
-| Connector HTTP | AppsFlyer 入口依赖 PM | 已覆盖；debug webhook 不操作项目 |
-| Scheduler/Connector/MA Worker | Worker 不依赖 PM，任务可长期运行 | 统一在 Master/Worker 准入和 heartbeat 处理 |
-| Dispatch/C1 | Delete Hook 只删 `counts`，现有 refresh 会跳过已删除项目但未标记 topology 变化 | 在现有 refresh 标记并移除 Redis task map 项，促使 TaskManager 关闭 Pipeline；额外驱逐 C1 metadata map |
-| MA 运行资源与进程内状态 | ConfigSync 已注册 PM Delete Hook，但 cohort index、watcher、matcher、feedback queue/token cache 未统一驱逐 | 保留 Untrack；由 MA PM Delete Hook 驱逐这些进程内状态，长期 consumer 由 Worker 取消 |
-| QE Catalog | Delete Hook 为空 | Delete 驱逐项目 Catalog，Restore 懒加载 |
-| LiveEvent | WebSocket 建连时只检查一次 | Delete 时关闭项目 Kafka consumer 和 WebSocket；Restore 后按新连接懒启动 |
-| Wagent | HTTP 受 Web 保护，Redis Stream Worker 不检查 PM | claim/start 前检查；禁用时不 ACK 或丢弃可恢复任务 |
-| Asset Behavior | 每项目持有后台 batcher | Delete 时关闭并移除 batcher；Restore 后懒创建 |
-| Pipeline finalizer | 通过 PM 列表运行 | Delete 时自然跳过；Restore 后继续，无额外逻辑 |
+- 只有能从 PM 取得项目的新请求和新任务才能开始执行；Web、SDK、MCP、Internal S2S、Edge、ADTOL、ABOL、Scheduler 和 Dispatch 的项目入口都必须覆盖。
+- `PM.DeleteInfo` 是项目不可用信号，不是同步分布式屏障：调用节点必须立即从本地 PM 驱逐项目，其他节点通过 Pub/Sub 和重连快照对账最终收敛；Delete 不等待远端 ACK，也不要求每个请求直查 Redis。
+- 每个能启动项目工作的入口必须唯一映射到请求门禁、任务/队列领取门禁、运行中 heartbeat 或资源 owner Hook；不能只用“所在 app 已初始化 PM”或“资源已列入台账”证明覆盖完成。
+- Delete 后，入口门禁拒绝新工作；运行中的工作通过 PM Delete Hook、Scheduler heartbeat 或 Dispatch 拓扑刷新收敛。
+- Internal S2S 按语义区分：新工作命令拒绝，Delete 前已启动工作的只读查询和结果/进度回写允许收尾；进入 `PURGING/PURGED` 后拒绝全部项目级调用。Migration 是明确例外，`DISABLE,false` 继续升级，`PURGING/PURGED` 才停止。
+- PM 在 app/进程内初始化，但接入和收敛按模块负责；app 初始化 PM 不等于内部所有模块自动受控。
+- 有可绕过 PM 的进程内路由，或持有 consumer、goroutine、WebSocket、batcher 等运行资源的模块，必须由资源 owner 驱逐或停止。
+- 没有项目运行资源的模块只复用入口门禁，不增加空 Hook、空 Purge 方法或组件专属停止协议。
+- Restore 调用 `PM.SetInfo` 后，从当前时刻恢复新工作；模块通过 PM Update Hook、Scheduler/Dispatch 或懒加载恢复，不回放 Delete 期间的工作。
+- 组件接入方式、资源和代码改动以 `04-detail.md` 第 4–5 章为唯一明细，不在 spec 重复资源台账。
 
-没有项目级资源的组件不得增加空 Purge 方法。
+### FR-5：生命周期动作与资源边界
 
-`04-detail.md` 必须按全部 `apps/*` 顶级目录逐项给出：项目输入与 PM 依赖、持久资源、Scheduler/consumer/goroutine 等运行资源、内存 cache/map、Delete/Restore/Purge 行为、清理 owner、证据文件和测试；`apps/simulator` 等无生产生命周期职责的组件也必须明确记录“已检查、无需改动”。
+| 资源范围 | Delete | Restore | Purge |
+| --- | --- | --- | --- |
+| Global PG 生命周期状态 | 写 `DISABLE` | 写 `ENABLE` | `PURGING -> PURGED`，保留最小墓碑 |
+| PM 可用项目目录 | `DeleteInfo` 移除项目 | `SetInfo` 写回已有配置 | 确认项目保持不存在 |
+| 项目持久数据 | 全部保留，不扫描或改写 | 直接继续使用，不检查或重建 | 由资源 owner 删除并核验不存在 |
+| 运行资源 | 停止新工作，运行中工作逐步收敛 | 重新调度、重新分配或懒启动 | 清理前必须确认静默 |
+| 进程内状态 | 仅驱逐可能继续工作、绕过 PM 或长期陈旧的项目状态 | PM Update Hook 或懒加载重建 | 不作为独立 Purge 步骤 |
+| Redis 项目业务数据 | 保留；按既有 TTL 自然过期的临时数据不扫描 | 继续使用仍存在的数据 | 由对应 owner 定向删除 |
+| Redis 派生运行状态 | 只对会继续驱动执行的 task map、lease 等定向重写、释放或自然过期 | 由现有调度恢复 | owner 定向清理，不删除共享 Key 或其他项目成员 |
+| 跨项目共享资源和客户外部数据 | 保留 | 保留 | 保留 |
 
-### FR-5：持久资源所有权
-
-| 资源 | Delete/Restore | Purge |
-| --- | --- | --- |
-| Global PG 项目/成员/配置 | 保留 | 最终事务清引用和配置/凭据，主记录只保留 OP 识别所需的 `PURGED,true` 墓碑 |
-| Meta PG | 保留并继续 project migration | Drop Schema |
-| Data PG | 保留；当前无独立 migration 类型 | Drop Schema |
-| Doris | 保留并继续 project migration | Drop Database |
-| Kafka Topic/消费组 | 保留 | 删除项目 Topic、Connector/MA 专属组和 LiveEvent 项目组，并验证不存在 |
-| Redis 业务 Key | 自然保留或按既有 TTL 过期；只修改 PM 控制状态 | 清共享项目前缀、权限/QE/Project→Org、Token scope cache、Wagent quota/rate-limit 和全局队列项目成员 |
-| MA 共享/独享 Redis、项目消费组 | Delete 只经 PM/Worker 停止新执行 | 由 MA 的窄内部接口同步清理 |
-| Scheduler Job | 保留 | 随 Meta Schema 删除 |
-| Scheduler Redis 通知/lease | 保留，Restore 后继续 | Scheduler 按 project ID 定向移除全局队列成员和项目 lease Key |
-| OSS | 保留 | 删除 Wave 管理的 `load/backfill/events_cron/users_cron` 四个项目固定前缀 |
-| 进程内 map/consumer/batcher | PM Delete Hook 或入口门禁收敛 | 进程内状态不作为 Purge 步骤 |
+具体的 PG、Doris、Kafka、Redis、OSS、Scheduler 以及各 `apps/*` 资源归属和动作，以 `04-detail.md` 第 4、9 章为准。
 
 ### FR-6：同步可重入 Purge
 

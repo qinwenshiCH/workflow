@@ -14,8 +14,8 @@
 
 核心分工：
 
-- `ProjectService`：状态、权限、短锁和生命周期规则。
-- `ProjectManager`：可用项目目录；Delete/Restore 传播运行开关，不编排 Purge。
+- `ProjectService`：状态、权限、短锁和生命周期规则；提供业务语义明确的 `Delete/Restore/Purge`。
+- `ProjectManager`：可用项目目录；Delete 用 `DeleteInfo`，Restore 复用 `SetInfo`，不新增 Restore/Purge 事件，也不编排 Purge。
 - `ProjectResourcePurger`：Web 内的具体同步编排器，固定顺序调用资源 owner。
 - 资源 owner：真正删除自己管理的数据，并确认资源已不存在。
 
@@ -56,7 +56,7 @@ Organization:
 
 | 动作 | 保证 | 明确不保证 |
 | --- | --- | --- |
-| Delete | 不主动删除项目持久资源；新请求、新任务停止进入 | 远端进程立即 ACK、错过流量/cron 可补偿 |
+| Delete | 不主动删除项目持久资源；本地 PM 收敛后，新请求、新任务停止进入，运行中工作逐步停止 | 瞬时全局屏障、远端进程立即 ACK、错过流量/cron 可补偿 |
 | Restore | DB 和 PM 恢复后，新工作可以重新进入 | 回放被拒请求、补跑 cron、恢复过期 Redis/Kafka 临时状态 |
 | Purge | 已知 Wave 项目资源被 owner 删除并核验，失败可从头重试 | 跨存储原子回滚、客户外部目标数据删除 |
 
@@ -118,6 +118,35 @@ sequenceDiagram
 - PM 先失效，DB 更新失败时 fail-closed；调用方可重复 Delete。
 - 不删除或 Stop Scheduler Job，不扫描 Redis，不改成员、Schema、Topic、OSS 或 Doris。
 - PM 中没有项目后，Master 不生成、Worker 不领取，运行中的 Scheduler handler 在 heartbeat 后取消本地 context 并释放 lease，不写业务失败状态。
+- 只有确实持有项目进程内状态或运行资源的模块通过 PM Delete Hook 做最小收敛；ProjectService 不逐组件调用，不要求无资源模块实现空 Hook。
+- 业务 Redis 全部保留；只有 PM 控制 Key，以及会继续驱动执行的 task map、lease 等派生运行状态可以定向重写、释放或自然过期。
+
+#### 流量停止模型
+
+资源台账回答“项目拥有什么”，流量停止模型回答“谁还能启动工作”。`PM.DeleteInfo` 只发布项目不可用状态；所有项目工作入口必须落在以下四种收敛机制之一：
+
+```mermaid
+flowchart TD
+    Delete["ProjectService.Delete"] --> Directory["PM.DeleteInfo<br/>移除可用项目目录"]
+    Directory --> Local["各进程本地 PM 快照收敛"]
+    Local --> Request["请求门禁"]
+    Local --> Claim["任务与队列领取门禁"]
+    Local --> Heartbeat["运行中任务 heartbeat"]
+    Local --> Hook["长生命周期资源 Delete Hook"]
+    Request --> Reject["拒绝新客户流量"]
+    Claim --> Skip["不创建或领取新工作"]
+    Heartbeat --> Cancel["取消 handler 并释放 lease"]
+    Hook --> Close["关闭 consumer / WebSocket<br/>驱逐路由与项目缓存"]
+```
+
+| 入口类别 | 目标行为 |
+| --- | --- |
+| 普通 Web、MCP、Edge、ADTOL、ABOL、Connector HTTP | 每次请求从本地 PM 判断项目是否可用；OP 生命周期入口是明确例外 |
+| Internal S2S | 新工作命令拒绝；Delete 前已启动工作的只读查询和结果/进度回写继续收尾 |
+| Scheduler、Dispatch、Wagent | 生成或领取前检查 PM；运行中工作通过 heartbeat、topology 或 owner context 收敛 |
+| LiveEvent、Catalog、Asset batcher、组件本地 consumer/cache | owner 只关闭或驱逐自己持有的目标项目资源 |
+
+Migration 不是客户流量：`DISABLE,false` 项目仍执行 Meta/Doris migration，`PURGING/PURGED` 才停止。完整入口、当前缺口和代码改动以 detail 的流量入口矩阵为准。
 
 ### 4.2 Project Restore
 
@@ -137,8 +166,10 @@ sequenceDiagram
 ```
 
 - 已为 `ENABLE,false` 时仍重发 `PM.SetInfo`，修复 DB 成功但 PM 发布失败。
+- `Restore` 只新增在 `ProjectService`；PM 不新增 `RestoreInfo/OnProjectRestore`，`SetInfo` 只表达项目当前可用。
 - 不等待 Scheduler 或各进程 Hook 收敛，不逐项检查项目资源。
 - 不重新初始化、不补 migration、不补 Delete 期间错过的 cron。
+- PM Update Hook、Scheduler/Dispatch 或懒加载根据当前快照恢复运行状态；新启动组件不需要知道项目曾经发生 Restore。
 
 ### 4.3 Project Purge
 
@@ -184,8 +215,19 @@ flowchart TD
 
 - Delete：组织锁内重查子项目；只有全部为 `DISABLE,false` 才执行 `ENABLE -> DISABLE`。
 - Restore：`DISABLE,false -> ENABLE,false`，不 Restore 项目。
-- Purge：要求全部子项目均为 `PURGED,true`，再写 `PURGING`、清组织引用并最终写 `PURGED,true`。
-- Customer Profile、合同、共享 Account、审计和项目墓碑继续保留。
+- Purge：要求全部子项目均为 `PURGED,true`，再写 `PURGING` 后执行，最终提交 `PURGED,true`。
+
+Organization 不拥有 PG Schema、Doris Database、Kafka Topic、OSS prefix 等项目级基础设施资源，Purge 只清理组织引用：
+
+| 顺序 | step | 操作 |
+| --- | --- | --- |
+| 0 | `org_precondition` | 全部子项目 `PURGED,true` |
+| 1 | `org_quiescence` | 确认无活跃写入引用该组织 |
+| 2 | `org_global` | 清邀请、组织成员、role、token scope 中的组织 ID 引用 |
+| 3 | `org_expire_customer` | 调用 `ExpireCustomerByOrgID` 保持客户绑定 `expired` |
+| 4 | `org_verify` | 最终核验 |
+
+Customer Profile、合同、共享 Account、审计和子项目墓碑继续保留。
 
 ## 5. 分布式可靠性
 
@@ -198,7 +240,17 @@ PM 保留现有 `SetInfo/DeleteInfo` 和 Hook 模型。Redis 中的 `sys:{pm}:pr
 3. Pub/Sub 关闭后重订阅。
 4. 重订阅后用可用项目集合索引和项目运行时快照对账本地 map。
 
-不增加 Purge 事件、逐组件 ACK、generation、Stop 信号或逐任务命令。
+PM 接入按三个层次判断：
+
+| 层次 | 责任 |
+| --- | --- |
+| app/进程 | 初始化一个 PM 实例并持有当前可用项目快照 |
+| 模块 | 显式查询 PM、注册 PM Hook，或通过 Scheduler/Dispatch 间接受控 |
+| 资源 owner | 只停止或驱逐自己拥有的项目运行资源和必要进程内状态 |
+
+app 初始化 PM 不代表内部所有模块自动受控。Delete 不建设 ProjectService 到各组件的 RPC fan-out；不增加 Restore/Purge 事件、逐组件 ACK、generation、Stop 信号或逐任务命令。
+
+`DeleteInfo` 也不是同步全局屏障：调用节点在 Redis 写成功后立即驱逐本地快照，其他节点通过 Pub/Sub 和断线后的快照对账最终收敛。为了证明覆盖，每个能启动项目工作的位置必须属于“请求门禁、任务/队列领取门禁、运行 heartbeat、资源 owner Hook”之一；只初始化 PM、只持有 `projectID` 或只出现在资源台账中都不算完成接入。
 
 ### 5.2 资源不能在清理后复活
 
@@ -392,6 +444,7 @@ flowchart TD
 - Delete/Restore 幂等和 PM 部分失败对账。
 - ProjectResourcePurger 固定顺序、失败即停、完整重跑、最终核验和墓碑事务。
 - PM 本地同步、订阅重连和快照对账。
+- 流量入口矩阵逐项验证：普通 Web、MCP、Internal S2S、Edge/ADTOL/ABOL/Connector、Scheduler、Dispatch/C1、Wagent 和 LiveEvent 均在目标检查点拒绝或收敛；Migration 例外单独验证。
 - C1 在 Topic 存在时正常写入；Topic 缺失时进入现有错误日志/重试并且不自动创建；Purge 后残余写入不能复活 Topic。
 - Scheduler 生成/领取/heartbeat 三层门禁和 11 个生产 JobType 覆盖。
 - MA endpoint 鉴权、共享/独享 Redis、消费组删除及重复调用。
@@ -435,6 +488,7 @@ flowchart TD
 - [x] 数据模型和 API 字段明确。
 - [x] Delete/Restore/Purge 的职责、主流程、错误和并发边界明确。
 - [x] PM、ProjectResourcePurger、资源 owner 和 MA 的边界明确。
+- [x] 资源台账与流量入口/运行收敛分层描述，且现有资源台账内容未删减。
 - [x] Purge 防复活、最终核验和可重入保证明确。
 - [x] Restore 的保留与时间性损失边界明确。
 - [x] 单元、集成、分布式和 E2E 测试策略明确。
