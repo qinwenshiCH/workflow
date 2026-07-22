@@ -40,13 +40,16 @@
 - `project.status` 现有值为 `INITIALIZING`、`ENABLE`、`DISABLE`；旧项目 Delete 是生产代码中 `DISABLE` 的主要写入点，没有发现独立的租户“暂停项目”功能。
 - 旧项目 Delete 会删除 usage metering Job、Doris Database、Meta/Data PG Schema、Kafka Topic，软删除项目成员和项目主记录，并从 PM 移除项目；它不能直接作为可恢复 Delete。
 - 旧 Project Delete 先写 `status=DISABLE`，随后把主记录 `is_deleted=true`，因此历史软删除主记录通常是 `DISABLE,true`；`GetByIDWithDeleted` 可直接读取。当前 worktree 未发现自动物理删除 project 主记录的生产清理机。
-- Project migration 使用 `GetAllNotDeletedProjects`，因此所有 `is_deleted=false` 项目（包括 `DISABLE`）都会继续执行 Meta/Data migration。
+- Project migration 使用 `GetAllNotDeletedProjects`，因此所有 `is_deleted=false` 项目（包括 `DISABLE`）都会继续执行 Meta PG/Doris migration；当前 framework 没有 Data PG migration 类型。
 - PM 的直接 Hook 使用方包括 Edge、Connector、ABOL、MA ConfigSync、QE Catalog 和 Dispatch；ADTOL 通过每次请求的 PM Token 查询阻断项目。
+- PM Redis 中 `sys:{pm}:projects` 是可用 project ID 集合索引，`sys:{pm}:info:<pid>` 是包含 Secret、状态、Schema/Database/Topic、配额和配置的 `pm.Info` JSON 快照，`sys:{pm}:info_change` 是 set/delete 变更频道；文档中不再把前两者统称为含义模糊的 membership/info。
 - 现有 `OrganizationFilter` 主要为 Account API Token 提取组织 ID；普通会话会提前放行，且中间件不检查组织状态。Role 等组织资源也并非全部经过 `OrgService.getOrgOrFail`，组织 Delete 不能只在 Service 层加门禁。
 - 不能只依赖 PM Delete/Update Hook：MCP 根路由、Internal S2S API、LiveEvent 长连接、Wagent Redis Stream Worker，以及 Scheduler 已加载 cron/notify 和 Worker 均存在需要单独门禁的路径。
 - C1 由 Dispatch 间接接收项目拓扑删除并关闭 Pipeline，但 `Node.OnProjectDelete` 只删 `counts`，现有 `refreshTopo` 对 Redis 中已移除项目只跳过、不标记 changed，可能不重写 task map；此外 C1 项目 metadata map 仍需单独驱逐。
+- Project 初始化会显式创建 `df_<pid>_{raw_event,event,other,error}` 四类 Kafka Topic，并设置分区和 retention；C1 loader 是当前唯一显式启用 `AllowAutoTopicCreation=true` 的生产 writer，Edge 使用默认 false、Connector 显式 false。关闭 C1 自动创建前需要检查并按初始化配置补齐全部 `ENABLE` 项目的预期 Topic。
 - Scheduler 生产 Worker 分布在 Web、Connector、MA；项目门禁和长期任务取消应优先在 Scheduler Master/Worker 中心入口完成，不逐组件建设生命周期协调器。
 - Scheduler 当前有 11 个生产 JobType 注册：Web 8 个（cohort、cohort-clean、ab-report、asset-metrics、asset-ref-wal、events-view、event-stat、usage-metering），Connector 1 个（pipeline），MA 2 个（ma-time-fire、ma-event-trigger）。
+- Internal S2S Pipeline 接口同时包含新工作命令、在途查询和结果/进度回写：`run/start`、`load-file/create`、`ma/materialize-fanout` 会创建新工作；`pipeline/run/load-file/backfill` 的 update/finish/advance/complete 只收敛既有执行状态、日志和统计。当前没有通用 `cleanup` 回调。
 - Scheduler 的 job/job-instance/job-task notify 使用全局 Redis List/ZSet，project ID 编码在 value/member 中；Instance heartbeat 和 Task lease 则使用带 project ID 的独立 Key。Project Purge 不能只扫描 `p:<pid>:*`，需要 Scheduler 按自身编码定向清理。
 - MA 运行资源同时使用共享和独享 Redis，项目 Key 形如 `ma:{p:<pid>}:*`，Web 没有独享 Redis 的连接配置；完整 Purge 需要由 MA 自己通过窄的内部接口同步清理两个 Redis，不能在 PM Delete Hook 中删除。
 - `cmd/ma` 的健康端口使用原生 `http.ServeMux`，当前不初始化 Global DB，也不挂 Web 的 Gin `internalauth`；单个 Web→MA Purge endpoint 复用专用环境变量 Secret 比为 MA 增加 Global DB/scope 依赖更小。
@@ -58,3 +61,4 @@
 - 共享 Redis 中项目权限（`sol:perm:v5:account_perm:pid:<pid>:`）、资产权限、QE refresh lock、Project→Org cache 和 Account API Token scope cache 都不完全落在 `p:<pid>:` 下；Purge 需要按各自既有 key 规则清理，不能只做一次通用 prefix scan。
 - `apps` 顶级目录共有 `abol/adtol/c1/connector/edge/ma/simulator/web` 八个；`apps/simulator` 不初始化 PM、不注册生产 Scheduler handler，也不拥有 Wave 项目持久资源。
 - `pkg/dal/dorisx` 的 `ddlLocks` 是按 project ID 缓存的进程内 mutex map；它不保存业务数据，不能在仍有 goroutine 持锁时安全按项目替换，生命周期中应视为随进程释放的同步残留，而非 Purge 资源。
+- Migration runner 的 `DBType` 只有 `global/meta/doris`：Global migration 执行一次，Meta/Doris migration 按项目执行，结果写入 Global PG `migration_history`；没有 Data PG migration 类型。Pipeline 是项目业务资源，只有某个 migration 修改 Pipeline 表时二者才发生结构升级关系。

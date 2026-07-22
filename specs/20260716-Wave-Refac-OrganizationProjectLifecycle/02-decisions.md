@@ -38,18 +38,26 @@
 - `2026-07-17` `[用户确认]`：先评审准确 plan，再生成 detail。
 - `2026-07-20` `[用户确认]`：采纳本轮全部 `/ponytail` 收缩建议：不用审计表模拟 Purge receipt，不建设 `purgeStep` 框架，不让长 TTL 锁承担正确性，不扩张通用 Redis 清理接口。
 - `2026-07-20` `[用户确认]`：`04-detail.md` 按 `apps/*` 顶级组件及共享项目基础设施梳理项目入口、持久资源、运行资源、进程内状态和 Delete/Restore/Purge 行为；`01-spec.md` 只定义覆盖要求，`03-plan.md` 只保留总览，避免重复堆叠实现细节。
-- `2026-07-20` `[用户确认]`：`04-detail.md` 的组件章节先用控制、可用性、运行、数据四个平面建立整体认知，再按职责分组覆盖全部 `apps/*`；以全景图和统一资源/动作矩阵为主，减少叙述性文字，但必须明确每项资源及 Delete/Restore/Purge 的变化。
+- `2026-07-20` `[用户确认]`：`04-detail.md` 的组件章节先用生命周期控制状态、可用性、运行、项目业务数据四个职责平面建立整体认知，再按职责分组覆盖全部 `apps/*`；职责平面与持久资源/运行资源/进程内状态/入口门禁等资源形态分开，以全景图和统一资源/动作矩阵为主。
 - `2026-07-20` `[用户确认]`：`04-detail.md` 表格中的多项资源和动作使用列表标记，避免把多个概念塞进连续句子；同一含义统一使用“持久资源、运行资源、进程内状态、入口门禁、清理 owner、PM Delete Hook、PM Update Hook”等术语，并删除总览与组件明细之间的重复信息。
 - `2026-07-20` `[用户确认]`：Markdown 表格单元不使用 HTML `<br>` 做换行；表格只保留单行摘要，多项资源和动作改为表格外的真实 Markdown 无序/有序列表。Mermaid 图中的 `<br>` 保留为图内换行语法。
-- `2026-07-20` `[用户确认]`：调整 04-detail 组件章节为“模块 Mermaid 流程图 + 资源台账表”；流程图描述资源创建、使用链路和生命周期介入点，台账表一行一个资源，列出类型、来源、使用链路、Delete、Restore、Purge 及清理 owner；无独立项目资源的组件只保留结论表。
+- `2026-07-20` `[用户确认]`：调整 04-detail 组件章节为“模块 Mermaid 流程图 + 资源台账表”；流程图描述资源生命周期变化，台账表一行一个资源，列出类型、来源、内容与作用、Delete、Restore、Purge 及清理 owner；无独立项目资源的组件只保留结论表。
 - `2026-07-20` `[用户确认]`：组件章节固定为“资源清单表 → 资源生命周期变化图 → 适配结论”；表格先说明资源内部情况，图再展示资源在 `ENABLE/DISABLE/PURGED` 三状态和 Delete/Restore/Purge 动作之间的变化，删除或弱化抽象的资源关系图；无项目资源的组件只保留结论表并说明不绘图。
 - `2026-07-20` `[用户确认]`：删除 `4.5.1 生命周期与准入图`，保留 `4.2 Wave 项目全链路` 作为唯一全局总览；`apps/web` 后续章节顺延编号，避免重复控制面图。
 - `2026-07-20` `[用户确认]`：生命周期图不在资源节点中混写“持久资源/运行资源”等类型；改用 `Global PG`、`PM Redis`、`Kafka`、`进程内存`、`运行中` 等载体框表达资源位置，资源表继续保留生命周期类型列；同一状态内部不绘制资源依赖箭头。
 - `2026-07-20` `[用户确认]`：生命周期图改为三状态外层框架 `ENABLE/DISABLE/PURGED`；`Restore` 不再单独建状态框，而是用 `DISABLE -.-> ENABLE` 回退箭头表示；Delete、Purge 使用实线，Restore 虚线仅用于区分回退方向，不表示异步；每项资源在三个状态中完整出现。
 - `2026-07-20` `[用户确认]`：生命周期图箭头标签统一使用“动作：资源结果”；资源没有变化时必须明确写“`不变`”，不得只用“保留”或省略动作，避免读者误以为资源变化未说明。
+- `2026-07-21` `[用户确认]`：ProjectService 只负责生命周期校验、短锁、状态切换和最终 Global PG 事务；Web 内新增具体的 `ProjectResourcePurger` 按固定顺序同步编排，各资源 owner 负责真正删除和确认资源不存在。它不是通用协调器，不提供 owner 接口、动态注册、步骤配置或执行表。
+- `2026-07-21` `[用户确认]`：`03-plan.md` 只回答顶层职责、核心流程、可靠性和取舍；`04-detail.md` 从文件/函数与组件维度说明具体实现，避免在两份文档重复资源介绍。
+- `2026-07-21` `[用户确认]`：允许在保持“资源台账 → 生命周期变化图 → 适配结论”风格不变的前提下修正 `04-detail.md` 第 4 章；职责平面和资源形态分开描述，Global PG 明确为“生命周期控制状态的持久化存储”，Meta/Data PG、Doris、Kafka、Redis、OSS 统一称为“项目业务数据”。
+- `2026-07-21` `[用户确认]`：资源台账不再只给资源名和类型，统一用“内容与作用”说明保存或承载什么、供谁使用；PM 的 `membership/info` 分别改称“可用项目集合索引”和“项目运行时快照”，避免与成员关系混淆。
+- `2026-07-21` `[用户确认]`：普通 Web API、MCP、Internal S2S 一节改为“入口与在途请求边界”，不把请求或回调称为资源；Internal S2S 明确区分新工作命令、在途查询和结果/进度回写，删除没有明确接口含义的 `cleanup 回调`。
+- `2026-07-21` `[用户确认]`：`apps/web` 先列 Meta/Data PG Schema、Doris Database、Kafka Topic 集合和 OSS 前缀集合等项目存储根，再单独说明 Pipeline 业务资源与 migration runner；二者不再合并为同一种资源。
+- `2026-07-21` `[用户确认]`：C1 Kafka producer 关闭自动建 Topic；上线前检查并按项目初始化配置补齐所有 `ENABLE` 项目的预期 Topic。缺失 Topic 时写入进入现有错误日志和重试路径，直到 Topic 修复或 context 取消，不再静默补建；本 spec 不顺便调整 producer 重试和告警体系。
 
 ### 1.4 已替代的人工决策
 
+- `2026-07-21` `[已替代]`：本轮重构不得改动 `04-detail.md` 第 4 章 → 后续评审发现职责平面、资源形态、入口和运行过程混用，允许保持既有风格进行局部重构。
 - `2026-07-20` `[已替代]`：生命周期图使用四状态外层框架，并将 `RESTORE` 作为独立状态展示 → 改为 `ENABLE/DISABLE/PURGED` 三状态，Restore 只作为回退动作。
 - `2026-07-16` `[已替代]`：暂不接入审计 → 本期复用现有 OP 审计。
 - `2026-07-16` `[已替代]`：新增全局生命周期页面 → 改为客户详情生命周期 Tab。
@@ -93,10 +101,10 @@
 ### 2.3 PM、运行面与组件覆盖
 
 - `2026-07-17` `[用户已确认]`：PM 只承担可用项目目录和 Delete/Restore 传播；Delete 用 `DeleteInfo`，Restore 用 `SetInfo`；Purge 只复用 `DeleteInfo` 确保项目已从 PM 消失，不增加 Purge 事件或由 PM 编排清理。
-- `2026-07-17` `[用户已确认]`：补强 PM 写错误上抛、调用节点本地同步、订阅重连和 membership/info 快照对账；不增加 Restore/Purge 事件、ACK 或协调器。
+- `2026-07-17` `[用户已确认]`：补强 PM 写错误上抛、调用节点本地同步、订阅重连和“可用项目集合索引 + 项目运行时快照”对账；不增加 Restore/Purge 事件、ACK 或协调器。
 - `2026-07-20` `[用户确认]`：PM 中是否存在 Project 是所有项目任务的唯一运行开关，不新增 Stop/Delete/Purge 事件或逐任务命令；Master 不生成、Worker 不领取，运行中 handler 在既有 heartbeat 读取 PM 后只取消本地 context、释放 lease。
 - `2026-07-20` `[用户确认]`：Delete 不删除、不 Stop、不标记 `CANCELED`，也不增加 Job/Instance/Task 的业务失败次数；Restore 后由现有 cron/repair 恢复，Delete 期间错过的 cron 不补跑。
-- `2026-07-17` `[用户已确认]`：MCP 在统一项目授权函数补 PM 门禁；Internal S2S 只阻断新工作入口，保留 finish/update/cleanup 回调。
+- `2026-07-17` `[用户已确认]`：MCP 在统一项目授权函数补 PM 门禁；Internal S2S 阻断新工作命令，Delete 后允许只读查询和结果/进度回写，进入 `PURGING` 后全部拒绝，静默后才删除底层资源。
 - `2026-07-17` `[用户已确认]`：Edge、QE、C1 metadata、LiveEvent 和 Asset Behavior 只补真实的项目本地清理；ADTOL、ABOL、Dispatch 和无项目级资源的组件不增加空接口。
 - `2026-07-17` `[用户已确认]`：Wagent claim/start 前检查项目；Delete 期间不 ACK 或丢弃可恢复队列消息。
 - `2026-07-20` `[用户确认]`：Connector、MA 等 Scheduler handler 不自行订阅生命周期信号，统一由 Scheduler Worker 门禁和 heartbeat 控制，不建设组件专属协调器。
@@ -110,6 +118,9 @@
 - `2026-07-20` `[自动采纳]`：带 project label 的 metrics、日志和 trace 属于可观测历史，沿用各自 retention，不在同步 Purge 中建设逐进程或远端监控删除接口；它们不得继续驱动项目工作。
 - `2026-07-20` `[自动采纳]`：当前生产 Scheduler 共注册 11 个 JobType：Web 8 个、Connector 1 个、MA 2 个；统一由 Scheduler Master/Worker/heartbeat 的 PM 门禁覆盖，不按 handler 复制生命周期逻辑。
 - `2026-07-20` `[自动采纳]`：`apps/simulator` 不初始化 PM、不注册生产 Scheduler handler、也不拥有 Wave 项目存储；只在 detail 明确“已检查、无需改动”，不增加空接口。
+- `2026-07-21` `[用户已确认]`：`ProjectResourcePurger` 位于 Web，但不替其他进程清理其私有资源；Web 通过窄 client 调用 MA 内部 Purge endpoint，MA Runtime 清理自身共享/独享 Redis 和项目消费组并在确认不存在后返回。多 MA 副本依靠 PM/Scheduler 统一停止进程内工作，不做逐 Pod HTTP fan-out。
+- `2026-07-21` `[自动采纳]`：Purge 在最终 Global PG 事务前对第 4 章列出的已知资源做一次显式最终核验；核验由各 owner 的既有查询或幂等清理方法完成，不建设通用 `Verify` 接口。
+- `2026-07-21` `[自动采纳]`：Purge 删除资源前必须满足“写入者已停止，或现有入口门禁已保证资源不能被重建”。Kafka producer 关闭自动建 Topic，项目级 PG/Doris/Kafka 容器只能由受状态约束的初始化路径创建；Redis/OSS 等运行数据在对应 writer 静默后清理，不引入 generation fencing。
 
 ### 2.4 Restore 保证与失败边界
 
@@ -132,13 +143,13 @@
 ### 2.6 已替代、拒绝与延期
 
 - `2026-07-17` `[已替代]`：`status=DELETED` 表示 Delete → 清理历史数据后复用 `DISABLE`。
-- `2026-07-17` `[已替代]`：项目 Redis deny Key 作为额外围栏 → 复用 PM membership/info 和关键入口门禁。
+- `2026-07-17` `[已替代]`：项目 Redis deny Key 作为额外围栏 → 复用 PM 可用项目集合索引、项目运行时快照和关键入口门禁。
 - `2026-07-17` `[已替代]`：Delete 删除 Scheduler Job/lease → 数据保留，只阻止新执行；所有运行中 handler 由既有 heartbeat 本地取消并释放 lease。
 - `2026-07-17` `[已替代]`：Restore 逐资源检查并等待收敛 → Restore 轻量立即恢复。
 - `2026-07-17` `[已替代]`：组织名/项目名切换全表唯一索引 → 继续使用现有部分索引。
 - `2026-07-20` `[已替代]`：Purge 开始统一设置 `is_deleted=true` → 新数据进行中使用 `PURGING,false`，历史 `DISABLE,true` 保持 true 进入 `PURGING,true`，两者只有成功结束才写 `PURGED,true`。
 - `2026-07-20` `[已替代]`：表格单元中的多项资源和动作使用列表 → 改为“模块 Mermaid 流程图 + 一行一个资源的资源台账表”。
-- `2026-07-20` `[已替代]`：固定 `purgeStep{name,run}` 切片 → Service 内显式顺序调用并在错误上附稳定 step。
+- `2026-07-20` `[已替代]`：固定 `purgeStep{name,run}` 切片 → 具体 `ProjectResourcePurger` 内使用直线式固定顺序调用，并在错误上附稳定 step。
 - `2026-07-20` `[已替代]`：成功后重复 Purge 通过审计反查返回 `already_absent` → `PURGED` 墓碑直接返回已完成，墓碑不存在时 NotFound。
 - `2026-07-20` `[已替代]`：生命周期锁覆盖整个重 Purge 并设置长 TTL → 既有锁只保护短状态竞争，`PURGING` 条件更新和幂等删除保证正确性。
 - `2026-07-20` `[已替代]`：Project Delete 要求父 Organization `ENABLE,false` → Delete 不检查父组织状态；Restore/Create 仍要求父组织可用。
