@@ -137,7 +137,7 @@ stateDiagram-v2
 验收场景：
 
 1. `ENABLE` 项目不能 Purge；`DISABLE`、`INITIALIZING` 和 `PURGING` 可以执行或重试，包括历史 `DISABLE/PURGING,is_deleted=true`。
-2. 新数据写 `PURGING,false`，历史软删除数据写 `PURGING,true`；随后确保 PM 移除项目，再检查 Scheduler、Dispatch、Wagent 等运行面已经静默，未静默则保留当前组合并返回冲突。
+2. 新数据写 `PURGING,false`，历史软删除数据写 `PURGING,true`；随后确保 PM 移除项目。
 3. Service 使用显式顺序调用执行资源清理；目标资源不存在视为成功，任一步失败则停止，重试从第一步开始。
 4. Purge 期间始终禁止 Restore；进入清理后保持原 `is_deleted`，直到新数据在最终事务由 false 改为 true。
 5. Kafka、OSS 等最终一致资源在各自步骤内验证。
@@ -221,18 +221,15 @@ stateDiagram-v2
 
 ### FR-5：生命周期动作与资源边界
 
-| 资源范围 | Delete | Restore | Purge |
-| --- | --- | --- | --- |
-| Global PG 生命周期状态 | 写 `DISABLE` | 写 `ENABLE` | `PURGING -> PURGED`，保留最小墓碑 |
-| PM 可用项目目录 | `DeleteInfo` 移除项目 | `SetInfo` 写回已有配置 | 确认项目保持不存在 |
-| 项目持久数据 | 全部保留，不扫描或改写 | 直接继续使用，不检查或重建 | 由资源 owner 删除并核验不存在 |
-| 运行资源 | 停止新工作，运行中工作逐步收敛 | 重新调度、重新分配或懒启动 | 清理前必须确认静默 |
-| 进程内状态 | 仅驱逐可能继续工作、绕过 PM 或长期陈旧的项目状态 | PM Update Hook 或懒加载重建 | 不作为独立 Purge 步骤 |
-| Redis 项目业务数据 | 保留；按既有 TTL 自然过期的临时数据不扫描 | 继续使用仍存在的数据 | 由对应 owner 定向删除 |
-| Redis 派生运行状态 | 只对会继续驱动执行的 task map、lease 等定向重写、释放或自然过期 | 由现有调度恢复 | owner 定向清理，不删除共享 Key 或其他项目成员 |
-| 跨项目共享资源和客户外部数据 | 保留 | 保留 | 保留 |
+项目资源按所有权分为三类。所有组件行为遵循统一规则：
 
-具体的 PG、Doris、Kafka、Redis、OSS、Scheduler 以及各 `apps/*` 资源归属和动作，以 `04-detail.md` 第 4、9 章为准。
+| 资源类别 | 所有权 | Delete | Restore | Purge |
+| --- | --- | --- | --- | --- |
+| **持久资源** | 项目独占——Global PG 状态、PM 目录、PG Schema、Doris DB、Kafka Topic、OSS 前缀、Redis 业务数据 | 全部保留；状态写 `DISABLE`；`DeleteInfo` 移除 PM 目录；Redis 业务数据保留，按既有 TTL 自然过期 | 不检查、不重建；状态写回 `ENABLE`；`SetInfo` 写回 PM | 由 owner 物理删除并核验；Redis 定向清理；PM 确认不存在；保留 `PURGED` 墓碑 |
+| **运行资源** | 进程内或项目级——内存 map、consumer goroutine、WebSocket、cache、Scheduler job、Redis lease/task map | PM Hook 主动收敛；进程内状态驱逐（仅可能继续工作或绕过 PM 的）；Redis 派生状态定向重写或释放 | 懒加载重建或重新领取，不主动重建 | 清理前已由 Delete 阶段收敛，不作为独立 Purge 步骤 |
+| **共享资源** | 跨项目——全局 Kafka producer、全局 loader、客户外部数据 | 保留 | 保留 | 保留 |
+
+具体的 PG、Doris、Kafka、Redis、OSS、Scheduler 以及各 `apps/*` 资源归属和动作，以 `04-detail.md` 为准。
 
 ### FR-6：同步可重入 Purge
 
@@ -332,7 +329,7 @@ LifecycleProject {
 - 空客户绑定返回 `organization=null,projects=[]`。
 - Organization Delete 对大量项目只返回有限 blocked IDs 和总数，不级联处理。
 - 并发 Delete/Restore/Purge 由锁和条件 UPDATE 保证单一有效转换。
-- Restore 不等待运行面收敛；Purge 在运行工作未停止时返回冲突。
+- Restore 不等待运行面收敛；Purge 依赖 Delete 阶段的收敛结果。
 - Purge 部分成功后只能重试 Purge，不能 Restore。
 
 ## 9. 长期 Delete 后的 Restore 保证

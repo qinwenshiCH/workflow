@@ -60,7 +60,25 @@ Organization:
 | Restore | DB 和 PM 恢复后，新工作可以重新进入 | 回放被拒请求、补跑 cron、恢复过期 Redis/Kafka 临时状态 |
 | Purge | 已知 Wave 项目资源被 owner 删除并核验，失败可从头重试 | 跨存储原子回滚、客户外部目标数据删除 |
 
-因此 Restore 是“从当前时刻恢复”，不是“任意时长绝对无损”。
+因此 Restore 是”从当前时刻恢复”，不是”任意时长绝对无损”。
+
+### 2.3 资源分类与生命周期行为规则
+
+项目资源按**所有权和生命周期敏感度**分为三类，所有组件的资源行为遵循统一规则：
+
+| 类别 | 所有权 | 典型资源 | Delete | Restore | Purge |
+| --- | --- | --- | --- | --- | --- |
+| **持久资源** | 项目独占 | PG Schema、Doris DB、Kafka Topic、OSS Prefix | 保留 | 保留（不检查、不重建） | 删除 |
+| **运行资源** | 进程内或项目级运行时 | 内存 map、consumer goroutine、WebSocket、cache、Redis key、Scheduler job | PM Hook 主动收敛 | 懒加载重建或重新领取 | 随上两类清理 |
+| **共享资源** | 跨项目 | 全局 Kafka producer、全局 loader、ETL 系统外部目标 | 不处理 | 不处理 | 不处理（项目不拥有） |
+
+**持久资源原则**：Delete/Restore 是可逆操作，持久数据必须保留；只有 Purge（不可逆）才能物理删除。因此 PG Schema、Doris DB、Kafka Topic、OSS 前缀在 Delete/Restore 阶段全部”不动”——不是实现没做，是设计就不该动。
+
+**运行资源原则**：项目 Delete 后进程不重启，内存状态和运行中连接必须通过 PM Hook 主动收敛。但 Restore 不主动重建——组件在收到新请求时通过正常业务路径懒加载恢复，减少 PM 负担和 Restore 失败的反向影响。
+
+**共享资源原则**：如果一个资源在多个项目间共用（如 Edge 的 Kafka producer），它不能因为单个项目的生命周期而关闭。这类资源不纳入任何生命周期操作。
+
+这三条规则覆盖 detail.md 中所有资源台账的每一行行为。读者先理解规则，再看表格时就自然知道”为什么这行是保留、那行是删除”。例外情况（如 Purge 中 Scheduler job 等运行资源先于持久资源清理）在 Purge 固定顺序中单独说明。
 
 ## 3. 顶层职责
 
@@ -184,7 +202,7 @@ flowchart TD
     C -->|"首次 Purge"| D["条件写入 PURGING，保持原 is_deleted"]
     C -->|"PURGING 重试"| E["继续执行"]
     D --> E
-    E --> F["PM 移除并等待写入者静默或被门禁"]
+    E --> F["PM 移除"]
     F --> G["ProjectResourcePurger 固定顺序清理"]
     G --> H["最终核验全部已知资源"]
     H --> I["Global PG 最终事务"]
@@ -198,16 +216,15 @@ flowchart TD
 | 顺序 | 稳定 step | owner 职责 |
 | --- | --- | --- |
 | 0 | `project_pm` | 确认 PM 不含项目 |
-| 1 | `project_quiescence` | 确认 writer 已停止或无法重建待删资源 |
-| 2 | `project_redis` | Scheduler、Wagent 和 Web Redis owner 定向清理 |
-| 3 | `project_ma` | MA 清共享/独享 Redis、项目消费组并自检 |
-| 4 | `project_oss` | 清四类 Wave 管理前缀并确认空 |
-| 5 | `project_kafka` | 清项目 Topic/专属消费组并轮询确认不存在 |
-| 6 | `project_doris` | Drop 项目 Database |
-| 7 | `project_pgdata` | Drop Data Schema |
-| 8 | `project_meta` | Drop Meta Schema，项目 Job 随 Schema 删除 |
-| 9 | `project_verify` | 对第 4 章已知资源做最终核验 |
-| 10 | `project_global` | ProjectService 在短事务中清引用和敏感字段，提交 `PURGED,true` |
+| 1 | `project_redis` | Scheduler、Wagent 和 Web Redis owner 定向清理 |
+| 2 | `project_ma` | MA 清共享/独享 Redis、项目消费组并自检 |
+| 3 | `project_oss` | 清四类 Wave 管理前缀并确认空 |
+| 4 | `project_kafka` | 清项目 Topic/专属消费组并轮询确认不存在 |
+| 5 | `project_doris` | Drop 项目 Database |
+| 6 | `project_pgdata` | Drop Data Schema |
+| 7 | `project_meta` | Drop Meta Schema，项目 Job 随 Schema 删除 |
+| 8 | `project_verify` | 对第 4 章已知资源做最终核验 |
+| 9 | `project_global` | ProjectService 在短事务中清引用和敏感字段，提交 `PURGED,true` |
 
 每步不存在资源即成功；任一步失败都保留当前 `PURGING,is_deleted` 组合并返回稳定 step。下一次调用重新构造快照，从第 0 步执行。已完成步骤必须幂等，不做反向补偿。
 
@@ -222,10 +239,9 @@ Organization 不拥有 PG Schema、Doris Database、Kafka Topic、OSS prefix 等
 | 顺序 | step | 操作 |
 | --- | --- | --- |
 | 0 | `org_precondition` | 全部子项目 `PURGED,true` |
-| 1 | `org_quiescence` | 确认无活跃写入引用该组织 |
-| 2 | `org_global` | 清邀请、组织成员、role、token scope 中的组织 ID 引用 |
-| 3 | `org_expire_customer` | 调用 `ExpireCustomerByOrgID` 保持客户绑定 `expired` |
-| 4 | `org_verify` | 最终核验 |
+| 1 | `org_global` | 清邀请、组织成员、role、token scope 中的组织 ID 引用 |
+| 2 | `org_expire_customer` | 调用 `ExpireCustomerByOrgID` 保持客户绑定 `expired` |
+| 3 | `org_verify` | 最终核验 |
 
 Customer Profile、合同、共享 Account、审计和子项目墓碑继续保留。
 
@@ -254,7 +270,7 @@ app 初始化 PM 不代表内部所有模块自动受控。Delete 不建设 Proj
 
 ### 5.2 资源不能在清理后复活
 
-Purge 不仅等待“当前没有任务”，还要求每类 writer 满足以下条件之一：
+Purge 删除底层资源时，要求每类 writer 满足以下条件之一（由 Delete 阶段的 PM Hook 和入口门禁保证）：
 
 - 已通过 PM/Scheduler heartbeat 停止；
 - 已有入口门禁拒绝创建；
@@ -393,7 +409,7 @@ flowchart TD
 | PM Delete 成功、DB Delete 失败 | 项目暂时 fail-closed | 重复 Delete/Restore 对账 |
 | DB Restore 成功、PM SetInfo 失败 | DB 为 ENABLE，运行面仍不可用 | 重复 Restore 重发 PM |
 | PM Pub/Sub 丢失 | 远端本地 map 暂时陈旧 | 重订阅快照对账 |
-| Purge writer 未静默 | 保留 `PURGING`，返回 `project_quiescence` | 等待后重试 |
+| Purge 步骤失败 | 保留 `PURGING`，返回失败 step | 重试 Purge 从第一步开始 |
 | Purge owner 或最终核验失败 | 保留 `PURGING` 和稳定 step | 修复依赖后从头重试 |
 | Purge 请求超时/取消 | 已删除资源不回滚 | 刷新状态后人工重试 |
 | 目标已 `PURGED,true` | 成功返回当前墓碑 | 不重跑 |
