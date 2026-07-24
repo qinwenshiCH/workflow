@@ -657,7 +657,7 @@ Wagent 接收三类流量：
 | 存储位置 | 资源 | 类型 | 内容与作用 | 代码文件 | 搜索关键词 |
 | --- | --- | --- | --- | --- | --- |
 | Meta PG | wagent_conversation、message | 持久资源 | 持久化 AI 对话和消息记录，支撑用户查看和恢复历史会话 | `apps/web/wagent/dao/conversation.go` | wagent_conversation / Message |
-| 共享 Redis | execution 队列 | 可恢复队列 | 全局 List `wagent:execution:queue` 存 `projectID:executionID` 格式成员，由 `BRPop` 领取；项目状态只能出队解码后检查 | `apps/web/wagent/service/runtime/queue.go` | LPush / BRPop |
+| 共享 Redis | execution 队列 | 可恢复队列 | 全局 Stream `wagent:{wagent}:execution:stream` 存 `projectID/executionID/kind` 字段，由 `XReadGroup` 按 consumer group 领取；项目状态只能在出队解码后检查 | `apps/web/wagent/service/runtime/queue.go` | XADD / XReadGroup |
 | 共享 Redis | execution 协调 Key | 运行资源 | `p:<pid>:` 前缀 key 组，覆盖 execution 数据、claim 锁、cancel 标记、active_lock/active_execution。写入时指定 TTL 30min，心跳续约；Delete 停止续约后到期自动过期 | `apps/web/wagent/service/runtime/` | executionKey / activeLockKey |
 | 共享 Redis | quota Key | 运行资源 | `{pid:week}` 哈希标签 key，限制项目 AI 的周配额消耗。Lua 脚本写入时指定 TTL（当前周剩余+7天宽限期），Delete 后无新写入自动过期 | `apps/web/wagent/service/tokenquota/service.go` | quotaKeyTag |
 | 共享 Redis | rate-limit Key | 运行资源 | 限制项目 AI 调用速率。自增时指定 TTL 1-4min，到期自动过期，不依赖 Delete/Purge 清理 | `apps/web/wagent/service/ratelimit/ratelimit.go` | rate-limit Key |
@@ -723,7 +723,7 @@ flowchart LR
     DLease -.->|Restore：—| ELease
     DQuota -.->|Restore：—| EQuota
     DRateLimit -.->|Restore：—| ERateLimit
-    DRunning -.->|Restore：重建| ERunning
+    DRunning -.->|Restore：懒加载| ERunning
     DMsg -->|Purge：删除| PMsg
     DQueue -->|Purge：—| PQueue
     DLease -->|Purge：—| PLease
@@ -785,7 +785,7 @@ sequenceDiagram
 
 | 文件 | 改动 |
 | --- | --- |
-| `web/wagent/service/runtime/` | 先用现有 execution ownership/pending heartbeat 确认 handler 已退出；项目级 key（含 `p:<pid>:` 前缀）已有 TTL 30min，Delete 停止续约后到期自动过期，不主动清理；全局 List + Sorted Set 因跨项目混合无法按 project_id 清理，— |
+| `web/wagent/service/runtime/` | 先用现有 execution ownership/pending heartbeat 确认 handler 已退出；项目级 key（含 `p:<pid>:` 前缀）已有 TTL 30min，Delete 停止续约后到期自动过期，不主动清理；全局 Stream（execution 队列）跨项目混合、按 execution 的 Sorted Set（event 日志）以 executionID 为 key，均无法按 project_id 清理，— |
 | `web/wagent/service/tokenquota/` | quota Key 已有 TTL（本周剩余+7天宽限期），Delete 不再有新 execution 创建写入后到期自动过期，不主动清理 |
 | `web/wagent/service/ratelimit/` | rate-limit Key 全局共享且自身 TTL 较短（1-4min），不主动清理 |
 
@@ -1172,7 +1172,7 @@ flowchart LR
     DMap -.->|Restore：重建| EMap
     DTasker -.->|Restore：重建| ETasker
     DLoader -.->|Restore：重建| ELoader
-    DMeta -.->|Restore：重建| EMeta
+    DMeta -.->|Restore：懒加载| EMeta
     DCounts -.->|Restore：重建| ECounts
     DMutex -.->|Restore：—| EMutex
     DMap -->|Purge：—| PMap
