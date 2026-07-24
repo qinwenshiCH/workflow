@@ -12,7 +12,7 @@
 - `2026-07-16` `[用户确认]`：Organization Delete 前逐个 Delete 项目，Organization Purge 前逐个 Purge 项目；不自动级联或批量代办。
 - `2026-07-17` `[用户确认]`：项目 Delete 复用现有 `DISABLE`，不新增 `DELETED`；历史数据清理后，`DISABLE,false` 只表示新 Delete 的可恢复数据。
 - `2026-07-17` `[用户确认，后续细化]`：历史 DISABLE 由用户人工处理，本 change 不提供扫描、批处理、脚本、运行手册或自动 migration；后续明确为通过本期 OP Project Purge 逐个处理 `DISABLE,true`。
-- `2026-07-17` `[用户确认]`：`INITIALIZING` 项目允许 Purge。
+- `2026-07-24` `[用户确认]`：`INITIALIZING` 项目不能 Delete、Restore 或 Purge；初始化结束只允许条件转换为 `ENABLE`，失败初始化仍由创建流程回滚、修复或运维处理。
 - `2026-07-20` `[用户确认]`：Project、Organization 新增 `PURGING` 和 `PURGED`；新数据以 `PURGING,false` 作为同步清理的持久栅栏，全部业务资源和引用清理完成后才在最终 Global PG 事务写 `PURGED,true`，保留可直接查询的生命周期墓碑；墓碑的后续物理删除不在本期设计范围。
 - `2026-07-17` `[用户确认]`：Delete/Restore 必须轻量，只修改 Global PG 生命周期状态和 PM 控制状态，不删除 Scheduler Job 或项目持久资源。
 - `2026-07-20` `[用户确认]`：历史旧 Delete 产生的 `DISABLE,is_deleted=true` 项目允许直接 Purge；执行期间保持 `is_deleted=true`，不改回 false，最终归一为 `PURGED,true`。用户会先人工 Purge 这些历史项目，本 change 不设计主记录的后续物理删除。
@@ -60,6 +60,7 @@
 - `2026-07-22` `[用户确认]`：资源台账只回答“项目拥有什么”，不能代替流量入口和运行收敛设计；文档新增“流量入口 → PM 门禁 → 运行资源 → 收敛方式”矩阵，明确区分当前代码事实与改造后目标。`PM.DeleteInfo` 只传播项目不可用状态，不是同步全局流量屏障；Delete 接受 Pub/Sub/快照对账驱动的最终一致收敛，不增加远端 ACK 或每请求直查 Redis。
 - `2026-07-22` `[用户确认]`：`04-detail.md` 现有资源台账内容不得删减。新增流量入口、门禁和收敛说明时，保留既有每项资源、生命周期变化图和适配结论；后续发现遗漏只能补充，不能用新的流量矩阵替代资源台账。
 - `2026-07-22` `[用户确认]`：`04-detail.md` 第 4.2 节的 PM 接入、Hook 缺口、流量入口和运行收敛等覆盖表统一按 `app/包 → 模块` 排列，使用同一模块名称方便横向核对；生命周期动作矩阵继续按动作组织，各组件资源台账继续在 app/module 章节内一行一个资源，不为格式统一改变其职责或删减内容。
+- `2026-07-24` `[用户确认]`：Organization status 必须同时覆盖新环境 bootstrap 和存量 global migration；历史 `is_deleted=false/true` 分别初始化为 `ENABLE/DISABLE`，migration 不覆盖已有非空 lifecycle 状态。
 
 ### 1.4 已替代的人工决策
 
@@ -100,17 +101,17 @@
 - `2026-07-20` `[自动采纳]`：Organization Purge 要求全部子项目已为 `PURGED,true`，而不是要求项目行消失；本期保留组织和项目墓碑，不设计其后续物理删除。
 - `2026-07-20` `[自动采纳]`：Project `PURGED` 墓碑只保留 OP 识别和归属所需字段；最终事务清空配置并把 `secret` 替换为不可认证且唯一的墓碑值，避免“保留状态”反而保留可用凭据。
 - `2026-07-17` `[用户已确认]`：保留现有 `WHERE is_deleted=false` 名称唯一索引，Delete 后名称继续占用。
-- `2026-07-20` `[用户已确认]`：migration runner 改用单用途 `GetAllMigrationProjects`，只遍历 `INITIALIZING/ENABLE/DISABLE,is_deleted=false`；`DISABLE` 继续升级，`PURGING` 不再迁移。
+- `2026-07-20` `[用户已确认]`：migration runner 改用单用途 `GetAllMigrationProjects`，只遍历 `INITIALIZING/ENABLE/DISABLE,is_deleted=false`；`DISABLE` 继续升级，`PURGING` 不再迁移。为防止枚举快照与 Purge 竞态，migration 和 Doris/PG 清理复用现有 owner-token Redis 锁做单项目短互斥，锁内重查生命周期。
 - `2026-07-17` `[用户已确认]`：不新增生命周期 CHECK、trigger 或复杂一致性 SQL；只新增 organization status 字段并同步 bootstrap SQL。
 - `2026-07-17` `[自动采纳，后续修正]`：生命周期前端开放前必须由用户确认历史 DISABLE 已清理；后续确认改为复用 OP Project Purge 逐个处理 `DISABLE,true`，Purge 保持原 `is_deleted`，Restore 明确拒绝该历史组合，不引入批处理或第二套生命周期语义。
 
 ### 2.3 PM、运行面与组件覆盖
 
 - `2026-07-17` `[用户已确认]`：PM 只承担可用项目目录和 Delete/Restore 传播；Delete 用 `DeleteInfo`，Restore 用 `SetInfo`；Purge 只复用 `DeleteInfo` 确保项目已从 PM 消失，不增加 Purge 事件或由 PM 编排清理。
-- `2026-07-17` `[用户已确认]`：补强 PM 写错误上抛、调用节点本地同步、订阅重连和“可用项目集合索引 + 项目运行时快照”对账；不增加 Restore/Purge 事件、ACK 或协调器。
-- `2026-07-20` `[用户确认]`：PM 中是否存在 Project 是所有项目任务的唯一运行开关，不新增 Stop/Delete/Purge 事件或逐任务命令；Master 不生成、Worker 不领取，运行中 handler 在既有 heartbeat 读取 PM 后只取消本地 context、释放 lease。
+- `2026-07-17` `[用户已确认]`：补强 PM 可用项目集合索引/项目运行时快照写错误上抛、调用节点本地同步、订阅重连和 added/updated/removed 对账；Pub/Sub 只是非持久通知，不以订阅者数量判断成功，也不增加 Restore/Purge 事件、ACK 或协调器。
+- `2026-07-20` `[用户确认]`：PM 中是否存在 Project 是新工作快速准入开关，不是既有运行工作已经停止的证明；Master 不生成、Worker 不领取，运行中 handler 由既有 heartbeat/context 收敛。
 - `2026-07-20` `[用户确认]`：Delete 不删除、不 Stop、不标记 `CANCELED`，也不增加 Job/Instance/Task 的业务失败次数；Restore 后由现有 cron/repair 恢复，Delete 期间错过的 cron 不补跑。
-- `2026-07-17` `[用户已确认]`：MCP 在统一项目授权函数补 PM 门禁；Internal S2S 阻断新工作命令，Delete 后允许只读查询和结果/进度回写，进入 `PURGING` 后全部拒绝，静默后才删除底层资源。
+- `2026-07-17` `[用户已确认]`：MCP 在统一项目授权函数补 PM 门禁；Internal S2S 阻断新工作命令，Delete 后允许只读查询和结果/进度回写，进入 `PURGING` 后全部拒绝；底层资源只有在对应 owner 的已有状态核验成功后才能删除。
 - `2026-07-22` `[自动采纳]`：PM 缺失不能区分 `DISABLE` 与 `PURGING/PURGED`。Internal S2S 新工作只用本地 PM 做 fail-closed 门禁；在途查询和结果/进度回写在 PM 缺失时查询 Global Project 生命周期，只允许 `DISABLE,false` 的既有执行收尾，`PURGING/PURGED/is_deleted=true/NotFound` 全部拒绝。不增加生命周期缓存或粗粒度全局 middleware。
 - `2026-07-17` `[用户已确认]`：Edge、QE、C1 metadata、LiveEvent 和 Asset Behavior 只补真实的项目本地清理；ADTOL、ABOL、Dispatch 和无项目级资源的组件不增加空接口。
 - `2026-07-17` `[用户已确认]`：Wagent claim/start 前检查项目；Delete 期间不 ACK 或丢弃可恢复队列消息。
@@ -127,15 +128,15 @@
 - `2026-07-20` `[自动采纳]`：`apps/simulator` 不初始化 PM、不注册生产 Scheduler handler、也不拥有 Wave 项目存储；只在 detail 明确“已检查、无需改动”，不增加空接口。
 - `2026-07-21` `[用户已确认]`：`ProjectResourcePurger` 位于 Web，但不替其他进程清理其私有资源；Web 通过窄 client 调用 MA 内部 Purge endpoint，MA Runtime 清理自身共享/独享 Redis 和项目消费组并在确认不存在后返回。多 MA 副本依靠 PM/Scheduler 统一停止进程内工作，不做逐 Pod HTTP fan-out。
 - `2026-07-21` `[自动采纳]`：Purge 在最终 Global PG 事务前对第 4 章列出的已知资源做一次显式最终核验；核验由各 owner 的既有查询或幂等清理方法完成，不建设通用 `Verify` 接口。
-- `2026-07-21` `[自动采纳]`：Purge 删除资源前必须满足“写入者已停止，或现有入口门禁已保证资源不能被重建”。Kafka producer 关闭自动建 Topic，项目级 PG/Doris/Kafka 容器只能由受状态约束的初始化路径创建；Redis/OSS 等运行数据在对应 writer 静默后清理，不引入 generation fencing。
+- `2026-07-21` `[自动采纳]`：Purge 删除资源前，各 owner 使用已有 ownership、heartbeat、task map、consumer group 或 drain 结果做有界停止核验；无法确认时保持 `PURGING`。Kafka producer 关闭自动建 Topic，不引入通用静默协议或 generation fencing。
 
 ### 2.4 Restore 保证与失败边界
 
 - `2026-07-17` `[用户已确认]`：Restore 立即更新 DB 并重新发布 PM，不等待后台运行状态收敛，不逐项扫描或重建资源。
 - `2026-07-17` `[用户已确认]`：Delete 保证不主动删除项目持久资源，但不承诺补偿被拒绝流量、错过 cron、过期 Kafka/Redis 状态、LiveEvent 实时消息或外部副作用。
-- `2026-07-20` `[用户已确认]`：所有运行中 Scheduler handler 采用同一规则，在 heartbeat 发现 PM 不含项目后收到本地 context cancel；不区分短任务和长期 consumer。只有 Purge 必须确认运行面静默。
+- `2026-07-20` `[用户已确认]`：所有运行中 Scheduler handler 采用同一规则，在 heartbeat 发现 PM 不含项目后收到本地 context cancel；不区分短任务和长期 consumer。Purge 必须等待既有 ownership 释放，查询失败或超时均不继续删除。
 - `2026-07-17` `[自动采纳]`：重复 Restore 即使 DB 已是 `ENABLE` 也重新执行 PM `SetInfo`，修复 DB 成功但 PM 写失败。
-- `2026-07-20` `[用户已确认]`：Purge 先条件写入 `PURGING`，再移除 PM、确认静默并顺序清理；失败保留 `PURGING`，只能重试 Purge，最终写 `PURGED,true`，不在同步请求内硬删主记录。
+- `2026-07-20` `[用户已确认]`：Purge 先条件写入 `PURGING`，再移除 PM，由具体 owner 有界停止、清理和核验；失败保留 `PURGING`，只能重试 Purge，最终写 `PURGED,true`，不在同步请求内硬删主记录。
 - `2026-07-17` `[自动采纳]`：Purge 尊重请求 context 和现有依赖 timeout；客户端断开后不转后台执行。
 
 ### 2.5 API、前端与测试
@@ -149,6 +150,7 @@
 
 ### 2.6 已替代、拒绝与延期
 
+- `2026-07-17` `[已替代]`：`INITIALIZING` 项目允许 Purge → 初始化只能完成为 `ENABLE`，生命周期动作不接管初始化失败。
 - `2026-07-17` `[已替代]`：`status=DELETED` 表示 Delete → 清理历史数据后复用 `DISABLE`。
 - `2026-07-17` `[已替代]`：项目 Redis deny Key 作为额外围栏 → 复用 PM 可用项目集合索引、项目运行时快照和关键入口门禁。
 - `2026-07-17` `[已替代]`：Delete 删除 Scheduler Job/lease → 数据保留，只阻止新执行；所有运行中 handler 由既有 heartbeat 本地取消并释放 lease。
